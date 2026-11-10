@@ -76,6 +76,12 @@ export interface LogThreatSummary {
   topTargetUsers: ThreatUser[];
   hourlyDistribution: number[];
   threatLevel: LogThreatLevel;
+  breachedSources: readonly BreachedSource[];
+}
+
+export interface BreachedSource {
+  ip: string; failuresBeforeSuccess: number; firstSuccessAt: string;
+  user: string | null; method: "password" | "publickey" | null;
 }
 
 export interface LogSourceReadResult {
@@ -290,7 +296,7 @@ function threatUser(value: unknown, maximum: number): value is ThreatUser {
 function threatSummary(value: unknown, maximum: number): value is LogThreatSummary {
   return record(value) && exact(value, [
     "bruteForceCount", "successfulLoginCount", "privilegeEscalationCount", "suspiciousActivityCount",
-    "topSourceIps", "topTargetUsers", "hourlyDistribution", "threatLevel",
+    "topSourceIps", "topTargetUsers", "hourlyDistribution", "threatLevel", "breachedSources",
   ]) && unsigned(value.bruteForceCount, maximum) && unsigned(value.successfulLoginCount, maximum) &&
     unsigned(value.privilegeEscalationCount, maximum) && unsigned(value.suspiciousActivityCount, maximum) &&
     Array.isArray(value.topSourceIps) && value.topSourceIps.length <= 20 &&
@@ -299,7 +305,17 @@ function threatSummary(value: unknown, maximum: number): value is LogThreatSumma
     value.topTargetUsers.every((item) => threatUser(item, maximum)) &&
     Array.isArray(value.hourlyDistribution) && value.hourlyDistribution.length === 24 &&
     value.hourlyDistribution.every((item) => unsigned(item, maximum)) &&
-    typeof value.threatLevel === "string" && threatLevels.has(value.threatLevel as LogThreatLevel);
+    typeof value.threatLevel === "string" && threatLevels.has(value.threatLevel as LogThreatLevel) &&
+    Array.isArray(value.breachedSources) && value.breachedSources.length <= 20 &&
+    value.breachedSources.every((item) => breachedSource(item));
+}
+
+function breachedSource(value: unknown): value is BreachedSource {
+  return record(value) && exact(value, ["ip", "failuresBeforeSuccess", "firstSuccessAt", "user", "method"]) &&
+    typeof value.ip === "string" && value.ip.length <= 45 &&
+    unsigned(value.failuresBeforeSuccess, 65536) && text(value.firstSuccessAt, 64) &&
+    (value.user === null || text(value.user, 128)) &&
+    (value.method === null || value.method === "password" || value.method === "publickey");
 }
 
 function entryTextBudget(entries: PublicLogEntry[], maximumBytes: number): boolean {

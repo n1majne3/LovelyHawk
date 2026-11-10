@@ -4,6 +4,7 @@
 //!
 //! This crate deliberately has no dependency on any UI runtime.
 
+pub mod account_password;
 pub mod ai;
 pub mod apache_capability;
 pub mod apache_config;
@@ -11,6 +12,7 @@ pub mod apache_runtime;
 pub mod apache_visual;
 pub mod audit;
 pub mod baseline;
+pub mod capability_strip;
 pub mod command_findings;
 pub mod command_paths;
 pub mod command_workbench;
@@ -26,6 +28,7 @@ pub mod database_config_schema;
 mod database_config_schema_domestic;
 mod database_config_schema_open;
 pub mod database_config_sources;
+pub mod database_password;
 pub mod detection;
 pub mod docker;
 pub mod domain;
@@ -34,6 +37,7 @@ pub mod events;
 pub mod exec_directory;
 pub mod file_analysis;
 pub mod file_evidence;
+pub mod firewall_block;
 pub mod haproxy_config;
 pub mod integrity;
 pub mod investigation;

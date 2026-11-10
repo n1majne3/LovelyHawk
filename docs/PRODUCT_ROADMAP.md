@@ -1,5 +1,124 @@
 # LovelyHawk 长期产品与验证进度
 
+## 2026-11-10 外部应急材料对照的待补能力清单
+
+对照本机外部材料逐项核对现有代码后确认以下缺口。材料来源：运维竞赛 writeup（运维1.5、运维2、运维3）、培训课件与笔记（Day1/Day2/课件1/课件2）、`sec_baseline_check.sh`（约 2580 行的基线与后门狩猎脚本）、LinuxIR 整合包（LinuxCheck_plus + unhide 三件套 + rkhunter 1.4.6）、D 盾（闭源 Windows 工具，仅参考使用方式）与 `tunnel_key.sh`；材料在本机 `tmp/` 下，不入库。基础排查面（进程、网络、账号、cron、systemd、init.d/rc 文件、`ld.so.preload`、authorized_keys、SUID 白名单判定、高危 capability 判定、挖矿、反弹 shell、iptables 只读、SSH 爆破统计、直接读取 cron spool、账号锁定/删除、容器内排查与文件编辑）已由 `detection.rs`、`command_workbench.rs`、`command_findings.rs`、`system_info.rs`、`file_analysis.rs` 覆盖，不在此重复；包完整性与隐藏进程只有基础实现，深度缺口见下文。清单按建议优先级排列，不代表全覆盖；每项实施时仍按 core → backend → DTO → 宿主 → UI 链路补拒绝测试与真实环境验证。
+
+### 实施进度（2026-11-10，本地未推送）
+
+逐项进度同步到 GitHub issue #1–#11（n1majne3/LovelyHawk）。以下已实现并通过所列验证；“不纳入范围”外的其余条目继续按优先级推进。
+
+- 数据库账号口令修改（PostgreSQL）：core 计划/执行/独立登录复核/限时恢复与已存口令放回，桌面数据库页“修改口令”对话框，见 [设计与边界](DATABASE_PASSWORD_CHANGE.md)。PostgreSQL 16 一次性容器实验 6/6（scram 自改并放回、超级用户改他人、非超级用户不可恢复、md5、nologin 拒绝、`log_statement=all` 日志无明文）；调试构建桌面端到端 21/21（`tools/lab/probe-ui-postgresql-password.mjs`：修改并复核、已存口令同步、容器内 psql 独立核对、界面放回、非超级用户不可恢复、焦点与键盘、日志与便携数据无口令），过程中修正计划视图字段命名、格式名与确认步骤立即过期三处缺陷。MySQL/MariaDB 未开始。
+- 判定规则（命令工作台）：shell 启动文件与 init 脚本中的 `insmod`/`modprobe`、可写目录 `nohup`、xinetd shell 服务与 TCP wrappers `spawn`/`twist`；init.d 内容扫描；alias/同名函数/`trap` 劫持；Web 根内任意压缩包、依赖/认证清单、`.git`/`.svn`（不下钻）、云与集群凭据文件；Web 根隐藏脚本。
+- 包校验：Debian 无 debsums 时用 `dpkg --verify` 校验关键软件包，并先以 `dpkg.md5sums` 核对 dpkg 自身；命令备份残留（`.bak`/`.orig`/`.old`/`~`/同目录点号副本/`psd`/`lsd` 等）。
+- Rootkit：`/sys/module` 与 `/proc/modules`、`/proc/kallsyms` 模块标签比对；隐藏进程改为两次目录列表 + 直接探测（上限 65536，排除自身子进程与瞬时进程）。
+- 后门：sshd 软链接后门（argv0、指向 sshd 的软链接、配置外监听端口）、`pam_exec.so` 与 `pam_unix.so` 包校验、新增 Python `.pth` 与 Git 钩子两个条目（目录 149 项）。
+- 溯源：日志分析“爆破后成功登录”（同一来源失败 ≥5 次后首次成功，威胁等级至少为高）。
+- 基线（只检查，不提供写入）：新增 7 项。SSH 弱算法（按 sshd -T 生效值；OpenSSH 默认 MAC 含 umac-64/hmac-sha1，未显式配置的主机通常判为不合规）、SFTP 子系统、AllowUsers/AllowGroups、TMOUT 空闲超时、口令历史 remember、su 的 pam_wheel 限制、90 天未登录的可登录账号；目录 120 项。sshd -T 不可读、文件或 lastlog 缺失时显示无法判断。debian/alpine 一次性容器以真实采集脚本核对默认值与夹具值（alpine 无 /etc/pam.d/su 与 lastlog，正确显示无法判断）。结果值中的英文短标记（如 `within-900`、`absent`、`ge-5`）已由界面按组件+建议值组合映射为中文（`baselineObservedLabel`/`baselineRecommendationLabel`），其余真实取值原样显示。
+- 移除文件能力（setcap 修复，处置闭环第二项）：core `capability_strip.rs` 经 SSH 探测（getcap/setcap/sha256sum 在位、普通文件、root 或免密 sudo、当前能力集与文件摘要）后生成计划；执行前重核摘要与能力集，文件被改过即拒绝且不做任何写；`setcap -r` 移除后独立 `getcap` 复核，撤销把原能力集写回一次；缺工具、非普通文件、权限不足、无能力分别给出拒绝码。工作台“文件 Capabilities”条目命中的路径在菜单提供“移除文件能力”。验证：core 探测解析单测、backend 句柄/拒绝映射测试、Debian 一次性容器端到端 25/25（`tools/lab/probe-emergency-path-capability.mjs`：夹具独立 getcap 核对移除/写回、已用计划不可再执行、计划后文件被改拒绝且原内容保留、能力被清空与变成符号链接分别按码拒绝），过程中修正 getcap 按位序输出与内核写入即清能力两个夹具假设。`sudo -n` 路径未经真实目标驱动。
+- 封禁 IP（处置闭环第一项）：core `firewall_block.rs`，按 firewalld → iptables（含 DOCKER-USER）→ nftables（自有 `inet lovelyhawk` 表）选择后端，ufw 活动时拒绝；只加运行时规则并明确说明重启或重载后失效；入方向封禁当前 SSH 来源地址时拒绝；内网地址给出提示；规则带 `lovelyhawk-block-<8位>` 标记，执行后回读，可单独撤销且只删除本次规则。后端 `system-info.firewall`，恢复标识只在后端内存、页面只拿不透明句柄；主机全景的防火墙/网络详情/外连排查标签提供“封禁地址…”，连接行提供“封禁…”。验证：core 单元 8 项与 debian（iptables-nft）、alpine（nftables）NET_ADMIN 一次性容器实验（规则回读、计数器命中、连接被拒、撤销后为 0；修正 nft 撤销取错链名、规则缺少计数器两处缺陷），backend 3 项，UI 契约与对话框测试；firewalld/ufw 仅单元测试，iptables-legacy 在实验内核中不可用。调试构建桌面端到端 14/14（`tools/lab/probe-ui-firewall-block.mjs`：从防火墙标签封禁并经容器内 iptables 独立核对、撤销后核对已删除、封禁当前 SSH 来源被拒且不加规则、焦点与 Escape），过程中修正撤销时对不存在的 DOCKER-USER 链也发删除命令、导致规则已删却报失败的缺陷。
+- 系统账号口令修改（处置闭环第三项）：core `account_password.rs`。明文在计划时即由 core 计算成 SHA-512 crypt（`sha-crypt` crate）后丢弃，计划只存要写入的散列字段（Zeroizing）；优先 `chpasswd -e` 经敏感通道 stdin 写入（命令行与审计都不出现散列），`usermod -p` 为兜底。锁定账户的 `!` 前缀原样保留（改口令不会悄悄解锁），`*`/`x` 等拒绝登录标记拒绝改写；需要 root 或免密 sudo，缺工具、弱口令、域账号/读不到记录分别给出拒绝码。执行前重读字段一致才写，执行后回读精确匹配加账号身份复核为验证，失败自动写回原字段。主机全景用户标签行操作提供“修改口令”，先输入新口令（两次确认、本地校验）再生成计划。验证：core 单测 4 项、backend 行操作测试、Debian 一次性容器端到端 21/21（`tools/lab/probe-account-password.mjs`：独立 openssl/crypt 复算证明新口令可认证、旧口令不再匹配、锁定账户散列替换后仍锁定、`*` 字段与弱口令按码拒绝、计划后字段被改拒绝且原值保留、已用计划不可再执行、明文不出现在本地数据存储）。`sudo -n` 路径与验证失败自动放回未经真实目标强制驱动。
+- 验证：core `command_` 96、`log_analysis` 13、`database_password` 12、`account_password` 4，backend `postgresql_runtime`/`emergency_`/`log_analysis`/`system_info`，`pnpm ui:check` 1196+；WSL 夹具 38/38；debian:12-slim 与 alpine:3.20 一次性容器 7 项后门/rootkit 用例全部通过，单项 0.4–0.8 s（`command_workbench::lab`，过程中修正 pam_exec 未命中、Git 钩子未标记、隐藏进程自身子进程误报、`[bpf]` 伪模块误报）。容器不能伪造隐藏模块/进程，这两项的真实命中仍需 VM/实机验证。
+
+### 处置闭环（最高）
+
+- 封禁 IP 的防火墙写入：现有 iptables/nft/firewalld 能力全部只读（`detection.rs:956`、`system_info.rs:9039` 的规则枚举与按 IP 检索），处置 C2 地址与爆破来源是所有 writeup 的固定动作，需按计划、确认、回读、可恢复链路补规则写入。
+- capability 修复（`setcap`）：`perm-capabilities` 已按 `DANGEROUS_CAPABILITIES`（`command_findings.rs:118`）判定高危能力，但没有写入能力；被替换命令还原后（如 ping）需补 `setcap cap_net_raw+ep`，否则普通用户不可用（`cp` 不带 `--preserve=xattr` 会丢失 capability）。
+- 系统命令还原一条龙：留证 → 按备份残留还原 → 包校验复核 → 功能验证。备份命名需覆盖 `.bak`/`psd`/`lsd`/`dpkgbak` 及同目录点号副本（运维2 的 `/usr/sbin/.userdel`），代码中均无探测。现有包校验（`file-package-verify`）与文件隔离零件可复用，缺面向“命令被替换”场景的引导。
+- 包校验在 Debian/Ubuntu 上的回退：`file-package-verify` 的 Debian 分支只用 debsums，未安装即只输出“debsums 未安装”（`command_workbench.rs:1943`），不回退系统自带的 `dpkg --verify`（writeup 正是用 `dpkg -V`；主机全景行操作里已有单包 `dpkg --verify`，`system_info.rs:6638`）。dpkg 自身被替换时（运维1.5 第 5 题）需不经 dpkg 二进制、直接比对 `/var/lib/dpkg/info/*.md5sums`。
+- ~~账号口令修改~~（已完成，见上方进度区）。仍缺的配套：只检查用户录入的连接口令强度，不对目标做字典尝试（锁定风险且越过只读默认）。删除账号依赖目标 `userdel`，被替换时（运维2）复核能报告失败，但不提示命令可能被替换、也不提供替代路径。
+- 普通业务进程按原样重启：改完源码后需按原命令行、工作目录、用户重新拉起非服务进程（运维2 的 `nohup python3 app.py`）；现有仅结束进程与 Nginx 专用修补。
+
+### Rootkit 检测深度
+
+- rootkit 签名库：rkhunter 1.4.6 内嵌约 70 个家族、350+ 文件/目录特征与 21 条后门端口映射；现有 Rootcheck 仅 3 项轻量启发（`system_info.rs:9054`）。
+- 隐藏端口检测（unhide-tcp 思路：逐端口 `bind()` 探测与 netstat 输出对比）：未实现。
+- LKM 专项：`/proc/kallsyms` 特定符号、标准模块目录外 `.ko`、kill -64 信号触发探测（Diamorphine 类）未实现；lsmod、内核 taint、eBPF 程序清单已有。
+- 自隐藏模块：`/sys/module` 与 `/proc/modules` 差集比对未实现（运维1.5 的 lkmh 在 lsmod 中不可见、`/sys/module` 中仍在）；`system-modules` 只跑 lsmod（`command_workbench.rs:975`）。还需提示“已加载模块的残留需重启才能消失”。
+- 模块复活点：`REMOTE_EXECUTION`（`command_findings.rs:414`）不含 `insmod`/`modprobe`，shell 启动文件中加载模块的行不会被标出；dmesg 中的模块加载痕迹也未检查。
+- 隐藏进程深度：`process-hidden`（`command_workbench.rs:1268`）只比较 `/proc` 目录列表与目标上的 `ps`；钩住 readdir 的 rootkit 会让两边同时隐藏，`ps` 被替换时结果也不可信。缺 unhide 式按 PID 直接访问 `/proc/N` 的暴力探测。
+- 系统命令依赖库注入：批量检查系统命令的 `DT_NEEDED` 是否异常（运维1.5 的 ls 被注入 `libzio.so`）未实现；现在只能对单个文件看 `readelf -d`（`file_analysis.rs:366`）。
+- 命令被替换的旁证：与同目录其他命令修改时间不一致、`strings` 中出现 curl/socket/`/bin/sh` 等网络或回连特征，未实现。
+- 可信工具（待决策）：工作台全部依赖目标上的 `ps`/`ls`/`find`/`dpkg`，命令被替换时结果整体不可信。LinuxIR 用自带静态 unhide 绕开；是否提供“确认后上传静态工具到临时目录执行、用完清理”的路线，与“默认不在目标上安装工具”的规范冲突，需产品决定。
+
+### 持久化与后门判定深度
+
+- 持久化链条跟踪：cron 调用 `www_bak.sh`、它再 `source vmtools.sh`（运维1.5）这类链条只看 cron 行本身发现不了；init.d 中 `nohup /home/cmcc/windows` 这类非标准路径程序也不一定命中现有特征。
+- xinetd 后门：`persistence-inetd`（`command_workbench.rs:1465`）只原样输出配置，判定规则不含 `server = /bin/bash` 类特征。
+- alias / 同名函数 / trap：`persistence-alias`（`command_workbench.rs:1501`）收集 alias 与 function，但只按远程执行特征判定；`sudo()`/`ssh()` 同名函数、`trap DEBUG`，以及运维2 中“每执行一次 whoami 就写出一个木马文件”的 alias 都不会被标出。
+- SSH 软链接后门：`/tmp/su` 指向 sshd、经 `pam_rootok` 任意密码登录（运维2）。`process-exe-path`（`command_workbench.rs:1311`）看的是 `/proc/PID/exe`，解析后就是真 sshd，不会命中；代码中无 `pam_rootok`。需判定：命令行第一个参数不是 sshd 的 sshd 进程、配置端口以外仍在监听的 sshd、可写目录中指向 sshd 的软链接。
+- 其他隐蔽持久化点：Python `.pth`、`.git/hooks`、`/etc/hosts.allow` 的 spawn、`pam_exec.so`、`pam_unix.so` 二进制被篡改，代码中均无检查。
+- 可疑进程规则：Web/数据库账号（www-data、mysql 等）派生的 shell、名称伪装成 `[kworker]` 却有磁盘程序文件的进程，未找到对应规则。
+
+### 溯源
+
+- 爆破后登录成功关联：同一 IP 多次失败后又成功登录的判定未实现；`log_analysis.rs` 只统计爆破次数（`brute_force_count`）。
+- IOC 自动提取：从排查结果（crontab、被替换的程序 strings）中提取 IP/域名并汇总（运维3 的 `hacker_ip.txt`）。存储结构 `CaseIoc`（`investigation.rs:832`）仍在，但案件页已移除，也没有自动提取。
+
+### 数据库应急（入侵排查视角，非配置基线）
+
+- MySQL/MariaDB 运行实例在线检查与日志溯源：匿名账号、`root@'%'`、空口令、非 root `File_priv`、`mysql.func` 表 UDF 痕迹（sys_eval/sys_exec）、`general_log_file` 指向 Web 目录、general log 中 `Access denied` 爆破统计与 `INTO OUTFILE` 写马 SQL。现有 MySQL 基线全部为配置文件项（`baseline.rs:530` 起）；可复用 PostgreSQL 原生协议模式（`postgresql_wire.rs`）。
+- 数据库账号口令修改（运维2 用 `SET PASSWORD` 加固 MySQL root 弱口令）：现无此功能，桌面端只能编辑 LovelyHawk 自己保存的连接口令；PostgreSQL 原生连接强制只读（`postgresql_native.rs:214`）；core 遗留的通用 `plan_mutation`（`database.rs:1507`，任意 SQL）未接线，按 `UNWIRED_FEATURES.md` 不作为此功能的实现路径。需按产品分别实现固定语句（PostgreSQL `ALTER ROLE … PASSWORD`、MySQL/MariaDB `ALTER USER 'u'@'host' IDENTIFIED BY`，区分 host 部分），新口令只在 core 内处理、不进 DTO/日志/审计原文；确认时说明业务应用配置中的旧口令会失效，执行后用新口令独立登录复核，并提示更新应用配置与已保存的连接口令。MySQL 依赖先补原生连接。
+- MSSQL 日志审计：ERRORLOG/log.trc、18454/18456 事件、`xp_cmdshell`/`sp_OACreate` 与 `xplog70.dll` 等存储过程恢复痕迹。未实现；Windows 侧 16 类事件日志查询是现成载体。
+
+### Web 应急：一键 Webshell 扫描与 Web 日志规则
+
+- 一键 Webshell 扫描（“D 盾扫 www”式工作流）：现有 `WebshellScan`（`detection.rs:962`）固定 3 个根目录、仅近 30 天文件、仅 php/jsp/asp/aspx 四种后缀、5 条单行特征、输出文件名列表。缺：
+  - Web 根自动发现：从 nginx/apache 配置指令、运行中 Web 进程、`docker inspect` 挂载反推；Tomcat webapps、`/home/*/public_html` 与非标准安装现在会漏。
+  - 扫描范围：不限修改时间；扩展后缀（phtml/pht/php3-7/phar/jspx/asa/cer/ashx）；图片马（图片二进制内嵌 `<?php`）；配置型后门 `.htaccess`（`AddType x-httpd-php`）与 `.user.ini`（`auto_prepend_file`）——经 grep 核对 core 均无对应检查。
+  - 特征分级：一句话、变形（`call_user_func`+`$_`、`preg_replace /e`、`create_function`）、加密马疑似（单行长 base64、`gzinflate`/`str_rot13`/`openssl_decrypt` 链）；疑似项标明需人工确认，不冒充确证。
+  - 结果处置闭环：文件+行号+特征+风险级+纯文本预览，接现有“下载留证”（file_evidence）与“隔离/去执行位”（emergency_path 计划链路），批量处置带范围预览。
+  - 容器 Web 根一键扫描：选中容器后发现 Web 根，容器内直接扫或整目录拉出扫后回定位容器文件。
+  - 外部扫描器编排：支持配置本机已安装扫描器（如 D 盾）的可执行路径，一键把目标 Web 目录整目录拉回本机临时目录，自动调用扫描、解析并回显结果，与留证/案件记录关联；依赖“传输能力”节的整目录下载。涉及本机路径与本机进程调用，按仓库规范走宿主专用命令而非主窗口白名单，扫描器输出按不可信纯文本处理，任务可取消、临时目录用后清理。
+  - 边界：D 盾为闭源 Windows 工具，不能嵌入或再分发；内置特征库与“用户自备路径的外部扫描器编排”是两条互补路线，内置路线仍需写明误报边界。
+- Web 日志攻击特征内置规则：`union.*select`、`../`、`${jndi:`、thinkphp 特征路径与攻击源 IP 统计；现有 `log_analysis.rs` 只是自定义规则框架。
+- 访问日志反查文件：运维2 的免杀马 D 盾扫不出，是从 apache 访问日志找到的。需从访问日志提取被请求的脚本路径（重点是点号隐藏文件、只有 POST 的脚本），再到磁盘核对存在性与特征。
+- Web 根内的站点打包与敏感文件：`file-credential` 只在文件名含 backup/dump/bak 时才标出压缩包（`command_workbench.rs:644`），运维2 的 `www.zip` 不会命中；`composer.json`、`.git/config` 与云凭证文件（`.aws/credentials` 等）均无检查（站点内 `.env.*` 已覆盖）。
+- Web 根内的隐藏文件：`file-hidden`（`command_workbench.rs:919`）只查 `/tmp`、`/var/tmp`、`/dev/shm`、`/home`、`/root`，不含 Web 根（运维2 的 `.a.php`、`.dont_delete_me.php`）。
+- Web 组件版本识别与已知漏洞：ThinkPHP、phpMyAdmin、Smarty 等在 core 中只出现在 `settings.rs`；运维2/运维3 多个容器的修复方式就是按版本升级或修补。
+- 模板编译缓存污染：Smarty `templates_c` 被写入后即使修补 WAF 仍可利用（运维3），发现与清理未实现。
+
+### 传输能力：整目录上传/下载与批量传输
+
+- SFTP 单文件上传/下载、变更集原语已齐（`sftp.rs:244` 起的 `SftpMutation`，含 `CreateArchive`、`UploadStaged` 与 `ExtractedDirectory` 恢复令牌）；缺：
+  - 整目录递归上传/下载的接线：远端 `CreateArchive` 打包后下载压缩包、上传侧暂存+解压恢复；配目录树选择、文件数/容量上限、取消与背压。用途是把 `/var/www/html` 整目录拉回本地深扫（与一键 Webshell 扫描组合成完整工作流）以及工具包/补丁目录整体上传。
+  - 批量多文件传输队列（逐项进度、部分失败可见、重试）。
+  - 双主机中转传输（失陷机 → 本地 → 分析机，两条连接分别授权，凭据不交叉）。
+  - 大文件断点续传与分段限速（文件证据单文件上限 512 MiB，`file_evidence.rs` 现为非递归单文件；超大文件目前只能放弃）。
+- SCP 协议回退：部分目标没有 SFTP 子系统（运维2 的 sshd_config 只有 7 行、没有 Subsystem；现有代码能识别并说明原因，`ssh.rs:47`，但文件功能全部不可用；关闭 `Subsystem sftp` 的 sshd、精简或嵌入式 SSH 服务、只提供 exec 通道的跳板），现有文件管理、文件证据与上传下载在这些机器上全部不可用。需在连接预检探测 SFTP 可用性，不可用时经 exec 通道回退到经典 SCP 协议（`scp -f`/`scp -t` 的 T/C/U 行握手）覆盖上传与下载，界面明确降级说明（rename、chmod 语义与目录递归差异，列表继续用 exec 命令实现）。实现走 core 内嵌协议解析，不调用本机 ssh/scp 二进制；注意 OpenSSH 9+ 的 scp 命令行默认改走 SFTP，需显式经典协议语义。拖放路径按安全要求保持关闭。
+
+### 流量分析
+
+- pcap 离线解析：会话重组、TCP/HTTP 流追踪、HTTP 对象导出、传输文件提取（菜刀 `X@Y` 修剪类）。现有能力仅实时 tcpdump 行解析（`packet_capture.rs:732`），抓包留证后无法回放分析。
+- 恶意流量特征：冰蝎 4（固定 Accept 头、默认密钥 md5 前 16 位、密文长度 16 整数倍）、菜刀、CS 心跳、frp 握手、SQLmap、ICMP 隧道、stratum 矿池协议；进程与文件侧 stratum 特征已有，流量特征未实现。TLS keylog 解密为后续项。
+
+### Windows 侧
+
+- 登录事件链分析：4624/4625/4776/4648/4672 关联、登录类型（2/3/5/8/10）判读、远控工具登录指纹（IPC 一次 type3、PSEXEC 3+2、WMIC 四次 type3、SharpRDP 3+10）还原横向移动路径；现有仅“开启 4624/4625 审计”基线项（`windows_incident/baseline.rs:96`）。
+- PowerShell 4104 脚本内容与 WinRM/RDP 四个远程管理通道日志：对照现有 28 条命令预设（`win-ir-command-presets.ts`）补缺。
+
+### 基线小项（短期易补）
+
+- SSH 加密算法白名单（ciphers/macs/kex 禁 arcfour/3des/cbc/sha1）：`baseline.rs` 无对应项。
+- SUID 包归属与 GTFOBins 标注：标准 SUID 白名单与非标准目录判定已有（`command_findings.rs:244`），writeup 中的 `/bin/hack`、带 SUID 的 find/id 会被标出；缺 `dpkg -S`/`rpm -qf` 包归属核对与按 GTFOBins 标注提权方式。
+- systemd 自定义 unit 属主校验（`rpm -qf`/`dpkg -S` 查不到属主的自定义 service/timer）：现有仅按时间的 recent-units。
+- SFTP 子系统引导修复：按基线修改链路写入 `Subsystem sftp`、`sshd -t` 检查后重载（运维2）；现有基线项中没有。
+- Day1 课件对照、按配置名在 `baseline.rs` 未搜到的项：
+  - 系统：TMOUT 空闲超时、`pam_pwhistory` remember、`pam_wheel` 限制 su、sudo 操作日志、SSH AllowUsers/AllowGroups、90 天未登录的休眠账号。
+  - Apache：Indexes、server-status、运行用户、超时与请求大小、模块精简。
+  - Tomcat：manager/host-manager、AJP 8009、以 root 运行、目录列表、会话超时。
+  - MySQL：匿名账号与 test 库、root 远程登录、口令策略、登录失败锁定（需连接实例，与“数据库应急”节的 MySQL 原生连接一起做）。
+- 攻击与隧道工具名单扩充（frp/nps/gost/earthworm/reGeorg 等）：现有 `command_findings.rs:876` 附近仅 chisel/frpc 等少数。
+
+### 连接辅助
+
+- SSH 本地端口转发：把远端 docker 发布端口转到本机，用于修复后从工作机验证容器化 Web 业务（writeup 中 `tunnel_key.sh` 的用途）。未实现；涉及宿主侧监听端口，设计时需核对授权边界与默认关闭原则。
+
+### 不纳入范围
+
+- CTF 与攻击工具（随波逐流、CTF-NetA、pwn 工具、tscan/fscan）及课件中的渗透、域渗透、抓密码内容：与应急工作台定位不符；仅取其防守侧排查位置清单作参考。
+- 业务源码漏洞修补（Flask SSTI、PHP 反序列化/任意文件读取、ThinkPHP 控制器过滤等 writeup 中的代码改写）：属于应用开发，只取其日志溯源与“改完后验证、重启业务”的部分。
+
 ## 2026-10-27 Windows 通道与传输独立窗口
 
 底部抽屉已迁为可缩放、最大化和复用的独立 Tauri 窗口；四个标签共享主工作台状态，关闭收起保留草稿，离开工作台参与任务和草稿检查。专用窗口权限、会话绑定、单次操作领取及全局通知接线见 [实现与验证边界](WINDOWS_CHANNEL_WINDOW.md)。真实 RDP 目标命令与文件传输矩阵仍待验证，合成桌面测试不替代远端验收。

@@ -31,6 +31,7 @@ use crate::connections::{
     JumpHostConfig, ResolvedConnection, SshAuthMethod,
 };
 use crate::crypto::SecretValue;
+use crate::database_password::{PostgresqlPasswordResult, PostgresqlPasswordStep};
 use crate::events::{
     EventChannelDefaults, TerminalEvent, TerminalEventKind, TerminalEventReceiver,
     TerminalEventSender, TerminalTransport, terminal_event_channel,
@@ -1297,6 +1298,24 @@ impl SshService {
         receive(response, "PostgreSQL runtime read").await?
     }
 
+    /// Runs one closed password-change step over its own direct-tcpip channel.
+    /// The same actor admission, connection identity and cancellation rules apply.
+    pub(crate) async fn postgresql_password_step_bound(
+        &self,
+        session: &BoundSshSession,
+        step: PostgresqlPasswordStep,
+    ) -> CoreResult<PostgresqlPasswordResult> {
+        validate_runtime_id("SSH session id", session.session_id())?;
+        let (reply, response) = oneshot::channel();
+        self.send(WorkerCommand::PostgresqlPassword {
+            session_id: session.session_id().to_owned(),
+            expected_connection_id: session.connection_id().to_owned(),
+            step: Box::new(step),
+            reply,
+        })?;
+        receive(response, "PostgreSQL password step").await?
+    }
+
     /// Reads the small shell capability view used by the native terminal.
     /// The command is static and the result is bounded by the normal SSH exec
     /// ceiling; no remote value is ever interpolated back into a command.
@@ -2109,6 +2128,12 @@ enum WorkerCommand {
         request: Box<NativeRuntimeRequest>,
         reply: oneshot::Sender<CoreResult<NativeRuntimeRead>>,
     },
+    PostgresqlPassword {
+        session_id: String,
+        expected_connection_id: String,
+        step: Box<PostgresqlPasswordStep>,
+        reply: oneshot::Sender<CoreResult<PostgresqlPasswordResult>>,
+    },
     ExecuteSensitive {
         session_id: String,
         expected_connection_id: String,
@@ -2468,6 +2493,15 @@ async fn router_loop(
                         Ok((session, admission)) => {
                             tasks.spawn(run_session_response(session, admission, reply, "PostgreSQL runtime read", NATIVE_READ_TIMEOUT,
                                 move |handle| execute_postgresql_runtime_on_handle(handle, *request)));
+                        }
+                        Err(error) => { let _ = reply.send(Err(error)); }
+                    }
+                }
+                WorkerCommand::PostgresqlPassword { session_id, expected_connection_id, step, reply } => {
+                    match bind_actor_session(&sessions, &session_id, Some(&expected_connection_id), "PostgreSQL SSH session binding") {
+                        Ok((session, admission)) => {
+                            tasks.spawn(run_session_response(session, admission, reply, "PostgreSQL password step", Duration::from_secs(45),
+                                move |handle| execute_postgresql_password_on_handle(handle, *step)));
                         }
                         Err(error) => { let _ = reply.send(Err(error)); }
                     }
@@ -3002,6 +3036,31 @@ async fn execute_postgresql_runtime_on_handle(
                 },
             )
             .await
+        }
+        #[cfg(test)]
+        SessionHandle::Test(_) => Err(CoreError::Unsupported {
+            feature: "native PostgreSQL in a command-only SSH fixture",
+        }),
+    }
+}
+
+async fn execute_postgresql_password_on_handle(
+    handle: SessionHandle,
+    step: PostgresqlPasswordStep,
+) -> CoreResult<PostgresqlPasswordResult> {
+    match handle {
+        SessionHandle::Real(handle) => {
+            let (host, port) = step.endpoint();
+            let channel = handle
+                .channel_open_direct_tcpip(&host, u32::from(port), "127.0.0.1", 0)
+                .await
+                .map_err(|_| {
+                    CoreError::ssh(
+                        "PostgreSQL forwarding",
+                        "SSH 未能连接该数据库地址，请核对服务监听与转发权限",
+                    )
+                })?;
+            crate::database_password::run_step_on_stream(channel.into_stream(), step).await
         }
         #[cfg(test)]
         SessionHandle::Test(_) => Err(CoreError::Unsupported {

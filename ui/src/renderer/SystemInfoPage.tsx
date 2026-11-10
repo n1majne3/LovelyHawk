@@ -19,6 +19,7 @@ import {
   describeSystemInfoValue,
   EMPTY_SYSTEM_INFO_FILTER,
   filterSystemInfoRows,
+  firewallBlockAddress,
   systemInfoGauges,
   formatSystemInfoValue,
   groupShellConfigRows,
@@ -33,6 +34,7 @@ import {
 import { SearchIcon } from "./file-icons";
 import { rowActionFailureText, useSystemInfoRowActions } from "./system-info-row-actions";
 import { SystemInfoRowActionDialog } from "./SystemInfoRowActionDialog";
+import { FirewallBlockDialog } from "./FirewallBlockDialog";
 import { SystemInfoRowMenu, type SystemInfoRowLocalAction } from "./SystemInfoRowMenu";
 import {
   createSystemInfoState,
@@ -57,6 +59,7 @@ export function SystemInfoPage({ connection, api, writeClipboard, openFile }: Sy
   const [state, dispatch] = useReducer(systemInfoReducer, undefined, createSystemInfoState);
   const [summaryVersion, setSummaryVersion] = useState(0);
   const [notice, setNotice] = useState<string | null>(null);
+  const [firewallBlock, setFirewallBlock] = useState<{ address: string | null; direction: "inbound" | "outbound" | "both" } | null>(null);
   const backgroundRef = useRef<HTMLDivElement>(null);
   const tableRequestRef = useRef(0);
   const dialogRef = useRef<HTMLElement>(null);
@@ -90,6 +93,9 @@ export function SystemInfoPage({ connection, api, writeClipboard, openFile }: Sy
   // Most tabs have no detail behind any of their rows; the column is only worth
   // its width where at least one row can answer.
   const anyDetail = table?.rows.some((row) => row.detail) ?? false;
+  // A plan belongs to the connection it was made on.
+  useEffect(() => { setFirewallBlock(null); }, [bindingHandle]);
+  const blockColumn = bindingHandle !== null && (table?.tab === "network" || table?.tab === "established");
   // Each tab keeps what it was narrowed to, so moving between 进程 and 网络
   // does not throw either search away; a different target starts clean, since
   // its rows are a different machine's.
@@ -496,6 +502,9 @@ export function SystemInfoPage({ connection, api, writeClipboard, openFile }: Sy
                     ) : (
                       <button type="button" disabled={table === null} onClick={() => void copyTable()}>复制表格</button>
                     )}
+                    {!summaryTabActive && bindingHandle !== null && (selectedTab === "firewall" || selectedTab === "network" || selectedTab === "established") ? (
+                      <button type="button" onClick={() => setFirewallBlock({ address: null, direction: selectedTab === "firewall" ? "inbound" : "both" })}>封禁地址…</button>
+                    ) : null}
                     <button
                       type="button"
                       className="system-info-refresh"
@@ -635,7 +644,7 @@ export function SystemInfoPage({ connection, api, writeClipboard, openFile }: Sy
                   && table.tab !== "shell-configs" ? (
                   <div className="system-info-table-scroll">
                     <table>
-                      <thead><tr>{table.columns.map((column, index) => shownColumn(table.columns, index) ? <th key={column}>{column}</th> : null)}<th>级别</th>{anyDetail ? <th>详情</th> : null}</tr></thead>
+                      <thead><tr>{table.columns.map((column, index) => shownColumn(table.columns, index) ? <th key={column}>{column}</th> : null)}<th>级别</th>{anyDetail ? <th>详情</th> : null}{blockColumn ? <th>处置</th> : null}</tr></thead>
                       <tbody>
                         {pageRows.map((row) => (
                           <tr
@@ -659,6 +668,12 @@ export function SystemInfoPage({ connection, api, writeClipboard, openFile }: Sy
                                   : null}
                               </td>
                             ) : null}
+                            {blockColumn ? (() => {
+                              const remote = firewallBlockAddress(table.tab, row);
+                              return <td>{remote !== null
+                                ? <button type="button" aria-label={`封禁远端地址 ${remote}`} onClick={() => setFirewallBlock({ address: remote, direction: "both" })}>封禁…</button>
+                                : null}</td>;
+                            })() : null}
                           </tr>
                         ))}
                       </tbody>
@@ -698,10 +713,22 @@ export function SystemInfoPage({ connection, api, writeClipboard, openFile }: Sy
         />
       ) : null}
 
+      {firewallBlock !== null && bindingHandle !== null ? (
+        <FirewallBlockDialog
+          api={api}
+          bindingHandle={bindingHandle}
+          initialAddress={firewallBlock.address}
+          initialDirection={firewallBlock.direction}
+          onChanged={() => { if (selectedTab === "firewall") refreshTable(); }}
+          onClose={() => setFirewallBlock(null)}
+        />
+      ) : null}
+
       {rowActions.state !== null ? (
         <SystemInfoRowActionDialog
           state={rowActions.state}
           onConfirm={() => void rowActions.confirm()}
+          onSubmitPassword={(password) => void rowActions.submitPassword(password)}
           onCopyOutput={(text) => void copyText(text, "已复制输出。")}
           onClose={rowActions.close}
         />

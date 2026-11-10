@@ -42,7 +42,7 @@ describe("main window API", () => {
   it("is frozen and keeps the method count the renderer was built against", () => {
     const api = createMainApi();
     expect(Object.isFrozen(api)).toBe(true);
-    expect(Object.keys(api)).toHaveLength(172);
+    expect(Object.keys(api)).toHaveLength(176);
   });
 
   it("keeps release checks and downloads on a validated main-window command", async () => {

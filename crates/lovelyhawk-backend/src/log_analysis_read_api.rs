@@ -821,6 +821,17 @@ struct ThreatSummaryDto {
     top_target_users: Vec<ThreatUserDto>,
     hourly_distribution: Vec<usize>,
     threat_level: &'static str,
+    breached_sources: Vec<BreachedSourceDto>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BreachedSourceDto {
+    ip: String,
+    failures_before_success: usize,
+    first_success_at: String,
+    user: Option<String>,
+    method: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1431,6 +1442,17 @@ fn project_threat_summary(
             top_source_ips,
             top_target_users,
             hourly_distribution: summary.hourly_distribution,
+            breached_sources: summary
+                .breached_sources
+                .into_iter()
+                .map(|source| BreachedSourceDto {
+                    ip: source.ip,
+                    failures_before_success: source.failures_before_success,
+                    first_success_at: source.first_success_at,
+                    user: source.user,
+                    method: source.method,
+                })
+                .collect(),
             threat_level: match summary.threat_level {
                 ThreatLevel::None => "none",
                 ThreatLevel::Low => "low",
@@ -1661,6 +1683,7 @@ mod tests {
             }],
             hourly_distribution: vec![0; 24],
             threat_level: ThreatLevel::Low,
+            breached_sources: Vec::new(),
         }
     }
 

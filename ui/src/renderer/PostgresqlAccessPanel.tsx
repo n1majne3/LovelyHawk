@@ -38,7 +38,7 @@ function source(file: string | null, line: number | null): string { return `${fi
 function roleAttributes(row: PostgresqlRoleRow): string {
   return [[row.superuser, "超级用户"], [row.inherit, "新成员授权默认继承"], [row.createRole, "创建角色"], [row.createDatabase, "创建数据库"], [row.replication, "复制"], [row.bypassRls, "绕过行级安全"]].filter(([enabled]) => enabled).map(([, label]) => label).join("、") || "以上直接属性均未启用";
 }
-export function PostgresqlAccessTable({ page, onInspectRole, busy = false }: { page: PostgresqlAccessPage; onInspectRole?: ((role: PostgresqlRoleRow) => void) | undefined; busy?: boolean }): React.JSX.Element {
+export function PostgresqlAccessTable({ page, onInspectRole, onPasswordRole, busy = false }: { page: PostgresqlAccessPage; onInspectRole?: ((role: PostgresqlRoleRow) => void) | undefined; onPasswordRole?: ((role: PostgresqlRoleRow) => void) | undefined; busy?: boolean }): React.JSX.Element {
   return <div className="database-table"><table><caption>{names[page.section]} · 共 {page.total} 项，匹配 {page.matched} 项{page.query ? ` · 搜索：${page.query}` : ""}</caption>
     {page.section === "hba" ? <><thead><tr><th>顺序 / 来源</th><th>连接与选择项</th><th>地址 / 掩码</th><th>认证方式 / 诊断选项名称</th><th>需要复核</th></tr></thead><tbody>{page.rows.map((row, i) => <tr key={i}>
       <td>{row.ruleNumber ?? "未编号"}<p>{source(row.fileName, row.lineNumber)}</p></td><td>{row.connectionType ?? "未取得"}<p>数据库：{row.databases?.join("、") ?? "未取得"}</p><p>用户：{row.users?.join("、") ?? "未取得"}</p></td>
@@ -50,17 +50,18 @@ export function PostgresqlAccessTable({ page, onInspectRole, busy = false }: { p
       <td>自动继承：{row.inheritOption ? "允许" : "不允许"}<p>切换角色：{row.setOption ? "允许" : "不允许"}</p><p>管理成员（ADMIN）：{row.adminOption ? "允许，需复核条件" : "未授予"}</p></td><td><Findings codes={row.findings} /></td>
     </tr>)}</tbody></> : <><thead><tr><th>角色 / 登录</th><th>直接属性</th><th>口令状态</th><th>需要复核 / 查看</th></tr></thead><tbody>{page.rows.map(row => <tr key={row.oid}>
       <td>{row.name}<p>OID：{row.oid} · {row.canLogin ? "允许作为登录角色" : "未设置 LOGIN"}</p><p>连接限制：{row.connectionLimit === -1 ? "未设置数量上限" : row.connectionLimit}（不等同于所有连接均受此限制）</p></td>
-      <td>{roleAttributes(row)}</td><td>{{ none: "未存储口令", md5: "MD5 存储标识", "scram-sha-256": "SCRAM 存储标识", unrecognized: "无法识别", unavailable: "无权读取存储标识" }[row.passwordKind]}<p>到期时间（数据库显示格式）：{row.passwordExpiresAt ?? "未设置"}</p>{row.passwordExpired ? <p>按服务器时间已过期；仅影响口令认证</p> : null}</td><td><Findings codes={row.findings} /><button disabled={busy || !onInspectRole} onClick={() => onInspectRole?.(row)}>查看权限来源</button></td>
+      <td>{roleAttributes(row)}</td><td>{{ none: "未存储口令", md5: "MD5 存储标识", "scram-sha-256": "SCRAM 存储标识", unrecognized: "无法识别", unavailable: "无权读取存储标识" }[row.passwordKind]}<p>到期时间（数据库显示格式）：{row.passwordExpiresAt ?? "未设置"}</p>{row.passwordExpired ? <p>按服务器时间已过期；仅影响口令认证</p> : null}</td><td><Findings codes={row.findings} /><button disabled={busy || !onInspectRole} onClick={() => onInspectRole?.(row)}>查看权限来源</button>{row.canLogin ? <button disabled={busy || !onPasswordRole} onClick={() => onPasswordRole?.(row)}>修改口令</button> : null}</td>
     </tr>)}</tbody></>}
   </table>{page.rows.length === 0 ? <p>当前搜索没有匹配记录。此状态不构成安全结论。</p> : null}</div>;
 }
-export function PostgresqlAccessPanel({ summary, page, busy, expert, onRead, rolePage = null, onRoleRead, objectPage = null, objectDetail = null, onObjectRead, onObjectDetail }: {
+export function PostgresqlAccessPanel({ summary, page, busy, expert, onRead, rolePage = null, onRoleRead, objectPage = null, objectDetail = null, onObjectRead, onObjectDetail, onPasswordRole }: {
   summary: PostgresqlAccessSummary; page: PostgresqlAccessPage | null; busy: boolean; expert: boolean;
   onRead(section: AccessSection, query: string, offset: number): unknown;
   objectPage?: PostgresqlObjectPage | null; objectDetail?: PostgresqlObjectDetail | null;
   onObjectRead?(section: ObjectSection, query: string, filter: ObjectFilter, offset: number): unknown;
   onObjectDetail?(section: ObjectSection, oid: number, subId: number, roleOid: number | null): unknown;
   rolePage?: PostgresqlRolePage | null; onRoleRead?(roleOid: number, mode: RoleAccessMode, query: string, offset: number): unknown;
+  onPasswordRole?(role: PostgresqlRoleRow): unknown;
 }): React.JSX.Element {
   const [selectedRole, setSelectedRole] = useState<PostgresqlRoleRow | null>(null);
   const [section, setSection] = useState<AccessSection>("hba");
@@ -91,7 +92,7 @@ export function PostgresqlAccessPanel({ summary, page, busy, expert, onRead, rol
       <p>未存储口令仍可能通过其他认证方式登录；SCRAM 存储标识不代表已验证校验值或登录成功。口令到期不等于账号停用。</p>
       <h5 ref={detailHeading} tabIndex={-1}>{names[section]}详情</h5>
       <form className="database-toolbar" onSubmit={event => { event.preventDefault(); load(section, query, 0); }}><label>搜索{names[section]}<input type="search" maxLength={128} value={query} onChange={event => setQuery(event.target.value)} placeholder={section === "memberships" ? "角色、授权者名称或 OID" : section === "roles" ? "角色名称" : "来源文件、用户或规则名称"} /></label><button disabled={busy || summary[section].state !== "available"}>搜索访问诊断</button></form>
-      {current ? <><PostgresqlAccessTable page={current} busy={busy} onInspectRole={summary.roleGraph.state === "available" && onRoleRead ? role => { setSelectedRole(role); void onRoleRead(role.oid, "inherit", "", 0); } : undefined} /><div className="database-toolbar"><button disabled={busy || current.offset === 0} onClick={() => load(section, current.query, Math.max(0, current.offset - 50))}>访问诊断上一页</button><button disabled={busy || current.offset + 50 >= current.matched} onClick={() => load(section, current.query, current.offset + 50)}>访问诊断下一页</button></div></> : <p>{busy ? "正在读取所选详情…" : "选择上方查看按钮，展开对应的规则或角色。"}</p>}
+      {current ? <><PostgresqlAccessTable page={current} busy={busy} onPasswordRole={busy ? undefined : onPasswordRole} onInspectRole={summary.roleGraph.state === "available" && onRoleRead ? role => { setSelectedRole(role); void onRoleRead(role.oid, "inherit", "", 0); } : undefined} /><div className="database-toolbar"><button disabled={busy || current.offset === 0} onClick={() => load(section, current.query, Math.max(0, current.offset - 50))}>访问诊断上一页</button><button disabled={busy || current.offset + 50 >= current.matched} onClick={() => load(section, current.query, current.offset + 50)}>访问诊断下一页</button></div></> : <p>{busy ? "正在读取所选详情…" : "选择上方查看按钮，展开对应的规则或角色。"}</p>}
     </div> : null}
   </section>;
 }

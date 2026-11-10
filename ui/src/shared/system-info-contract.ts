@@ -193,6 +193,39 @@ export interface SystemInfoRowReceipt {
   restored: boolean;
 }
 
+export type SystemInfoFirewallDirection = "inbound" | "outbound" | "both";
+export type SystemInfoFirewallBackend = "firewalld" | "iptables" | "nftables";
+export const SYSTEM_INFO_FIREWALL_DIRECTIONS: readonly SystemInfoFirewallDirection[] = ["inbound", "outbound", "both"];
+const FIREWALL_BACKENDS: readonly SystemInfoFirewallBackend[] = ["firewalld", "iptables", "nftables"];
+
+/** A runtime-only firewall block the target has not applied yet. */
+export interface SystemInfoFirewallPlan {
+  planHandle: string;
+  backend: SystemInfoFirewallBackend;
+  address: string;
+  direction: SystemInfoFirewallDirection;
+  /** The literal rule commands; they carry no secrets. */
+  commands: string[];
+  warnings: string[];
+  expiresInMs: number;
+}
+
+/** Read back after applying or removing the block. */
+export interface SystemInfoFirewallResult {
+  verified: boolean;
+  detail: string;
+  /** Present after a block was applied; opaque, the page never sees the rule tag. */
+  restoreHandle: string | null;
+}
+
+export interface SystemInfoFirewallRestorePlan {
+  planHandle: string;
+  backend: SystemInfoFirewallBackend;
+  address: string;
+  direction: SystemInfoFirewallDirection;
+  expiresInMs: number;
+}
+
 export interface SystemInfoApi {
   getSystemInfoCatalog(): Promise<unknown>;
   getSystemInfoSummary(bindingHandle: string): Promise<unknown>;
@@ -222,10 +255,15 @@ export interface SystemInfoApi {
     snapshotHandle: string,
     rowId: string,
     action: string,
+    password?: string,
   ): Promise<unknown>;
   confirmSystemInfoRowAction(bindingHandle: string, planHandle: string): Promise<unknown>;
   executeSystemInfoRowAction(bindingHandle: string, planHandle: string): Promise<unknown>;
   cancelSystemInfoRowAction(bindingHandle: string, planHandle: string): Promise<void>;
+  planSystemInfoFirewallBlock(bindingHandle: string, address: string, direction: SystemInfoFirewallDirection): Promise<unknown>;
+  executeSystemInfoFirewallBlock(bindingHandle: string, planHandle: string): Promise<unknown>;
+  planSystemInfoFirewallRestore(bindingHandle: string, restoreHandle: string): Promise<unknown>;
+  executeSystemInfoFirewallRestore(bindingHandle: string, planHandle: string): Promise<unknown>;
 }
 
 interface CatalogDefinition {
@@ -321,6 +359,46 @@ export function isSystemInfoMaximumRows(value: unknown): value is number {
 
 export function isSystemInfoOpaqueHandle(value: unknown): value is string {
   return utf8(value, 128) && /^[A-Za-z0-9-]+$/u.test(value);
+}
+
+/** A single IPv4 or IPv6 host address as typed; the backend and core validate it again. */
+export function isSystemInfoFirewallAddress(value: unknown): value is string {
+  return typeof value === "string" && value.length >= 2 && value.length <= 45 && /^[0-9A-Fa-f:.]+$/u.test(value) &&
+    (/^\d{1,3}(\.\d{1,3}){3}$/u.test(value) ? value.split(".").every(part => Number(part) <= 255) : value.includes(":"));
+}
+
+export function isSystemInfoFirewallDirection(value: unknown): value is SystemInfoFirewallDirection {
+  return typeof value === "string" && SYSTEM_INFO_FIREWALL_DIRECTIONS.some(key => key === value);
+}
+
+function isFirewallBackend(value: unknown): value is SystemInfoFirewallBackend {
+  return typeof value === "string" && FIREWALL_BACKENDS.some(key => key === value);
+}
+
+function boundedStrings(value: unknown, maximumItems: number, maximumBytes: number): value is string[] {
+  return Array.isArray(value) && value.length <= maximumItems && value.every(item => utf8(item, maximumBytes));
+}
+
+export function isSystemInfoFirewallPlan(value: unknown): value is SystemInfoFirewallPlan {
+  return isRecord(value) &&
+    exact(value, ["planHandle", "backend", "address", "direction", "commands", "warnings", "expiresInMs"]) &&
+    isSystemInfoOpaqueHandle(value.planHandle) && isFirewallBackend(value.backend) &&
+    isSystemInfoFirewallAddress(value.address) && isSystemInfoFirewallDirection(value.direction) &&
+    boundedStrings(value.commands, 8, 1_024) && (value.commands as string[]).length > 0 &&
+    boundedStrings(value.warnings, 8, 1_024) && safeUnsigned(value.expiresInMs) && value.expiresInMs > 0;
+}
+
+export function isSystemInfoFirewallResult(value: unknown): value is SystemInfoFirewallResult {
+  return isRecord(value) && exact(value, ["verified", "detail", "restoreHandle"]) &&
+    typeof value.verified === "boolean" && utf8(value.detail, 4_096, true) &&
+    (value.restoreHandle === null || isSystemInfoOpaqueHandle(value.restoreHandle));
+}
+
+export function isSystemInfoFirewallRestorePlan(value: unknown): value is SystemInfoFirewallRestorePlan {
+  return isRecord(value) && exact(value, ["planHandle", "backend", "address", "direction", "expiresInMs"]) &&
+    isSystemInfoOpaqueHandle(value.planHandle) && isFirewallBackend(value.backend) &&
+    isSystemInfoFirewallAddress(value.address) && isSystemInfoFirewallDirection(value.direction) &&
+    safeUnsigned(value.expiresInMs) && value.expiresInMs > 0;
 }
 
 export function isSystemInfoCatalog(value: unknown): value is SystemInfoTabCatalogEntry[] {

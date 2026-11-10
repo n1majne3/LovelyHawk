@@ -28,6 +28,8 @@ import {
   baselineComponentLabel,
   baselineComplianceLabel,
   baselineHistoryStateLabel,
+  baselineObservedLabel,
+  baselineRecommendationLabel,
   baselineRiskLabel,
   baselineScope,
   baselineValueSummary,
@@ -505,9 +507,9 @@ export function BaselineCheckCard({ item, status, selected = false, onSelect }: 
         <span className="baseline-card-bubble-risk">{baselineRiskLabel(item.risk)}风险</span>
         <p>{item.description}</p>
         <dl>
-          <div><dt>建议值</dt><dd><code>{item.recommendation}</code></dd></div>
+          <div><dt>建议值</dt><dd><code>{baselineRecommendationLabel(item)}</code></dd></div>
           <div><dt>取值</dt><dd>{baselineValueKindLabel(item.valueKind)}</dd></div>
-          <div><dt>目标机上的值</dt><dd><code>{status?.observed ?? "尚未扫描"}</code></dd></div>
+          <div><dt>目标机上的值</dt><dd><code>{status === null ? "尚未扫描" : baselineObservedLabel(item, status.observed)}</code></dd></div>
         </dl>
         {status?.textTruncated === true && <em>观察值已按字节边界截断。</em>}
       </span>

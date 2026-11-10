@@ -151,6 +151,10 @@ import {
   type SshAttemptStatus,
   type SshBindingDisconnection,
   type SystemInfoDetail,
+  type SystemInfoFirewallDirection,
+  type SystemInfoFirewallPlan,
+  type SystemInfoFirewallRestorePlan,
+  type SystemInfoFirewallResult,
   type SystemInfoRowActions,
   type SystemInfoRowInspection,
   type SystemInfoRowPlan,
@@ -331,6 +335,11 @@ import {
   isSshOpaqueHandle,
   isSystemInfoCatalog,
   isSystemInfoDetail,
+  isSystemInfoFirewallAddress,
+  isSystemInfoFirewallDirection,
+  isSystemInfoFirewallPlan,
+  isSystemInfoFirewallRestorePlan,
+  isSystemInfoFirewallResult,
   isSystemInfoOpaqueHandle,
   isSystemInfoRowActionKey,
   isSystemInfoRowActions,
@@ -409,6 +418,7 @@ export const SYSTEM_INFO_RPC_METHODS = Object.freeze({
   rowConfirm: "system-info.row.action.confirm",
   rowExecute: "system-info.row.action.execute",
   rowCancel: "system-info.row.action.cancel",
+  firewall: "system-info.firewall",
 } as const);
 
 /** The sidecar gives a read-only row action 45 seconds; this leaves room to hear back. */
@@ -984,10 +994,14 @@ export class BackendClient {
     snapshotHandle: string,
     rowId: string,
     action: string,
+    password?: string,
   ): Promise<SystemInfoRowPlan> {
     if (
       !isSystemInfoRowRequest(bindingHandle, snapshotHandle, rowId) ||
-      !isSystemInfoRowActionKey(action)
+      !isSystemInfoRowActionKey(action) ||
+      (password !== undefined &&
+        (typeof password !== "string" || password.length === 0 ||
+          utf8ByteLength(password) > 1_024))
     ) {
       throw new Error("The system-information row plan request is invalid.");
     }
@@ -996,6 +1010,7 @@ export class BackendClient {
       snapshotHandle,
       rowId,
       action,
+      ...(password === undefined ? {} : { password }),
     }, SYSTEM_INFO_ROW_PLAN_TIMEOUT_MS);
     if (!isSystemInfoRowPlan(value) || value.rowId !== rowId || value.action !== action) {
       throw new Error("The backend returned an invalid system-information row plan.");
@@ -1033,6 +1048,63 @@ export class BackendClient {
     }, SYSTEM_INFO_ROW_EXECUTE_TIMEOUT_MS);
     if (!isSystemInfoRowReceipt(value) || value.planHandle !== planHandle) {
       throw new Error("The backend returned an invalid system-information row receipt.");
+    }
+    return value;
+  }
+
+  async planSystemInfoFirewallBlock(
+    bindingHandle: string,
+    address: string,
+    direction: SystemInfoFirewallDirection,
+  ): Promise<SystemInfoFirewallPlan> {
+    if (!isSshOpaqueHandle(bindingHandle) || !isSystemInfoFirewallAddress(address) ||
+      !isSystemInfoFirewallDirection(direction)) {
+      throw new Error("The firewall block plan request is invalid.");
+    }
+    const value = await this.#request(SYSTEM_INFO_RPC_METHODS.firewall, {
+      action: "plan", bindingHandle, address, direction,
+    }, SYSTEM_INFO_ROW_PLAN_TIMEOUT_MS);
+    if (!isSystemInfoFirewallPlan(value) || value.direction !== direction) {
+      throw new Error("The backend returned an invalid firewall block plan.");
+    }
+    return value;
+  }
+
+  async executeSystemInfoFirewallBlock(bindingHandle: string, planHandle: string): Promise<SystemInfoFirewallResult> {
+    if (!isSshOpaqueHandle(bindingHandle) || !isSystemInfoOpaqueHandle(planHandle)) {
+      throw new Error("The firewall block execution request is invalid.");
+    }
+    const value = await this.#request(SYSTEM_INFO_RPC_METHODS.firewall, {
+      action: "execute", bindingHandle, planHandle,
+    }, SYSTEM_INFO_ROW_EXECUTE_TIMEOUT_MS);
+    if (!isSystemInfoFirewallResult(value)) {
+      throw new Error("The backend returned an invalid firewall block result.");
+    }
+    return value;
+  }
+
+  async planSystemInfoFirewallRestore(bindingHandle: string, restoreHandle: string): Promise<SystemInfoFirewallRestorePlan> {
+    if (!isSshOpaqueHandle(bindingHandle) || !isSystemInfoOpaqueHandle(restoreHandle)) {
+      throw new Error("The firewall restore plan request is invalid.");
+    }
+    const value = await this.#request(SYSTEM_INFO_RPC_METHODS.firewall, {
+      action: "plan-restore", bindingHandle, restoreHandle,
+    }, SYSTEM_INFO_ROW_PLAN_TIMEOUT_MS);
+    if (!isSystemInfoFirewallRestorePlan(value)) {
+      throw new Error("The backend returned an invalid firewall restore plan.");
+    }
+    return value;
+  }
+
+  async executeSystemInfoFirewallRestore(bindingHandle: string, planHandle: string): Promise<SystemInfoFirewallResult> {
+    if (!isSshOpaqueHandle(bindingHandle) || !isSystemInfoOpaqueHandle(planHandle)) {
+      throw new Error("The firewall restore execution request is invalid.");
+    }
+    const value = await this.#request(SYSTEM_INFO_RPC_METHODS.firewall, {
+      action: "execute-restore", bindingHandle, planHandle,
+    }, SYSTEM_INFO_ROW_EXECUTE_TIMEOUT_MS);
+    if (!isSystemInfoFirewallResult(value) || value.restoreHandle !== null) {
+      throw new Error("The backend returned an invalid firewall restore result.");
     }
     return value;
   }

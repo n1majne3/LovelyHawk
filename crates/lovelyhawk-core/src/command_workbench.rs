@@ -366,7 +366,12 @@ lh_tree() {
   lh_parents "$1" || return 1
   if [ ! -e "$1" ]; then printf '# 未找到目录：%s（未检查）\n' "$1"; return 1; fi
   if [ ! -d "$1" ] || [ ! -r "$1" ] || [ ! -x "$1" ]; then lh_gap '目录不可读或类型发生变化。'; return 1; fi
-  lh_paths=$({ find "$1" -xdev -maxdepth 6 -print0 2>/dev/null; printf '\000LH_TREE_STATUS:%s\000' "$?"; } | head -c 262145 | awk '
+  lh_paths=$({ if [ "$2" = "vcs" ]; then
+      find "$1" -xdev -maxdepth 6 \( -name .git -o -name .svn -o -name node_modules \) -prune -print0 -o -print0 2>/dev/null
+    else
+      find "$1" -xdev -maxdepth 6 -print0 2>/dev/null
+    fi
+    printf '\000LH_TREE_STATUS:%s\000' "$?"; } | head -c 262145 | awk '
     BEGIN {RS="\0"}
     function emit(p) {
       if (p == "") return
@@ -523,12 +528,25 @@ for lh_file in /etc/pam.d/*; do
   printf '# 属性：%s\n' "$lh_metadata"
   lh_lines=$(printf '%s\n' "$lh_data" | awk '$1 == "auth" && $2 == "sufficient" && $3 ~ /(^|\/)pam_permit\.so$/ {print NR}')
   for lh_line in $lh_lines; do lh_hit "$lh_ref | 第 $lh_line 行：auth sufficient pam_permit.so，需核对完整认证链。"; done
+  printf '%s\n' "$lh_data" | awk '$1 ~ /^(auth|account|session|password)$/ && $3 ~ /(^|\/)pam_exec\.so$/ {print NR, $3, $4}' | while read lh_n lh_m lh_a; do lh_hit "$lh_ref | 第 $lh_n 行：$lh_m $lh_a 会在认证流程中执行外部程序，需核对调用内容与来源。"; done
 done
 for lh_file in /lib/security/*.so /lib64/security/*.so /usr/lib/security/*.so /usr/lib64/security/*.so /lib/*/security/*.so; do
   [ -e "$lh_file" ] || [ -L "$lh_file" ] || continue
   lh_step
   lh_metadata=$(ls -ld "$lh_file" 2>/dev/null | tr '\000-\037\177' '?' | head -c 1024)
   printf '# 模块属性：%s\n' "$lh_metadata"
+  case "$lh_file" in */pam_unix.so)
+    if command -v dpkg >/dev/null 2>&1 && command -v dpkg-query >/dev/null 2>&1; then
+      lh_pkg=$(dpkg -S "$lh_file" 2>/dev/null | awk -F: '{print $1}' | head -n 1)
+      if [ -n "$lh_pkg" ]; then
+        lh_verify=$(dpkg --verify "$lh_pkg" 2>/dev/null | awk -v f="$lh_file" '$NF == f')
+        [ -n "$lh_verify" ] && lh_hit "$lh_file | 与软件包记录不一致：$lh_verify，需核对模块来源。"
+      else lh_hit "$lh_file | 不归属任何软件包，需核对模块来源。"; fi
+    elif command -v rpm >/dev/null 2>&1; then
+      lh_verify=$(rpm -Vf "$lh_file" 2>/dev/null)
+      [ -n "$lh_verify" ] && lh_hit "$lh_file | 与软件包记录不一致：$lh_verify，需核对模块来源。"
+    else lh_gap '缺少 dpkg/rpm，pam_unix.so 未能与安装记录比对。'; fi;;
+  esac
 done
 "#
 );
@@ -630,19 +648,33 @@ const CREDENTIAL_FILE_OBSERVATIONS: &str = bounded_observation!(
 printf '# 列出凭据类文件属性；在常见站点目录补查环境配置、备份压缩包及数据库导出，不读取这些文件内容。\n'
 printf '# 每目录最多 6 层、仅当前文件系统；自定义站点目录未覆盖，文件存在不证明能够通过网站下载。\n'
 for lh_root in /var/www /usr/share/nginx /srv/www /root /home /etc /opt; do
-  lh_tree "$lh_root" || continue
+  lh_tree "$lh_root" vcs || continue
   while IFS= read -r lh_file; do
+    case "$lh_file" in
+      */.git|*/.svn|*/node_modules)
+        case "$lh_file" in /var/www/*|/usr/share/nginx/*|/srv/www/*|/home/*/public_html/*)
+          case "$lh_file" in */.git|*/.svn) lh_hit "$lh_file | 站点目录内版本库，可能泄露完整源码，需核查站点映射与访问控制。";; esac;;
+        esac
+        continue;;
+    esac
     lh_tree_entry "$lh_file" || continue
     lh_name=$(printf '%s' "${lh_file##*/}" | tr '[:upper:]' '[:lower:]')
     lh_credential=0 lh_feature=''
     case "$lh_name" in id_rsa*|id_ed25519*|*.pem|*.key|.env|.env.*|*.p12) lh_credential=1;; esac
+    case "$lh_file" in /root/.aws/credentials|/home/*/.aws/credentials|/root/.aliyun/config.json|/home/*/.aliyun/config.json|/root/.config/gcloud/credentials.db|/home/*/.config/gcloud/credentials.db|/root/.kube/config|/home/*/.kube/config|/root/.docker/config.json|/home/*/.docker/config.json|/root/.git-credentials|/home/*/.git-credentials) lh_credential=1;; esac
     case "$lh_file" in /var/www/*|/usr/share/nginx/*|/srv/www/*|/home/*/public_html/*)
+      case "$lh_file" in */vendor/*|*/node_modules/*) ;; *)
+        case "$lh_name" in composer.json|composer.lock|auth.json|package.json) lh_feature='站点目录内依赖或认证清单，需确认能否被直接下载及是否含凭据';; esac;;
+      esac
       case "$lh_name" in
         .env|.env.*) lh_feature='站点目录内环境配置文件';;
         *.sql|*.dump|*.sqlite|*.db) lh_feature='站点目录内数据库或导出文件';;
         *.bak) lh_feature='站点目录内备份文件';;
-        *.zip|*.tar|*.tgz|*.tbz2|*.txz|*.gz|*.bz2|*.xz|*.7z|*.rar)
-          case "$lh_name" in *backup*|*dump*|*bak*) lh_feature='站点目录内疑似备份压缩包';; esac;;
+        *.zip|*.tar|*.tgz|*.tbz2|*.txz|*.tar.gz|*.gz|*.bz2|*.xz|*.7z|*.rar|*.war)
+          case "$lh_name" in
+            *backup*|*dump*|*bak*) lh_feature='站点目录内疑似备份压缩包';;
+            *) [ -z "$lh_feature" ] && lh_feature='站点目录内压缩包（可能是源码或数据打包）';;
+          esac;;
       esac;;
     esac
     if [ "$lh_credential" -eq 1 ] || [ -n "$lh_feature" ]; then
@@ -920,9 +952,9 @@ static CATALOG: &[CommandDefinition] = &[
         Files,
         "隐藏文件",
         "列出常见可写位置下的隐藏普通文件。",
-        "command -v find >/dev/null 2>&1 || { echo 'find 不可用，本项未执行'; exit 0; }; find /tmp /var/tmp /dev/shm /home /root -xdev \\( -type f -o -type d \\) -name '.*' -not -name '.' -not -name '..' -exec ls -ld -- {} + 2>/dev/null | head -n 500"
+        "command -v find >/dev/null 2>&1 || { echo 'find 不可用，本项未执行'; exit 0; }; find /tmp /var/tmp /dev/shm /home /root /var/www /usr/share/nginx /srv/www -xdev \\( -type f -o -type d \\) -name '.*' -not -name '.' -not -name '..' -exec ls -ld -- {} + 2>/dev/null | head -n 500"
     )
-    .flagging(command_findings::planted_file),
+    .flagging(command_findings::hidden_entry),
     portable!(
         "file-largest",
         Files,
@@ -976,9 +1008,10 @@ static CATALOG: &[CommandDefinition] = &[
         System,
         "内核模块",
         "列出已加载内核模块及签名状态线索。",
-        "lsmod 2>/dev/null; echo '--- taint ---'; cat /proc/sys/kernel/tainted 2>/dev/null"
+        "lsmod 2>/dev/null; echo '--- taint ---'; cat /proc/sys/kernel/tainted 2>/dev/null; echo '--- 隐藏模块比对 ---'; lh_loaded=$(awk '{print $1}' /proc/modules 2>/dev/null | sort -u); for lh_d in /sys/module/*/initstate; do [ -f \"$lh_d\" ] || continue; lh_m=$(basename \"$(dirname \"$lh_d\")\"); echo \"$lh_loaded\" | grep -qx \"$lh_m\" || echo \"关注：/sys/module 中存在但模块列表中不可见的已加载模块：$lh_m（疑似自隐藏模块；已加载模块的残留需重启后才会消失）\"; done | head -n 100; if [ -r /proc/kallsyms ]; then grep -oE '\\[[A-Za-z0-9_.-]+\\]' /proc/kallsyms 2>/dev/null | tr -d '[]' | sort -u | while read lh_m; do case \"$lh_m\" in bpf|__builtin*) continue;; esac; echo \"$lh_loaded\" | grep -qx \"$lh_m\" || echo \"关注：符号表中存在但模块列表中不可见的模块标签：$lh_m（疑似自隐藏模块；已加载模块的残留需重启后才会消失）\"; done | head -n 100; else echo '# /proc/kallsyms 不可读，符号表比对未执行'; fi"
     )
-    .flagging(command_findings::tainted_kernel),
+    .with_timeout(60)
+    .flagging(command_findings::module_anomaly),
     portable!(
         "perm-world-writable-dir",
         Permissions,
@@ -1269,7 +1302,7 @@ static CATALOG: &[CommandDefinition] = &[
         Processes,
         "隐藏进程比对",
         "比对 /proc 与进程列表，发现被工具隐藏的进程。",
-        "for p in /proc/[0-9]*; do pid=${p#/proc/}; ps -p \"$pid\" >/dev/null 2>&1 || echo \"仅存在于 /proc 的进程: $pid $(cat \"$p/comm\" 2>/dev/null)\"; done 2>/dev/null | head -n 100"
+        "echo '# 目录列表与直接探测比对；直接探测上限 min(pid_max, 65536)'; lh_pids=$(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); lh_max=$(cat /proc/sys/kernel/pid_max 2>/dev/null); if [ \"$lh_max\" -gt 65536 ] 2>/dev/null; then lh_cap=65536; echo \"# pid_max=$lh_max 超过探测上限，高于 65536 的 PID 未探测\"; else lh_cap=${lh_max:-65536}; fi; lh_cands=''; lh_i=0; while [ \"$lh_i\" -lt \"$lh_cap\" ]; do lh_i=$((lh_i+1)); [ -d \"/proc/$lh_i\" ] || continue; echo \"$lh_pids\" | grep -qx \"$lh_i\" || lh_cands=\"$lh_cands $lh_i\"; done; lh_pids2=$(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); for lh_n in $lh_cands; do [ -d \"/proc/$lh_n\" ] || continue; echo \"$lh_pids2\" | grep -qx \"$lh_n\" && continue; lh_anc=0; lh_pp=$lh_n; lh_k=0; while [ \"$lh_k\" -lt 8 ]; do lh_pp=$(awk '/^PPid:/{print $2}' /proc/$lh_pp/status 2>/dev/null); [ -z \"$lh_pp\" ] && break; [ \"$lh_pp\" = 0 ] && break; if [ \"$lh_pp\" = \"$$\" ]; then lh_anc=1; break; fi; lh_k=$((lh_k+1)); done; [ \"$lh_anc\" = 0 ] && echo \"关注：目录列表中不可见但可直接访问的进程：$lh_n $(cat /proc/$lh_n/comm 2>/dev/null)\"; done | head -n 100; echo '--- 与进程列表比对 ---'; lh_miss=$( (ps -e -o pid= 2>/dev/null | tr -d ' '; echo SEP; echo \"$lh_pids\") | awk 'BEGIN{sep=0} /^SEP$/{sep=1;next} !sep{seen[$1]=1} sep && !seen[$1]{print}' ); lh_ps2=$(ps -e -o pid= 2>/dev/null | tr -d ' '); for lh_n in $lh_miss; do [ -d \"/proc/$lh_n\" ] || continue; echo \"$lh_ps2\" | grep -qx \"$lh_n\" && continue; echo \"仅存在于 /proc 的进程: $lh_n\"; done | head -n 100"
     )
     .with_timeout(60)
     .flagging(command_findings::any_hit),
@@ -1312,8 +1345,9 @@ static CATALOG: &[CommandDefinition] = &[
         Processes,
         "可疑映像路径",
         "找出可执行文件位于临时目录或已被删除的进程。",
-        "ls -l /proc/[0-9]*/exe 2>/dev/null | grep -E 'deleted|/tmp/|/dev/shm|/var/tmp' | head -n 200"
+        "ls -l /proc/[0-9]*/exe 2>/dev/null | grep -E 'deleted|/tmp/|/dev/shm|/var/tmp' | head -n 200; echo '--- sshd 名称与链接比对 ---'; lh_sshd=$(command -v sshd 2>/dev/null); [ -n \"$lh_sshd\" ] || lh_sshd=/usr/sbin/sshd; lh_sshd=$(readlink -f \"$lh_sshd\" 2>/dev/null); if [ -n \"$lh_sshd\" ]; then for lh_p in /proc/[0-9]*/exe; do lh_t=$(readlink \"$lh_p\" 2>/dev/null); [ \"$lh_t\" = \"$lh_sshd\" ] || continue; lh_pid=${lh_p#/proc/}; lh_pid=${lh_pid%/exe}; lh_a=$(tr '\\000' ' ' < /proc/$lh_pid/cmdline 2>/dev/null | cut -d' ' -f1); case ${lh_a##*/} in sshd*) ;; *) echo \"关注：sshd 以名称 $lh_a 运行（软链接后门特征，PAM 将按该名称的配置认证，可能任意口令登录）：PID $lh_pid\";; esac; done; for lh_d in /tmp /var/tmp /dev/shm /home /root /usr/local/bin; do [ -d \"$lh_d\" ] || continue; find \"$lh_d\" -xdev -maxdepth 3 -type l 2>/dev/null | while read lh_l; do [ \"$(readlink -f \"$lh_l\" 2>/dev/null)\" = \"$lh_sshd\" ] && echo \"关注：软链接 $lh_l 指向 sshd 二进制 $lh_sshd\"; done; done | head -n 100; lh_ports=$(sshd -T 2>/dev/null | awk '/^port /{print $2}'); if command -v ss >/dev/null 2>&1 && [ -n \"$lh_ports\" ]; then ss -ltnp 2>/dev/null | grep sshd | while IFS= read -r lh_s; do lh_lp=$(echo \"$lh_s\" | awk '{print $4}' | awk -F: '{print $NF}'); echo \"$lh_ports\" | grep -qx \"$lh_lp\" || echo \"关注：sshd 监听了配置之外的端口：$lh_lp\"; done | head -n 50; else echo '# ss 或 sshd -T 不可用/无权限，监听端口比对未执行'; fi; else echo '# sshd 未安装，名称伪装比对未执行'; fi"
     )
+    .with_timeout(60)
     .flagging(command_findings::any_hit),
     portable!(
         "process-interpreters",
@@ -1411,9 +1445,9 @@ static CATALOG: &[CommandDefinition] = &[
         Persistence,
         "开机脚本与运行级",
         "查看 rc.local 与各运行级下的启动脚本。",
-        "cat /etc/rc.local 2>/dev/null; echo '--- init 脚本 ---'; ls -l /etc/init.d 2>/dev/null | head -n 100; echo '--- 运行级目录 ---'; ls -l /etc/rc*.d 2>/dev/null | head -n 200"
+        "cat /etc/rc.local 2>/dev/null; echo '--- init 脚本 ---'; ls -l /etc/init.d 2>/dev/null | head -n 100; echo '--- 运行级目录 ---'; ls -l /etc/rc*.d 2>/dev/null | head -n 200; echo '--- init 脚本内容 ---'; grep -nHE '(nohup|insmod|modprobe|/dev/tcp|/dev/udp|curl |wget |base64 -d|bash -i|sh -i|nc -e|socat )' /etc/init.d/* /etc/rc.d/init.d/* 2>/dev/null | head -n 200"
     )
-    .flagging(command_findings::remote_execution_hint),
+    .flagging(command_findings::startup_hook),
     portable!(
         "persistence-ldso",
         Persistence,
@@ -1429,7 +1463,7 @@ static CATALOG: &[CommandDefinition] = &[
         "读取全局 Shell 启动脚本，定位注入的命令。",
         "for f in /etc/profile /etc/bash.bashrc /etc/bashrc /etc/profile.d/*; do [ -f \"$f\" ] && { echo \"--- $f ---\"; cat \"$f\" 2>/dev/null; }; done 2>/dev/null | head -n 400"
     )
-    .flagging(command_findings::remote_execution_hint),
+    .flagging(command_findings::startup_hook),
     portable!(
         "persistence-user-rc",
         Persistence,
@@ -1437,7 +1471,7 @@ static CATALOG: &[CommandDefinition] = &[
         "读取各账号的 Shell 启动脚本。",
         "for f in /root/.bashrc /root/.bash_profile /root/.profile /home/*/.bashrc /home/*/.bash_profile /home/*/.profile; do [ -f \"$f\" ] && { echo \"--- $f ---\"; cat \"$f\" 2>/dev/null; }; done 2>/dev/null | head -n 400"
     )
-    .flagging(command_findings::remote_execution_hint),
+    .flagging(command_findings::startup_hook),
     portable!(
         "persistence-motd",
         Persistence,
@@ -1445,7 +1479,7 @@ static CATALOG: &[CommandDefinition] = &[
         "登录时自动执行的横幅脚本也可被用作后门。",
         "ls -l /etc/update-motd.d /etc/motd /etc/issue /etc/issue.net 2>/dev/null; echo '--- 脚本内容 ---'; cat /etc/update-motd.d/* 2>/dev/null | head -n 200"
     )
-    .flagging(command_findings::remote_execution_hint),
+    .flagging(command_findings::startup_hook),
     portable!(
         "persistence-udev",
         Persistence,
@@ -1467,9 +1501,9 @@ static CATALOG: &[CommandDefinition] = &[
         Persistence,
         "超级守护进程服务",
         "检查 inetd 与 xinetd 中注册的服务。",
-        "cat /etc/inetd.conf 2>/dev/null; ls -l /etc/xinetd.d 2>/dev/null; cat /etc/xinetd.d/* 2>/dev/null | head -n 200"
+        "cat /etc/inetd.conf 2>/dev/null; ls -l /etc/xinetd.d 2>/dev/null; cat /etc/xinetd.d/* 2>/dev/null | head -n 200; echo '--- tcpd 包装规则 ---'; grep -vE '^[[:space:]]*(#|$)' /etc/hosts.allow /etc/hosts.deny 2>/dev/null | head -n 200"
     )
-    .flagging(command_findings::remote_execution_hint),
+    .flagging(command_findings::startup_hook),
     portable!(
         "persistence-supervisor",
         Persistence,
@@ -1502,9 +1536,25 @@ static CATALOG: &[CommandDefinition] = &[
         Persistence,
         "命令别名与函数",
         "别名和函数可以劫持常用命令的行为。",
-        "grep -rnE '^[[:space:]]*(alias|function)[[:space:]]' /etc/profile /etc/profile.d /etc/bash.bashrc /etc/bashrc /root/.bashrc /home/*/.bashrc 2>/dev/null | head -n 200"
+        "grep -rnE '^[[:space:]]*(alias[[:space:]]|function[[:space:]]|trap[[:space:]]|[A-Za-z_][A-Za-z0-9_.-]*[[:space:]]*\\(\\)[[:space:]]*(\\{|$))' /etc/profile /etc/profile.d /etc/bash.bashrc /etc/bashrc /root/.bashrc /root/.bash_aliases /home/*/.bashrc /home/*/.bash_aliases /etc/profile.d/*.sh /root/.profile /home/*/.profile /root/.zshrc /home/*/.zshrc 2>/dev/null | head -n 200"
     )
-    .flagging(command_findings::remote_execution_hint),
+    .flagging(command_findings::shell_hijack),
+    portable!(
+        "persistence-python-pth",
+        Persistence,
+        "Python 自动导入文件",
+        "查找 site-packages 与 dist-packages 中带 import 的 .pth 文件；这些文件会在每次启动解释器时执行导入。",
+        "command -v find >/dev/null 2>&1 || { echo 'find 不可用，本项未执行'; exit 0; }; find /usr/lib/py*3* /usr/local/lib/py*3* /usr/lib64/py*3* -maxdepth 3 -name '*.pth' -type f 2>/dev/null | head -n 100; echo '--- 自动导入行 ---'; find /usr/lib/py*3* /usr/local/lib/py*3* /usr/lib64/py*3* -maxdepth 3 -name '*.pth' -type f -exec grep -nHE '^[[:space:]]*import[[:space:]]' {} + 2>/dev/null | head -n 100"
+    )
+    .flagging(command_findings::pth_autoimport),
+    portable!(
+        "persistence-git-hooks",
+        Persistence,
+        "Git 钩子脚本",
+        "查找工作目录版本库中的可执行钩子脚本；钩子在提交、推送等操作时被自动执行。",
+        "command -v find >/dev/null 2>&1 || { echo 'find 不可用，本项未执行'; exit 0; }; find /root /home /var/www /srv /opt -xdev -maxdepth 5 -type d -name hooks -path '*/.git/hooks' -exec ls -l -- {} + 2>/dev/null | head -n 200; echo '--- 可执行钩子 ---'; find /root /home /var/www /srv /opt -xdev -maxdepth 6 -type f -path '*/.git/hooks/*' -perm -100 ! -name '*.sample' 2>/dev/null | head -n 100 | while read lh_h; do echo \"关注：可执行 Git 钩子：$lh_h\"; done"
+    )
+    .flagging(command_findings::collection_finding),
     portable!(
         "log-ssh-accepted",
         Logs,
@@ -1672,7 +1722,7 @@ static CATALOG: &[CommandDefinition] = &[
         Files,
         "系统命令近期改动",
         "检查系统命令目录中最近改动的文件。",
-        "command -v find >/dev/null 2>&1 || { echo 'find 不可用，本项未执行'; exit 0; }; find /bin /sbin /usr/bin /usr/sbin /usr/local/bin /usr/local/sbin -xdev -type f -mtime -30 -exec ls -ld -- {} + 2>/dev/null | head -n 200"
+        "command -v find >/dev/null 2>&1 || { echo 'find 不可用，本项未执行'; exit 0; }; find /bin /sbin /usr/bin /usr/sbin /usr/local/bin /usr/local/sbin -xdev -type f -mtime -30 -exec ls -ld -- {} + 2>/dev/null | head -n 200; echo '--- 备份残留 ---'; lh_n=0; for d in /bin /sbin /usr/bin /usr/sbin /usr/local/bin; do [ -d \"$d\" ] || continue; for f in \"$d\"/*.bak \"$d\"/*.orig \"$d\"/*.old \"$d\"/*~ \"$d\"/.* \"$d\"/*bak; do [ -f \"$f\" ] || continue; n=${f##*/}; case \"$n\" in *.bak|*.orig|*.old) o=${n%.*};; *~) o=${n%~};; .*|*bak) o=${n#.}; o=${o%bak};; *) continue;; esac; [ -n \"$o\" ] && [ -e \"$d/$o\" ] || continue; echo \"命令备份残留：$f（对应 $d/$o）\"; lh_n=$((lh_n+1)); [ \"$lh_n\" -ge 200 ] && break 2; done; done; for pair in 'ps psd' 'ls lsd' 'netstat netstatd' 'top topd'; do set -- $pair; [ -e /usr/bin/$1 ] || [ -e /bin/$1 ] || continue; for d in /bin /sbin /usr/bin /usr/sbin /usr/local/bin; do [ -f \"$d/$2\" ] && echo \"命令备份残留：$d/$2（对应 $d/$1；需核实，$2 也可能是正常安装的工具）\"; done; done"
     )
     .with_timeout(60)
     .flagging(command_findings::any_hit),
@@ -1939,14 +1989,14 @@ static CATALOG: &[CommandDefinition] = &[
         "软件包文件完整性",
         "比对系统命令与安装包记录，发现被替换的文件。",
         FamilyCommands {
-            default: "rpm -Va --nomtime --nomode 2>/dev/null | head -n 300 || debsums -c 2>/dev/null | head -n 200 || echo '完整性校验工具不可用'",
-            debian: Some("command -v debsums >/dev/null 2>&1 && debsums -c 2>/dev/null | head -n 200 || echo 'debsums 未安装'"),
+            default: "rpm -Va --nomtime --nomode 2>/dev/null | head -n 300 || { if [ -f /var/lib/dpkg/info/dpkg.md5sums ]; then cd / && { grep -E ' (usr/)?bin/dpkg$' /var/lib/dpkg/info/dpkg.md5sums | md5sum -c --quiet 2>&1 || echo '关注：dpkg 程序与安装记录不一致，校验结果不可信（md5sum 自身未校验）'; }; fi; echo '# 仅校验关键软件包；完整校验需单独执行 dpkg --verify'; lh_installed=''; for lh_p in coreutils procps net-tools iproute2 iputils-ping inetutils-ping passwd login sudo openssh-server openssh-client findutils util-linux dpkg libpam-modules libpam-runtime cron bash; do dpkg-query -W -f='${Package}' \"$lh_p\" 2>/dev/null | grep -qx \"$lh_p\" && lh_installed=\"$lh_installed $lh_p\"; done; if [ -z \"$lh_installed\" ]; then echo '关键软件包均未安装'; elif command -v debsums >/dev/null 2>&1; then debsums -c $lh_installed 2>/dev/null | head -n 200; elif command -v dpkg >/dev/null 2>&1; then dpkg --verify $lh_installed 2>/dev/null | head -n 300; else echo 'debsums 与 dpkg 不可用'; fi; }",
+            debian: Some("{ if [ -f /var/lib/dpkg/info/dpkg.md5sums ]; then cd / && { grep -E ' (usr/)?bin/dpkg$' /var/lib/dpkg/info/dpkg.md5sums | md5sum -c --quiet 2>&1 || echo '关注：dpkg 程序与安装记录不一致，校验结果不可信（md5sum 自身未校验）'; }; fi; echo '# 仅校验关键软件包；完整校验需单独执行 dpkg --verify'; lh_installed=''; for lh_p in coreutils procps net-tools iproute2 iputils-ping inetutils-ping passwd login sudo openssh-server openssh-client findutils util-linux dpkg libpam-modules libpam-runtime cron bash; do dpkg-query -W -f='${Package}' \"$lh_p\" 2>/dev/null | grep -qx \"$lh_p\" && lh_installed=\"$lh_installed $lh_p\"; done; if [ -z \"$lh_installed\" ]; then echo '关键软件包均未安装'; elif command -v debsums >/dev/null 2>&1; then debsums -c $lh_installed 2>/dev/null | head -n 200; elif command -v dpkg >/dev/null 2>&1; then dpkg --verify $lh_installed 2>/dev/null | head -n 300; else echo 'debsums 与 dpkg 不可用'; fi; }"),
             redhat: Some("rpm -Va --nomtime --nomode 2>/dev/null | head -n 300"),
             alpine: Some("apk audit --system 2>/dev/null | head -n 200 || echo 'apk audit 不可用'"),
         },
     )
     .with_timeout(60)
-    .flagging(command_findings::any_hit),
+    .flagging(command_findings::package_verify_mismatch),
     CommandDefinition::adapted(
         "persistence-user-services",
         CommandCategory::Persistence,
@@ -2566,6 +2616,10 @@ fn truncate_utf8_bytes(value: &str) -> (String, bool) {
     }
     (value[..end].to_owned(), true)
 }
+
+#[cfg(test)]
+#[path = "command_lab.rs"]
+mod lab;
 
 #[cfg(test)]
 mod tests {

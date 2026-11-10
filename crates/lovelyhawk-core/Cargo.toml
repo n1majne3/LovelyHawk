@@ -20,6 +20,7 @@ lovelyhawk-win-dvc = { path = "../lovelyhawk-win-dvc" }
 parking_lot.workspace = true
 native-tls.workspace = true
 postgres-native-tls.workspace = true
+postgres-protocol.workspace = true
 reqwest.workspace = true
 regex.workspace = true
 russh.workspace = true
@@ -34,3 +35,4 @@ tracing.workspace = true
 url.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
+sha-crypt = "0.6.0"

@@ -57,7 +57,7 @@ const threatSummary = {
   topSourceIps: [],
   topTargetUsers: [],
   hourlyDistribution: Array.from({ length: 24 }, () => 0),
-  threatLevel: "none" as const,
+  threatLevel: "none" as const, breachedSources: [] as const,
 };
 
 function loadedState() {

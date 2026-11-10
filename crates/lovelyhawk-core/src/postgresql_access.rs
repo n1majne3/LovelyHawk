@@ -630,6 +630,11 @@ impl PostgresqlAccessReview {
             passwords: false,
         }
     }
+    /// Whether a role with this OID was observed in this review's role rows.
+    pub fn observed_role(&self, oid: u32) -> bool {
+        self.roles.reason.is_none() && self.roles.rows.iter().any(|row| row.fields.oid == oid)
+    }
+
     pub fn summary(&self) -> PostgresqlAccessSummary {
         PostgresqlAccessSummary {
             hba: self.hba.summary(),

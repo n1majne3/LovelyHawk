@@ -27,12 +27,15 @@ export interface SystemInfoRowMenuState {
 
 export interface SystemInfoRowActionState {
   subject: string;
+  rowId: string;
   action: SystemInfoRowActionEntry;
   inspection: SystemInfoRowInspection | null;
   plan: SystemInfoRowPlan | null;
   receipt: SystemInfoRowReceipt | null;
   busy: boolean;
   error: string | null;
+  /** `account.password` collects the new password before a plan exists. */
+  needsPassword: boolean;
 }
 
 interface MenuEvent {
@@ -65,6 +68,24 @@ export function rowActionFailureText(error: unknown): string {
       return "root 账户不在这里删除。要阻止它登录，可以改用锁定。";
     case "system-info-account-state":
       return "这个账户已经是这个状态了（例如已经锁定的账户再锁一次）。刷新一下看看它现在的状态。";
+    case "system-info-account-password-privilege":
+      return "修改账户口令需要 root 或免密码 sudo。当前账户没有这个权限，这次没有改动。";
+    case "system-info-account-password-tools":
+      return "目标机缺少可用的改口令工具（chpasswd -e 或 usermod），这次没有改动。";
+    case "system-info-account-password-field":
+      return "这个账户没有可安全改写的本地口令记录（可能是域账号、禁止登录标记或权限不足），这次没有改动。";
+    case "system-info-account-password-secret":
+      return "新口令不符合要求：12–1024 字节、不含控制字符、至少包含大写/小写/数字/其他中的三类、不含账号名。";
+    case "system-info-account-password-changed":
+      return "这个账户的口令记录在计划之后变了，这次没有写入。请刷新账户状态后再操作。";
+    case "system-info-firewall-privilege":
+      return "修改防火墙规则需要 root 或免密码 sudo。当前账户没有这个权限，这次没有改动。";
+    case "system-info-firewall-ufw":
+      return "目标主机用 ufw 管理防火墙，暂不支持在这里封禁；请在终端用 ufw deny from <地址> 处理。";
+    case "system-info-firewall-backend":
+      return "目标主机上没有找到可用的防火墙（firewalld、iptables、nftables 都不可用），这次没有改动。";
+    case "system-info-firewall-session":
+      return "这是当前 SSH 连接的来源地址，入方向封禁会切断本次连接，已拒绝。可改为只封出站，或换一条连接再操作。";
     case "system-info-binding-unavailable":
       return "与目标机的连接已经断开。";
     case "system-info-snapshot-stale":
@@ -173,8 +194,17 @@ export function useSystemInfoRowActions(
     ) return;
     const subject = current.actions.subject;
     const rowId = current.row.id;
+    // The password action collects its secret before a plan can be made; the
+    // dialog asks, submitPassword plans, and the usual confirm runs it.
+    if (action.key === "account.password") {
+      setState({
+        subject, rowId, action, inspection: null, plan: null, receipt: null,
+        busy: false, error: null, needsPassword: true,
+      });
+      return;
+    }
     inFlight.current = true;
-    setState({ subject, action, inspection: null, plan: null, receipt: null, busy: true, error: null });
+    setState({ subject, rowId, action, inspection: null, plan: null, receipt: null, busy: true, error: null, needsPassword: false });
     try {
       if (action.kind === "inspect") {
         const inspection = await api.inspectSystemInfoRow(
@@ -210,6 +240,39 @@ export function useSystemInfoRowActions(
     }
   }, [api, bindingHandle, menu, snapshotHandle]);
 
+  const submitPassword = useCallback(async (password: string) => {
+    const current = state;
+    if (
+      current === null ||
+      !current.needsPassword ||
+      bindingHandle === null ||
+      snapshotHandle === null ||
+      inFlight.current
+    ) return;
+    inFlight.current = true;
+    setState({ ...current, busy: true, error: null });
+    try {
+      const plan = await api.planSystemInfoRowAction(
+        bindingHandle,
+        snapshotHandle,
+        current.rowId,
+        current.action.key,
+        password,
+      );
+      if (!isSystemInfoRowPlan(plan) || plan.action !== current.action.key) {
+        throw new Error("目标机返回的操作计划无法识别。");
+      }
+      planHandleRef.current = plan.planHandle;
+      setState((previous) => previous === null ? null
+        : { ...previous, plan, needsPassword: false, busy: false, error: null });
+    } catch (error) {
+      setState((previous) => previous === null ? null
+        : { ...previous, busy: false, error: rowActionFailureText(error) });
+    } finally {
+      inFlight.current = false;
+    }
+  }, [api, bindingHandle, snapshotHandle, state]);
+
   const confirm = useCallback(async () => {
     const planHandle = planHandleRef.current;
     if (bindingHandle === null || planHandle === null || inFlight.current) return;
@@ -236,5 +299,5 @@ export function useSystemInfoRowActions(
     }
   }, [api, bindingHandle]);
 
-  return { menu, state, openMenu, dismissMenu, choose, confirm, close };
+  return { menu, state, openMenu, dismissMenu, choose, submitPassword, confirm, close };
 }

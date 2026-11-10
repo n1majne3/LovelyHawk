@@ -256,6 +256,8 @@ describe("system-info row action dialog", () => {
       <SystemInfoRowActionDialog
         state={{
           subject: "PID 4242 · /usr/bin/sshd -D",
+          rowId: "row-1",
+          needsPassword: false,
           action: { key: "process.command-line", label: "命令行参数", kind: "inspect", dangerous: false },
           inspection: inspection({ truncated: true }),
           plan: null,
@@ -264,6 +266,7 @@ describe("system-info row action dialog", () => {
           error: null,
         }}
         onConfirm={() => undefined}
+        onSubmitPassword={() => undefined}
         onCopyOutput={() => undefined}
         onClose={() => undefined}
       />,
@@ -281,6 +284,8 @@ describe("system-info row action dialog", () => {
   it("walks a change through plan, confirmation and receipt", () => {
     const base = {
       subject: "PID 4242 · /usr/bin/sshd -D",
+      rowId: "row-1",
+      needsPassword: false,
       action: { key: "process.signal.kill", label: "强制终止进程（SIGKILL）", kind: "change" as const, dangerous: true },
       inspection: null,
       busy: false,
@@ -290,6 +295,7 @@ describe("system-info row action dialog", () => {
       <SystemInfoRowActionDialog
         state={{ ...base, plan: null, receipt: null, busy: true }}
         onConfirm={() => undefined}
+        onSubmitPassword={() => undefined}
         onCopyOutput={() => undefined}
         onClose={() => undefined}
       />,
@@ -301,6 +307,7 @@ describe("system-info row action dialog", () => {
       <SystemInfoRowActionDialog
         state={{ ...base, plan: plan(), receipt: null }}
         onConfirm={() => undefined}
+        onSubmitPassword={() => undefined}
         onCopyOutput={() => undefined}
         onClose={() => undefined}
       />,
@@ -318,6 +325,7 @@ describe("system-info row action dialog", () => {
       <SystemInfoRowActionDialog
         state={{ ...base, plan: plan({ confirmed: true }), receipt: receipt() }}
         onConfirm={() => undefined}
+        onSubmitPassword={() => undefined}
         onCopyOutput={() => undefined}
         onClose={() => undefined}
       />,
@@ -330,6 +338,7 @@ describe("system-info row action dialog", () => {
       <SystemInfoRowActionDialog
         state={{ ...base, plan: plan({ confirmed: true }), receipt: receipt({ verified: false, restored: true }) }}
         onConfirm={() => undefined}
+        onSubmitPassword={() => undefined}
         onCopyOutput={() => undefined}
         onClose={() => undefined}
       />,

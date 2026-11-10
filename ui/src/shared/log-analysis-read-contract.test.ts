@@ -20,6 +20,7 @@ const threatSummary = {
   topTargetUsers: [],
   hourlyDistribution: Array.from({ length: 24 }, () => 0),
   threatLevel: "none",
+  breachedSources: [],
 };
 
 const snapshot = {

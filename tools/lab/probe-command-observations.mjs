@@ -20,9 +20,12 @@ const scripts = Object.fromEntries(names.map(name => {
   return [name, `${preamble}${body}\nlh_finish\n`];
 }));
 const shq = text => `'${String(text).replaceAll("'", "'\\''")}'`;
+const distro = process.env.LOVELYHAWK_LAB_DISTRO ?? ["Ubuntu", "kali-linux", "podman-machine-default"]
+  .find(candidate => spawnSync("wsl.exe", ["-d", candidate, "-e", "/bin/sh", "-c", "true"], { timeout: 15000, windowsHide: true }).status === 0);
+if (!distro) throw new Error("No usable WSL distro (Ubuntu/kali-linux/podman-machine-default)");
 function shell(script) {
-  const result = spawnSync("wsl.exe", ["-d", "Ubuntu", "-e", "/bin/sh"], {
-    input: script, encoding: "utf8", timeout: 75000, maxBuffer: 4 * 1024 * 1024, windowsHide: true,
+  const result = spawnSync("wsl.exe", ["-d", distro, "-e", "/bin/sh"], {
+    input: script.replace(/\r/g, ""), encoding: "utf8", timeout: 75000, maxBuffer: 4 * 1024 * 1024, windowsHide: true,
   });
   if (result.error || result.signal) throw result.error ?? new Error(`WSL ended: ${result.signal}`);
   return { status: result.status, stdout: result.stdout, stderr: result.stderr };
@@ -138,11 +141,18 @@ for p in 41 42 43; do mkdir -p ${shq(`${root}/basic/proc`)}/$p/ns; ln -s /usr/bi
     "files/var/www/site/database.sql": privateMarker,
     "files/var/www/site/settings.bak": privateMarker,
     "files/var/www/site/assets.zip": "legitimate downloadable archive",
+    "files/var/www/site/composer.json": '{"name":"demo/site"}',
+    "files/var/www/site/vendor/composer.json": '{"name":"vendor/inside"}',
+    "files/var/www/site/app.war": "packaged deployment",
+    "files/root/.aws/credentials": privateMarker,
+    "files/home/demo/.docker/config.json": privateMarker,
     "files/root/id_ed25519": privateMarker,
     "files/etc/private.dump": privateMarker,
     "files/home/demo/public_html/archive.dump": privateMarker,
     "files/var/www/site/strange\nname.php": "eval($_POST['not-safe-path']);",
     "files/var/www/site/deep/a/b/c/d/e/f/missed.php": "eval($_GET['beyond-depth']);",
+        "files/var/www/site/repo/.git/config": "[core]\nrepositoryformatversion = 0\n",
+    "files/var/www/site/repo/.svn/entries": "12\n",
   }, `ln -s ${shq(`${root}/files/root/.bash_history`)} ${shq(`${root}/files/var/www/site/link.php`)}\nchmod 600 ${shq(`${root}/files/root/id_ed25519`)}`);
   const filePrints = () => shell(`find ${shq(`${root}/files`)} -type f -print0 | sort -z | xargs -0 sha256sum\n`).stdout;
   const filesBefore = filePrints();
@@ -155,10 +165,18 @@ for p in 41 42 43; do mkdir -p ${shq(`${root}/basic/proc`)}/$p/ns; ln -s /usr/bi
   check("help, variable values, search text, comments and encrypted chpasswd stay neutral", {},
     [5, 6, 7, 8, 9, 10, 11, 12, 13, 16, 17, 18, 19].every(line => !result.stdout.includes(`.bash_history | 第 ${line} 行`)));
   result = shell(mapped("CREDENTIAL_FILE_OBSERVATIONS", "files"));
-  check("site secrets and backups are clues, ordinary archives and non-site dumps are neutral", result,
+  check("site secrets and backups are clues, archives flagged by wording, non-site dumps neutral", result,
     result.status === 1 && [".env.production", "backup.zip", "database.sql", "settings.bak", "archive.dump"].every(name => result.stdout.includes(`${name} |`)) &&
-    !result.stdout.includes("assets.zip") && !result.stdout.includes("private.dump") && !result.stdout.includes(privateMarker) &&
+    result.stdout.includes("assets.zip | 站点目录内压缩包") && result.stdout.includes("backup.zip | 站点目录内疑似备份压缩包") &&
+    result.stdout.includes("app.war | 站点目录内压缩包") &&
+    !result.stdout.includes("private.dump") && !result.stdout.includes(privateMarker) &&
     result.stdout.includes("id_ed25519") && result.stdout.includes("不证明能够通过网站下载"));
+  check("manifests flag outside vendor, cloud credentials list as attribute lines", {},
+    result.stdout.includes("composer.json | 站点目录内依赖或认证清单") &&
+    !result.stdout.includes("vendor/composer.json |") &&
+    result.stdout.includes(".aws/credentials") && result.stdout.includes(".docker/config.json"));
+  check("pruned version-control directories flag once without descending", {},
+    result.stdout.includes(".git | 站点目录内版本库") && !result.stdout.includes(".git/config") && !result.stdout.includes(".svn/config"));
   result = shell(mapped("WEB_CODE_OBSERVATIONS", "files"));
   check("PHP request execution, decoder execution and JSP/ASP direct calls have locations", result,
     result.status === 1 && [7, 8, 13].every(line => result.stdout.includes(`index.php | 第 ${line} 行`)) &&

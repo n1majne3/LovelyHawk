@@ -111,7 +111,7 @@ fn parse_ca(pem: &str) -> CoreResult<Certificate> {
     Certificate::from_pem(pem.as_bytes()).map_err(|_| invalid("CA 证书无法解析"))
 }
 
-fn invalid(reason: &'static str) -> CoreError {
+pub(crate) fn invalid(reason: &'static str) -> CoreError {
     CoreError::validation("PostgreSQL native transport", reason)
 }
 
@@ -122,9 +122,9 @@ fn endpoint_host(host: &str) -> &str {
 }
 
 pub(crate) struct NativeRuntimeRequest {
-    connection: DatabaseConnection,
-    tls: PostgresqlTlsSettings,
-    password: Option<SecretValue>,
+    pub(crate) connection: DatabaseConnection,
+    pub(crate) tls: PostgresqlTlsSettings,
+    pub(crate) password: Option<SecretValue>,
 }
 
 impl fmt::Debug for NativeRuntimeRequest {
@@ -171,6 +171,101 @@ impl NativeRuntimeRequest {
     pub(crate) fn port(&self) -> u16 {
         self.connection.port
     }
+
+    /// Same connection endpoint under another role's credentials, used by the
+    /// password-change login verification.
+    pub(crate) fn for_user(
+        &self,
+        username: &str,
+        password: Option<SecretValue>,
+    ) -> CoreResult<Self> {
+        let mut connection = self.connection.clone();
+        connection.username = Some(username.to_owned());
+        Self::new(connection, self.tls.clone(), password)
+    }
+}
+
+/// Which reviewed statement session a native connection presents to the
+/// database. The read-only profile keeps the exact option text pinned by
+/// tests; the write profile is only reachable from the password-change path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeSessionProfile {
+    ReadOnlyReview,
+    PasswordChange,
+}
+
+impl NativeSessionProfile {
+    fn options(self) -> &'static str {
+        match self {
+            Self::ReadOnlyReview => {
+                "-c default_transaction_read_only=on -c statement_timeout=20000 -c lock_timeout=3000 -c idle_in_transaction_session_timeout=5000 -c search_path=pg_catalog"
+            }
+            Self::PasswordChange => {
+                "-c statement_timeout=20000 -c lock_timeout=3000 -c idle_in_transaction_session_timeout=5000 -c search_path=pg_catalog"
+            }
+        }
+    }
+
+    fn application_name(self) -> &'static str {
+        match self {
+            Self::ReadOnlyReview => "LovelyHawk runtime review",
+            Self::PasswordChange => "LovelyHawk password change",
+        }
+    }
+}
+
+/// Closed connect-failure classes so callers can distinguish "the new
+/// credentials were rejected" from "the verification path could not be tried".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeConnectClass {
+    Authentication,
+    AccessRule,
+    Timeout,
+    Other,
+}
+
+#[derive(Debug)]
+pub(crate) struct NativeConnectError {
+    pub(crate) class: NativeConnectClass,
+    error: CoreError,
+}
+
+impl From<NativeConnectError> for CoreError {
+    fn from(error: NativeConnectError) -> Self {
+        error.error
+    }
+}
+
+/// An authenticated native session whose connection driver stays owned by the
+/// SSH actor task that created it.
+pub(crate) struct NativeConnection {
+    client: Client,
+    notices: Arc<AtomicUsize>,
+    driver: Pin<Box<dyn Future<Output = CoreResult<()>> + Send>>,
+}
+
+impl NativeConnection {
+    pub(crate) async fn run<F, T>(self, work: F) -> CoreResult<(T, usize)>
+    where
+        F: for<'a> FnOnce(&'a Client) -> Pin<Box<dyn Future<Output = CoreResult<T>> + Send + 'a>>,
+    {
+        let Self {
+            client,
+            notices,
+            mut driver,
+        } = self;
+        let result = tokio::select! {
+            result = work(&client) => result,
+            stopped = &mut driver => { stopped?; return Err(invalid("数据库在检查完成前关闭了连接")); }
+        };
+        drop(client);
+        if result.is_ok() {
+            tokio::time::timeout(Duration::from_secs(2), &mut driver)
+                .await
+                .map_err(|_| invalid("数据库连接关闭超时，结果尚未完成确认"))??;
+        }
+        result.map(|value| (value, notices.load(Ordering::Relaxed)))
+    }
 }
 
 #[derive(Debug)]
@@ -195,8 +290,28 @@ pub(crate) async fn read_over_stream<S, F, P>(
 ) -> CoreResult<NativeRuntimeRead>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    F: FnOnce(crate::postgresql_process::ProcessProbeInput) -> P + Send,
-    P: Future<Output = crate::postgresql_process::PostgresqlHostInspection> + Send,
+    F: FnOnce(crate::postgresql_process::ProcessProbeInput) -> P + Send + 'static,
+    P: Future<Output = crate::postgresql_process::PostgresqlHostInspection> + Send + 'static,
+{
+    let mode = request.tls.mode;
+    let connection = connect(stream, request, NativeSessionProfile::ReadOnlyReview).await?;
+    let (mut read, notices) = connection
+        .run(|client| Box::pin(read_queries(client, mode, probe)))
+        .await?;
+    read.notice_count = notices;
+    Ok(read)
+}
+
+/// Connects one reviewed native session. The same TLS and loopback rules
+/// apply to every session profile; only the statement timeouts and the
+/// application name differ.
+pub(crate) async fn connect<S>(
+    stream: S,
+    request: NativeRuntimeRequest,
+    session: NativeSessionProfile,
+) -> Result<NativeConnection, NativeConnectError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let mut config = Config::new();
     // connect_raw uses the supplied SSH stream, but still requires a hostname
@@ -210,47 +325,91 @@ where
             .expect("validated username"),
     );
     config.dbname(request.connection.database.as_deref().unwrap_or("postgres"));
-    config.application_name("LovelyHawk runtime review");
-    config.options("-c default_transaction_read_only=on -c statement_timeout=20000 -c lock_timeout=3000 -c idle_in_transaction_session_timeout=5000 -c search_path=pg_catalog");
+    config.application_name(session.application_name());
+    config.options(session.options());
     if let Some(password) = &request.password {
         config.password(password.expose());
     }
-    let mode = request.tls.mode;
-    match mode {
+    let classify =
+        |class: NativeConnectClass, error: CoreError| NativeConnectError { class, error };
+    match request.tls.mode {
         PostgresqlTlsMode::VerifyFull => {
             let mut builder = native_tls::TlsConnector::builder();
             builder.min_protocol_version(Some(Protocol::Tlsv12));
             if let Some(pem) = &request.tls.ca_certificate_pem {
-                builder.add_root_certificate(parse_ca(pem)?);
+                builder.add_root_certificate(
+                    parse_ca(pem).map_err(|error| classify(NativeConnectClass::Other, error))?,
+                );
             }
-            let connector = builder
-                .build()
-                .map_err(|_| invalid("无法建立数据库 TLS 验证器"))?;
+            let connector = builder.build().map_err(|_| {
+                classify(
+                    NativeConnectClass::Other,
+                    invalid("无法建立数据库 TLS 验证器"),
+                )
+            })?;
             let connector = postgres_native_tls::TlsConnector::new(connector, request.host());
             config.ssl_mode(SslMode::Require);
-            drop(request);
-            connect_and_read(
-                WireBudget::new(stream),
-                GuardedTls(connector),
-                config,
-                mode,
-                probe,
-            )
-            .await
+            connect_stream(WireBudget::new(stream), GuardedTls(connector), config).await
         }
         PostgresqlTlsMode::SshLoopback => {
             config.ssl_mode(SslMode::Disable);
-            drop(request);
-            connect_and_read(
-                FrameGuard::new(WireBudget::new(stream)),
-                NoTls,
-                config,
-                mode,
-                probe,
-            )
-            .await
+            connect_stream(FrameGuard::new(WireBudget::new(stream)), NoTls, config).await
         }
     }
+}
+
+async fn connect_stream<S, T>(
+    stream: S,
+    tls: T,
+    mut config: Config,
+) -> Result<NativeConnection, NativeConnectError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    T: TlsConnect<S>,
+    T::Stream: Send + 'static,
+{
+    let connected =
+        tokio::time::timeout(Duration::from_secs(12), config.connect_raw(stream, tls)).await;
+    // Our credential type is zeroizing. The driver owns its authentication
+    // copies; discard the Config's password as soon as authentication ends.
+    config.password(b"");
+    let (client, mut connection) = connected
+        .map_err(|_| NativeConnectError {
+            class: NativeConnectClass::Timeout,
+            error: invalid("数据库连接或认证超时"),
+        })?
+        .map_err(|error| {
+            let class = match error.code().map(|code| code.code()) {
+                Some("28P01") => NativeConnectClass::Authentication,
+                Some("28000") => NativeConnectClass::AccessRule,
+                _ => NativeConnectClass::Other,
+            };
+            NativeConnectError {
+                class,
+                error: database_error(
+                    "数据库连接或认证失败，请核对地址、口令、证书及访问规则",
+                    error,
+                ),
+            }
+        })?;
+    let notices = Arc::new(AtomicUsize::new(0));
+    let driver_notices = notices.clone();
+    // Connection's default Future logs server NOTICE text. Poll messages here
+    // instead, counting notices without allowing server-chosen text into logs.
+    let driver: Pin<Box<dyn Future<Output = CoreResult<()>> + Send>> = Box::pin(async move {
+        while let Some(message) = poll_fn(|cx| connection.poll_message(cx)).await {
+            message.map_err(|error| database_error("数据库连接中断，未取得完整结果", error))?;
+            if driver_notices.fetch_add(1, Ordering::Relaxed) >= MAX_NOTICES {
+                return Err(invalid("数据库返回的额外通知超过上限，检查已停止"));
+            }
+        }
+        Ok(())
+    });
+    Ok(NativeConnection {
+        client,
+        notices,
+        driver,
+    })
 }
 
 struct GuardedTls(postgres_native_tls::TlsConnector);
@@ -271,62 +430,6 @@ impl<S: TlsStream + Unpin> TlsStream for FrameGuard<S> {
     fn channel_binding(&self) -> ChannelBinding {
         self.inner().channel_binding()
     }
-}
-
-async fn connect_and_read<S, T, F, P>(
-    stream: S,
-    tls: T,
-    mut config: Config,
-    mode: PostgresqlTlsMode,
-    probe: F,
-) -> CoreResult<NativeRuntimeRead>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-    T: TlsConnect<S>,
-    F: FnOnce(crate::postgresql_process::ProcessProbeInput) -> P + Send,
-    P: Future<Output = crate::postgresql_process::PostgresqlHostInspection> + Send,
-{
-    let connected =
-        tokio::time::timeout(Duration::from_secs(12), config.connect_raw(stream, tls)).await;
-    // Our credential type is zeroizing. The driver owns its authentication
-    // copies; discard the Config's password as soon as authentication ends.
-    config.password(b"");
-    let (client, mut connection) = connected
-        .map_err(|_| invalid("数据库连接或认证超时"))?
-        .map_err(|error| {
-            database_error(
-                "数据库连接或认证失败，请核对地址、口令、证书及访问规则",
-                error,
-            )
-        })?;
-    let notices = Arc::new(AtomicUsize::new(0));
-    let driver_notices = notices.clone();
-    // Connection's default Future logs server NOTICE text. Poll messages here
-    // instead, counting notices without allowing server-chosen text into logs.
-    let driver = async {
-        while let Some(message) = poll_fn(|cx| connection.poll_message(cx)).await {
-            message.map_err(|error| database_error("数据库连接中断，未取得完整结果", error))?;
-            if driver_notices.fetch_add(1, Ordering::Relaxed) >= MAX_NOTICES {
-                return Err(invalid("数据库返回的额外通知超过上限，检查已停止"));
-            }
-        }
-        Ok(())
-    };
-    tokio::pin!(driver);
-    let result = tokio::select! {
-        result = read_queries(&client, mode, probe) => result,
-        stopped = &mut driver => { stopped?; return Err(invalid("数据库在检查完成前关闭了连接")); }
-    };
-    drop(client);
-    if result.is_ok() {
-        tokio::time::timeout(Duration::from_secs(2), &mut driver)
-            .await
-            .map_err(|_| invalid("数据库连接关闭超时，结果尚未完成确认"))??;
-    }
-    result.map(|mut read| {
-        read.notice_count = notices.load(Ordering::Relaxed);
-        read
-    })
 }
 
 async fn read_queries<F, P>(
@@ -478,7 +581,7 @@ pub(crate) async fn collect_tsv(
     Ok(output)
 }
 
-fn database_error(fallback: &'static str, error: tokio_postgres::Error) -> CoreError {
+pub(crate) fn database_error(fallback: &'static str, error: tokio_postgres::Error) -> CoreError {
     // Never include server detail, NOTICE, SQL text, usernames or authentication
     // payloads. Only these closed SQLSTATE mappings can affect public text.
     let reason = match error.code().map(|code| code.code()) {

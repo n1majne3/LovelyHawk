@@ -152,7 +152,7 @@ describe("AI history backend client boundary", () => {
 });
 
 describe("system-info backend client boundary", () => {
-  it("pins exactly ten RPC methods and validates every response DTO", () => {
+  it("pins exactly eleven RPC methods and validates every response DTO", () => {
     expect(SYSTEM_INFO_RPC_METHODS).toEqual({
       catalog: "system-info.catalog.get",
       summary: "system-info.summary.get",
@@ -164,8 +164,13 @@ describe("system-info backend client boundary", () => {
       rowConfirm: "system-info.row.action.confirm",
       rowExecute: "system-info.row.action.execute",
       rowCancel: "system-info.row.action.cancel",
+      firewall: "system-info.firewall",
     });
-    expect(Object.keys(SYSTEM_INFO_RPC_METHODS)).toHaveLength(10);
+    expect(Object.keys(SYSTEM_INFO_RPC_METHODS)).toHaveLength(11);
+    expect(BackendClient.prototype.planSystemInfoFirewallBlock.toString()).toContain("isSystemInfoFirewallPlan");
+    expect(BackendClient.prototype.executeSystemInfoFirewallBlock.toString()).toContain("isSystemInfoFirewallResult");
+    expect(BackendClient.prototype.planSystemInfoFirewallRestore.toString()).toContain("isSystemInfoFirewallRestorePlan");
+    expect(BackendClient.prototype.executeSystemInfoFirewallRestore.toString()).toContain("isSystemInfoFirewallResult");
     expect(BackendClient.prototype.getSystemInfoCatalog.toString()).toContain("isSystemInfoCatalog");
     expect(BackendClient.prototype.getSystemInfoSummary.toString()).toContain("isSystemInfoSummary");
     expect(BackendClient.prototype.collectSystemInfo.toString()).toContain("isSystemInfoTable");

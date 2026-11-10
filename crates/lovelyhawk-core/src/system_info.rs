@@ -62,7 +62,7 @@ const MAX_SUMMARY_CHARS: usize = 512;
 /// spends eleven seconds inside PAM on every command turned every one of them
 /// into "this action no longer applies to this row", which is not what had
 /// happened. The read-only investigations already sit at fifteen to thirty.
-const PRECONDITION_TIMEOUT: Duration = Duration::from_secs(20);
+pub(crate) const PRECONDITION_TIMEOUT: Duration = Duration::from_secs(20);
 
 const MAX_PROCESS_INVESTIGATION_CHARS: usize = 131_072;
 const MAX_SERVICE_INVESTIGATION_CHARS: usize = 131_072;
@@ -2650,7 +2650,7 @@ pub enum UserPasswordState {
 
 impl UserPasswordState {
     /// How the state reads on screen; `label` stays the stable journal word.
-    const fn display(self) -> &'static str {
+    pub(crate) const fn display(self) -> &'static str {
         match self {
             Self::Locked => "已锁定",
             Self::PasswordSet => "已设置口令",
@@ -3473,6 +3473,19 @@ impl SystemInfoTable {
         })
     }
 
+    /// Which account a password change would act on. Only the user inventory
+    /// resolves one — a login-history row names a person who logged in, not
+    /// necessarily a local account with a shadow slot.
+    pub fn user_password_request(&self, row_id: &str) -> CoreResult<UserIdentity> {
+        if self.tab != SystemInfoTab::Users {
+            return Err(CoreError::validation(
+                "user account operation",
+                "passwords are changed from the user inventory",
+            ));
+        }
+        self.user_identity(row_id)
+    }
+
     pub fn network_identity(&self, row_id: &str) -> CoreResult<NetworkConnectionIdentity> {
         network_identity_from_table(self, row_id)
     }
@@ -3532,9 +3545,9 @@ pub struct SystemInfoSummary {
 
 #[derive(Debug, Clone)]
 pub struct SystemInfoService {
-    ssh: SshService,
+    pub(crate) ssh: SshService,
     sftp: SftpService,
-    target: Arc<TargetContext>,
+    pub(crate) target: Arc<TargetContext>,
 }
 
 impl SystemInfoService {
@@ -4710,7 +4723,7 @@ impl SystemInfoService {
         parse_user_account_groups(&output.output)
     }
 
-    async fn user_account_snapshot(
+    pub(crate) async fn user_account_snapshot(
         &self,
         session: &BoundSshSession,
         username: &str,
@@ -7318,7 +7331,10 @@ fn user_account_action_verified(snapshot: &UserAccountSnapshot, action: UserAcco
     }
 }
 
-fn same_user_account_identity(left: &UserAccountSnapshot, right: &UserAccountSnapshot) -> bool {
+pub(crate) fn same_user_account_identity(
+    left: &UserAccountSnapshot,
+    right: &UserAccountSnapshot,
+) -> bool {
     left.username == right.username
         && left.uid == right.uid
         && left.gid == right.gid
@@ -7461,7 +7477,7 @@ fn user_account_delete_detail(
     }
 }
 
-fn user_account_snapshot_sha256(snapshot: &UserAccountSnapshot) -> String {
+pub(crate) fn user_account_snapshot_sha256(snapshot: &UserAccountSnapshot) -> String {
     let mut digest = Sha256::new();
     for value in [
         snapshot.username.as_str(),
@@ -8148,7 +8164,10 @@ fn parse_detail(request: &SystemInfoDetailRequest, output: &str) -> SystemInfoDe
 /// a host that is merely slow reads as a host whose state changed under you.
 pub const COMMAND_TIMEOUT_MARKER: &str = "timed_out=true";
 
-fn command_failed(subject: &'static str, output: &crate::ssh::SshCommandOutput) -> CoreError {
+pub(crate) fn command_failed(
+    subject: &'static str,
+    output: &crate::ssh::SshCommandOutput,
+) -> CoreError {
     CoreError::Validation {
         subject: "system information command",
         message: format!(
@@ -8288,7 +8307,7 @@ fn stable_row_id(tab: SystemInfoTab, cells: &[String]) -> String {
     format!("{}-{}", tab_id(tab), &digest[..24])
 }
 
-fn invalid_detail_key(subject: &'static str) -> CoreError {
+pub(crate) fn invalid_detail_key(subject: &'static str) -> CoreError {
     CoreError::Validation {
         subject: "system information detail identity",
         message: format!("invalid {subject}"),

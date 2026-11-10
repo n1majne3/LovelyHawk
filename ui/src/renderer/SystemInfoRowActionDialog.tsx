@@ -1,3 +1,5 @@
+import { useState } from "react";
+
 import type { SystemInfoRowActionState } from "./system-info-row-actions";
 import { useModalScrim } from "./modal-scrim";
 import { planExpiryLabel } from "./plan-expiry";
@@ -5,6 +7,7 @@ import { planExpiryLabel } from "./plan-expiry";
 export interface SystemInfoRowActionDialogProps {
   state: SystemInfoRowActionState;
   onConfirm: () => void;
+  onSubmitPassword: (password: string) => void;
   onCopyOutput: (text: string) => void;
   onClose: () => void;
 }
@@ -21,12 +24,17 @@ export interface SystemInfoRowActionDialogProps {
 export function SystemInfoRowActionDialog({
   state,
   onConfirm,
+  onSubmitPassword,
   onCopyOutput,
   onClose,
 }: SystemInfoRowActionDialogProps) {
   useModalScrim();
-  const { action, subject, inspection, plan, receipt, busy, error } = state;
+  const { action, subject, inspection, plan, receipt, busy, error, needsPassword } = state;
+  const [password, setPassword] = useState("");
+  const [passwordAgain, setPasswordAgain] = useState("");
   const isChange = action.kind === "change";
+  const passwordMismatch = passwordAgain.length > 0 && password !== passwordAgain;
+  const passwordReady = password.length >= 12 && password === passwordAgain;
   return (
     <div className="system-info-detail-backdrop" role="presentation">
       <section
@@ -71,7 +79,51 @@ export function SystemInfoRowActionDialog({
           </div>
         ) : receipt === null ? (
           <div className="system-info-action-body">
-            {plan === null && error === null ? (
+            {needsPassword && plan === null ? (
+              <div className="system-info-action-panel">
+                <p className="system-info-action-summary">
+                  输入要设置的新口令。口令只在本机计算成 SHA-512 crypt 散列，目标机收到的只有散列，不会看到明文。
+                </p>
+                <dl>
+                  <div>
+                    <dt><label htmlFor="row-password">新口令</label></dt>
+                    <dd>
+                      <input
+                        id="row-password"
+                        type="password"
+                        autoComplete="new-password"
+                        value={password}
+                        disabled={busy}
+                        onChange={(event) => setPassword(event.target.value)}
+                        data-testid="system-info-row-password"
+                      />
+                    </dd>
+                  </div>
+                  <div>
+                    <dt><label htmlFor="row-password-again">再次输入</label></dt>
+                    <dd>
+                      <input
+                        id="row-password-again"
+                        type="password"
+                        autoComplete="new-password"
+                        value={passwordAgain}
+                        disabled={busy}
+                        onChange={(event) => setPasswordAgain(event.target.value)}
+                        data-testid="system-info-row-password-again"
+                      />
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>要求</dt>
+                    <dd>12–1024 字节，不含控制字符，至少包含大写/小写/数字/其他中的三类，不含账号名。锁定账户改口令后仍是锁定状态。</dd>
+                  </div>
+                </dl>
+                {passwordMismatch ? (
+                  <p className="system-info-detail-state error" role="alert">两次输入的口令不一致。</p>
+                ) : null}
+              </div>
+            ) : null}
+            {plan === null && error === null && !needsPassword ? (
               <div className="system-info-detail-state" role="status">正在读取目标机上的当前状态并准备计划…</div>
             ) : null}
             {plan !== null ? (
@@ -89,15 +141,32 @@ export function SystemInfoRowActionDialog({
             {error !== null ? <div className="system-info-detail-state error" role="alert">{error}</div> : null}
             <footer>
               <button type="button" onClick={onClose} disabled={busy}>取消</button>
-              <button
-                type="button"
-                className="is-dangerous"
-                disabled={busy || plan === null}
-                data-testid="system-info-row-action-execute"
-                onClick={onConfirm}
-              >
-                {busy && plan !== null ? "执行中…" : "确认并执行"}
-              </button>
+              {needsPassword && plan === null ? (
+                <button
+                  type="button"
+                  className="is-primary"
+                  disabled={busy || !passwordReady}
+                  data-testid="system-info-row-password-submit"
+                  onClick={() => {
+                    const value = password;
+                    setPassword("");
+                    setPasswordAgain("");
+                    onSubmitPassword(value);
+                  }}
+                >
+                  {busy ? "正在计划…" : "生成计划"}
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  className="is-dangerous"
+                  disabled={busy || plan === null}
+                  data-testid="system-info-row-action-execute"
+                  onClick={onConfirm}
+                >
+                  {busy && plan !== null ? "执行中…" : "确认并执行"}
+                </button>
+              )}
             </footer>
           </div>
         ) : (

@@ -82,20 +82,64 @@ export function groupBaselineChecks(visible: readonly BaselineVisibleItem[]): Ba
   });
 }
 
+/**
+ * Some read-only checks report inert machine tokens (the catalogue's own
+ * wording) rather than a translated phrase — translate those per check.
+ * Everything else is already a real value (names, numbers, lists) and is
+ * shown exactly as the target reported it.
+ */
+// The catalogue never exposes item ids, so a check is named by the pair that
+// is unique among the token-emitting read-only items: component +
+// recommendation (the recommendation itself is written in the same token
+// alphabet as the observed value).
+const BASELINE_OBSERVED_TOKENS: Readonly<Record<string, Readonly<Record<string, string>>>> = {
+  "ssh:none": { none: "未发现弱算法" },
+  "ssh:enabled": { enabled: "已启用", absent: "未配置" },
+  "ssh:restricted": { restricted: "已限制", unrestricted: "未限制" },
+  "system:within-900": { "within-900": "不超过 900 秒", unset: "未设置" },
+  "system:ge-5": { "ge-5": "至少 5 次", unset: "未设置" },
+  "system:required": { required: "已要求 wheel 组", unset: "未设置" },
+  "system:none": { none: "无" },
+};
+
+const BASELINE_NUMERIC_UNITS: Readonly<Record<string, string>> = {
+  "system:within-900": "秒",
+  "system:ge-5": "次",
+};
+
+const baselineTokenKey = (item: BaselineCatalogItem): string =>
+  `${item.component}:${item.recommendation}`;
+
+export function baselineObservedLabel(item: BaselineCatalogItem, observed: string): string {
+  const key = baselineTokenKey(item);
+  const mapped = BASELINE_OBSERVED_TOKENS[key]?.[observed];
+  if (mapped !== undefined) return mapped;
+  const unit = BASELINE_NUMERIC_UNITS[key];
+  if (unit !== undefined && /^\d+$/u.test(observed)) return `${observed} ${unit}`;
+  return observed;
+}
+
+/** The recommendation is written in the same token alphabet as the value. */
+export function baselineRecommendationLabel(item: BaselineCatalogItem): string {
+  return baselineObservedLabel(item, item.recommendation);
+}
+
 /** The one line a compact card can spare for what the target actually has. */
 export function baselineValueSummary(
   item: BaselineCatalogItem,
   status: BaselineStatus | null,
 ): string {
-  const wanted = item.valueKind.kind === "choice" && item.valueKind.options.length === 1
-    ? item.valueKind.options[0] ?? item.recommendation
-    : item.recommendation;
+  const wanted = baselineRecommendationLabel(item.valueKind.kind === "choice" &&
+    item.valueKind.options.length === 1
+    ? { ...item, recommendation: item.valueKind.options[0] ?? item.recommendation }
+    : item);
   if (status === null) return `建议 ${wanted}`;
   if (!baselineApplies(status)) return "这台机器上没有这个软件";
   if (baselineNeedsReview(status)) return status.observed;
-  if (baselineCandidateScope(item.component) !== null) return `候选配置中发现 ${status.observed}，需核对生效范围`;
+  const observed = baselineObservedLabel(item, status.observed);
+  if (baselineCandidateScope(item.component) !== null) return `候选配置中发现 ${observed}，需核对生效范围`;
   if (status.compliant) return `${wanted}，符合`;
-  return `建议 ${wanted}，实际 ${status.observed}`;
+  return `建议 ${wanted}，实际 ${observed}`;
 }
 
 export function baselineScope(bindingHandle: string): string {

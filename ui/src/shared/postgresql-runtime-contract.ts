@@ -18,7 +18,33 @@ export type PostgresqlRuntimeRequest =
   | { action: "object-detail"; bindingHandle: string; jobHandle: string; section: ObjectSection; oid: number; subId: number; roleOid: number | null }
   | { action: "role-access"; bindingHandle: string; jobHandle: string; roleOid: number; mode: RoleAccessMode; query: string; offset: number }
   | { action: "access-rows"; bindingHandle: string; jobHandle: string; section: AccessSection; query: string; offset: number }
-  | { action: "rows"; bindingHandle: string; jobHandle: string; query: string; offset: number };
+  | { action: "rows"; bindingHandle: string; jobHandle: string; query: string; offset: number }
+  | { action: "plan-password"; bindingHandle: string; profileHandle: string; role: PostgresqlPasswordRole; password: string; updateSavedPassword: boolean }
+  | { action: "execute-password"; bindingHandle: string; planHandle: string }
+  | { action: "plan-password-restore"; bindingHandle: string; restoreHandle: string; profileHandle: string }
+  | { action: "execute-password-restore"; bindingHandle: string; planHandle: string };
+export type PostgresqlPasswordRole = { kind: "current" } | { kind: "oid"; oid: number };
+export interface PostgresqlPasswordPlanView {
+  roleName: string; isConnectionRole: boolean; superuser: boolean; replication: boolean;
+  format: "scram-sha-256" | "md5"; restorable: boolean; updatesSavedPassword: boolean;
+  warnings: PostgresqlPasswordWarning[];
+}
+export const postgresqlPasswordWarnings = ["md5-weak", "replication-role", "superuser-role", "connection-role", "not-restorable"] as const;
+export type PostgresqlPasswordWarning = typeof postgresqlPasswordWarnings[number];
+export interface PostgresqlPasswordRestorePlanView { roleName: string; savedPasswordWasUpdated: boolean; }
+export type PostgresqlPasswordVerification =
+  | { state: "passed" | "rejected"; reason: null }
+  | { state: "unverifiable"; reason: "access-rule" | "network" | "timeout" | "other" };
+export type SavedPasswordUpdate = "not-requested" | "updated" | "profile-changed" | "skipped-verification-not-passed" | "failed";
+export type SavedPasswordRestore = "not-applicable" | "restored" | "profile-changed" | "skipped-verification-not-passed" | "failed";
+export interface PostgresqlPasswordResult {
+  verification: PostgresqlPasswordVerification; savedPassword: SavedPasswordUpdate; restorable: boolean;
+  journalRecorded: boolean; restoreHandle: string | null; restoreUnavailable: boolean; profile: PostgresqlProfileSummary | null;
+}
+export interface PostgresqlPasswordRestoreResult {
+  verification: "passed" | "mismatch" | "unverified"; savedPassword: SavedPasswordRestore;
+  journalRecorded: boolean; profile: PostgresqlProfileSummary | null;
+}
 export interface PostgresqlProfileSummary {
   profileHandle: string; name: string; host: string; port: number; username: string; database: string;
   tlsMode: PostgresqlTlsMode; hasPassword: boolean; hasCa: boolean; unassigned: boolean;
@@ -70,13 +96,17 @@ export type PostgresqlRuntimeResponse =
   | PostgresqlObjectDetail
   | PostgresqlRolePage
   | PostgresqlAccessPage
-  | { kind: "rejected"; action: PostgresqlRuntimeRequest["action"]; code: "invalid-params" | "stale" | "busy" | "capacity" | "store"; detail: string }
+  | { kind: "rejected"; action: PostgresqlRuntimeRequest["action"]; code: "invalid-params" | "stale" | "busy" | "capacity" | "store" | "unknown-state" | "rejected"; detail: string }
   | { kind: "profiles"; profiles: PostgresqlProfileSummary[] }
   | { kind: "editor"; profile: PostgresqlProfileSummary; caPem: string | null }
   | { kind: "saved"; profile: PostgresqlProfileSummary }
   | { kind: "delete-plan"; planHandle: string; profile: PostgresqlProfileSummary; expiresInMs: number }
   | { kind: "deleted"; planHandle: string; profileHandle: string; verified: boolean; detail: string }
   | { kind: "job"; job: PostgresqlRuntimeJob }
+  | { kind: "password-plan"; planHandle: string; expiresInMs: number; plan: PostgresqlPasswordPlanView }
+  | { kind: "password-result"; result: PostgresqlPasswordResult }
+  | { kind: "password-restore-plan"; planHandle: string; expiresInMs: number; plan: PostgresqlPasswordRestorePlanView }
+  | { kind: "password-restore-result"; result: PostgresqlPasswordRestoreResult }
   | { kind: "rows"; jobHandle: string; query: string; offset: number; matched: number; total: number; rows: PostgresqlRuntimeRow[] };
 export interface PostgresqlRuntimeApi {
   postgresqlRuntime(request: PostgresqlRuntimeRequest): Promise<PostgresqlRuntimeResponse>;
@@ -136,8 +166,39 @@ export function isPostgresqlRuntimeRequest(value: unknown): value is PostgresqlR
       typeof value.section === "string" && ["hba", "ident", "roles", "memberships"].includes(value.section) && string(value.query, 128, true) && integer(value.offset, value.section === "memberships" ? 2048 : 1024);
     case "rows": return keys(value, [...basic, "jobHandle", "query", "offset"]) && string(value.jobHandle, 128) &&
       string(value.query, 128, true) && integer(value.offset, 16384);
+    case "plan-password": return keys(value, [...basic, "profileHandle", "role", "password", "updateSavedPassword"]) && string(value.profileHandle, 128) &&
+      passwordRole(value.role) && passwordText(value.password) && typeof value.updateSavedPassword === "boolean";
+    case "execute-password": return keys(value, [...basic, "planHandle"]) && string(value.planHandle, 128);
+    case "plan-password-restore": return keys(value, [...basic, "restoreHandle", "profileHandle"]) && string(value.restoreHandle, 128) && string(value.profileHandle, 128);
+    case "execute-password-restore": return keys(value, [...basic, "planHandle"]) && string(value.planHandle, 128);
     default: return false;
   }
+}
+function passwordRole(value: unknown): value is PostgresqlPasswordRole {
+  return record(value) && (value.kind === "current" ? keys(value, ["kind"]) : value.kind === "oid" && keys(value, ["kind", "oid"]) && integer(value.oid, 4294967295, 1));
+}
+function passwordText(value: unknown): boolean {
+  return typeof value === "string" && encoder.encode(value).length <= 1024 && !value.includes("\0") && !/[\uD800-\uDFFF]/u.test(value);
+}
+function passwordPlanView(value: unknown): value is PostgresqlPasswordPlanView {
+  return record(value) && keys(value, ["roleName", "isConnectionRole", "superuser", "replication", "format", "restorable", "updatesSavedPassword", "warnings"]) &&
+    string(value.roleName, 128) && typeof value.isConnectionRole === "boolean" && typeof value.superuser === "boolean" && typeof value.replication === "boolean" &&
+    oneOf(value.format, ["scram-sha-256", "md5"]) && typeof value.restorable === "boolean" && typeof value.updatesSavedPassword === "boolean" &&
+    Array.isArray(value.warnings) && value.warnings.length <= postgresqlPasswordWarnings.length && value.warnings.every(warning => oneOf(warning, postgresqlPasswordWarnings)) &&
+    new Set(value.warnings).size === value.warnings.length;
+}
+function restorePlanView(value: unknown): value is PostgresqlPasswordRestorePlanView {
+  return record(value) && keys(value, ["roleName", "savedPasswordWasUpdated"]) && string(value.roleName, 128) && typeof value.savedPasswordWasUpdated === "boolean";
+}
+function passwordVerification(value: unknown): value is PostgresqlPasswordVerification {
+  return record(value) && keys(value, ["state", "reason"]) &&
+    (oneOf(value.state, ["passed", "rejected"]) && value.reason === null || value.state === "unverifiable" && oneOf(value.reason, ["access-rule", "network", "timeout", "other"]));
+}
+function savedUpdate(value: unknown): value is SavedPasswordUpdate {
+  return oneOf(value, ["not-requested", "updated", "profile-changed", "skipped-verification-not-passed", "failed"]);
+}
+function savedRestore(value: unknown): value is SavedPasswordRestore {
+  return oneOf(value, ["not-applicable", "restored", "profile-changed", "skipped-verification-not-passed", "failed"]);
 }
 function profileSummary(value: unknown): value is PostgresqlProfileSummary {
   return record(value) && keys(value, ["profileHandle", "name", "host", "port", "username", "database", "tlsMode", "hasPassword", "hasCa", "unassigned"]) &&
@@ -219,7 +280,7 @@ function job(value: unknown): value is PostgresqlRuntimeJob {
 export function isPostgresqlRuntimeResponse(value: unknown): value is PostgresqlRuntimeResponse {
   if (!record(value)) return false;
   switch (value.kind) {
-    case "rejected": return keys(value, ["kind", "action", "code", "detail"]) && oneOf(value.action, ["list", "edit", "save", "plan-delete", "delete", "begin", "poll", "cancel", "rows", "access-rows", "role-access", "object-rows", "object-detail", "retain", "discard-evidence"]) && oneOf(value.code, ["invalid-params", "stale", "busy", "capacity", "store"]) && string(value.detail, 2048);
+    case "rejected": return keys(value, ["kind", "action", "code", "detail"]) && oneOf(value.action, ["list", "edit", "save", "plan-delete", "delete", "begin", "poll", "cancel", "rows", "access-rows", "role-access", "object-rows", "object-detail", "retain", "discard-evidence", "plan-password", "execute-password", "plan-password-restore", "execute-password-restore"]) && oneOf(value.code, ["invalid-params", "stale", "busy", "capacity", "store", "unknown-state", "rejected"]) && string(value.detail, 2048);
     case "profiles": return keys(value, ["kind", "profiles"]) && Array.isArray(value.profiles) && value.profiles.length <= 256 &&
       value.profiles.every(profileSummary) && new Set(value.profiles.map(item => item.profileHandle)).size === value.profiles.length;
     case "editor": return keys(value, ["kind", "profile", "caPem"]) && profileSummary(value.profile) && certificate(value.caPem) && value.profile.hasCa === (value.caPem !== null);
@@ -227,6 +288,14 @@ export function isPostgresqlRuntimeResponse(value: unknown): value is Postgresql
     case "delete-plan": return keys(value, ["kind", "planHandle", "profile", "expiresInMs"]) && string(value.planHandle, 128) && profileSummary(value.profile) && integer(value.expiresInMs, 120000, 1);
     case "deleted": return keys(value, ["kind", "planHandle", "profileHandle", "verified", "detail"]) && string(value.planHandle, 128) && string(value.profileHandle, 128) && typeof value.verified === "boolean" && string(value.detail, 2048);
     case "job": return keys(value, ["kind", "job"]) && job(value.job);
+    case "password-plan": return keys(value, ["kind", "planHandle", "expiresInMs", "plan"]) && string(value.planHandle, 128) && integer(value.expiresInMs, 120000, 1) && passwordPlanView(value.plan);
+    case "password-result": return keys(value, ["kind", "result"]) && record(value.result) && keys(value.result, ["verification", "savedPassword", "restorable", "journalRecorded", "restoreHandle", "restoreUnavailable", "profile"]) &&
+      passwordVerification(value.result.verification) && savedUpdate(value.result.savedPassword) && typeof value.result.restorable === "boolean" && typeof value.result.journalRecorded === "boolean" && typeof value.result.restoreUnavailable === "boolean" &&
+      (value.result.restoreHandle === null || string(value.result.restoreHandle, 128)) && (value.result.profile === null || profileSummary(value.result.profile));
+    case "password-restore-plan": return keys(value, ["kind", "planHandle", "expiresInMs", "plan"]) && string(value.planHandle, 128) && integer(value.expiresInMs, 120000, 1) && restorePlanView(value.plan);
+    case "password-restore-result": return keys(value, ["kind", "result"]) && record(value.result) && keys(value.result, ["verification", "savedPassword", "journalRecorded", "profile"]) &&
+      oneOf(value.result.verification, ["passed", "mismatch", "unverified"]) && savedRestore(value.result.savedPassword) && typeof value.result.journalRecorded === "boolean" &&
+      (value.result.profile === null || profileSummary(value.result.profile));
     case "object-rows": return isPostgresqlObjectPage(value);
     case "object-detail": return isPostgresqlObjectDetail(value);
     case "role-access": return isPostgresqlRolePage(value);
@@ -257,5 +326,9 @@ export function matchesPostgresqlRuntimeResponse(request: PostgresqlRuntimeReque
     case "role-access": return response.kind === "role-access" && response.jobHandle === request.jobHandle && response.roleOid === request.roleOid && response.mode === request.mode && response.query === request.query && response.offset === request.offset;
     case "access-rows": return response.kind === "access-rows" && response.jobHandle === request.jobHandle && response.section === request.section && response.query === request.query && response.offset === request.offset;
     case "rows": return response.kind === "rows" && response.jobHandle === request.jobHandle && response.query === request.query && response.offset === request.offset;
+    case "plan-password": return response.kind === "password-plan";
+    case "execute-password": return response.kind === "password-result";
+    case "plan-password-restore": return response.kind === "password-restore-plan";
+    case "execute-password-restore": return response.kind === "password-restore-result";
   }
 }

@@ -38,6 +38,8 @@ pub(crate) struct SystemInfoApi {
     /// Changes an operator asked for from a row and has not yet approved or
     /// run. See `system_info_action_api`.
     pub(crate) plans: Mutex<RowPlanRegistry>,
+    /// Firewall-block plans and restore handles, per binding.
+    pub(crate) firewall: Mutex<crate::system_info_action_api::FirewallRegistry>,
 }
 
 impl fmt::Debug for SystemInfoApi {
@@ -61,6 +63,7 @@ impl SystemInfoApi {
             ssh,
             snapshots: Mutex::new(SnapshotRegistry::default()),
             plans: Mutex::new(RowPlanRegistry::default()),
+            firewall: Mutex::new(crate::system_info_action_api::FirewallRegistry::default()),
         }
     }
 
@@ -74,6 +77,9 @@ impl SystemInfoApi {
         }
         if let Ok(mut plans) = self.plans.lock() {
             plans.close_binding(binding_handle);
+        }
+        if let Ok(mut firewall) = self.firewall.lock() {
+            firewall.close_binding(binding_handle);
         }
     }
 

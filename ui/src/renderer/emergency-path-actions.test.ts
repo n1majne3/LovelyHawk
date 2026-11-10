@@ -348,4 +348,14 @@ describe("emergency file action lifecycle", () => {
     expect(refusal).toContain("重新查看文件属性");
     expect(refusal).not.toContain("已经没有执行位");
   });
+
+  it("translates each capability-strip refusal into its own next step", () => {
+    expect(reason("x (emergency-path-capability-tools)", "remove-capabilities")).toContain("setcap");
+    expect(reason("x (emergency-path-capability-privilege)", "remove-capabilities")).toContain("sudo");
+    expect(reason("x (emergency-path-capability-kind)", "remove-capabilities")).toContain("普通文件");
+    expect(reason("x (emergency-path-capability-empty)", "remove-capabilities")).toContain("没有文件能力");
+    // An unknown code and another action's code both stay untouched.
+    expect(reason("x (emergency-path-capability-empty)", "disarm")).toBe("x (emergency-path-capability-empty)");
+    expect(reason("x (emergency-path-other)", "remove-capabilities")).toBe("x (emergency-path-other)");
+  });
 });

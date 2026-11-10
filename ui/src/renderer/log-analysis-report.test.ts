@@ -38,7 +38,7 @@ const quiet: LogThreatSummary = {
   topSourceIps: [{ ip: "198.51.100.7", count: 3, lastSeen: "Oct 13 15:00:01", actionType: "failed-password" }],
   topTargetUsers: [{ username: "root", count: 4, successCount: 1, failCount: 3 }],
   hourlyDistribution: Array.from({ length: 24 }, (_, hour) => (hour === 15 ? 4 : 0)),
-  threatLevel: "medium",
+  threatLevel: "medium" as const, breachedSources: [],
 };
 
 function read(entries: PublicLogEntry[], extra: Partial<LogSourceReadResult> = {}): LogSourceReadResult {

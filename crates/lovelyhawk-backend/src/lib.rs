@@ -88,7 +88,7 @@ use crate::{
         DockerFileCopyDirection, DockerWriteAction, DockerWriteApi, DockerWriteApiError,
     },
     emergency_command_api::{EmergencyCommandApi, EmergencyCommandApiError},
-    emergency_path_api::{EmergencyPathAction, EmergencyPathApiError},
+    emergency_path_api::{EmergencyPathAction, EmergencyPathApiError, PathRefusal},
     file_evidence_api::{FileEvidenceApi, FileEvidenceError, FileEvidenceRequest},
     integrity_api::{IntegrityApi, IntegrityApiError},
     integrity_write_api::IntegrityWriteApi,
@@ -1054,6 +1054,9 @@ impl BackendState {
                             &params.snapshot_handle,
                             &params.row_id,
                             &params.action,
+                            params
+                                .password
+                                .map(lovelyhawk_core::crypto::SecretValue::new),
                         )
                         .await
                         .map(to_value)
@@ -1088,6 +1091,18 @@ impl BackendState {
                         .system_info
                         .cancel_row_action(&params.binding_handle, &params.plan_handle)
                         .map(|()| to_value(serde_json::json!({ "cancelled": true })))
+                        .map_err(system_info_failure),
+                    Err(failure) => Err(failure),
+                }
+            }
+            RpcMethod::SystemInfoFirewall => {
+                match parse_params::<crate::system_info_action_api::FirewallRequest>(request.params)
+                {
+                    Ok(params) => self
+                        .system_info
+                        .firewall(params)
+                        .await
+                        .map(Ok)
                         .map_err(system_info_failure),
                     Err(failure) => Err(failure),
                 }
@@ -2866,6 +2881,8 @@ enum RpcMethod {
     SystemInfoRowActionExecute,
     #[serde(rename = "system-info.row.action.cancel")]
     SystemInfoRowActionCancel,
+    #[serde(rename = "system-info.firewall")]
+    SystemInfoFirewall,
     #[serde(rename = "baseline.catalog.get")]
     BaselineCatalogGet,
     #[serde(rename = "baseline.scan")]
@@ -3295,6 +3312,9 @@ struct SystemInfoRowActionParams {
     row_id: String,
     /// One of the fixed keys the sidecar hands out; anything else is nothing.
     action: String,
+    /// Only `account.password` may carry one; the api layer refuses it
+    /// anywhere else. It becomes a SecretValue before it moves anywhere.
+    password: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -4741,6 +4761,83 @@ fn system_info_failure(error: SystemInfoApiError) -> RpcFailure {
                         "The account is already in that state.",
                     )
                 }
+                CoreError::Validation { subject, .. }
+                    if *subject
+                        == lovelyhawk_core::account_password::ACCOUNT_PASSWORD_PRIVILEGE_REFUSAL =>
+                {
+                    (
+                        "system-info-account-password-privilege",
+                        "Changing an account password needs root or passwordless sudo.",
+                    )
+                }
+                CoreError::Validation { subject, .. }
+                    if *subject
+                        == lovelyhawk_core::account_password::ACCOUNT_PASSWORD_TOOLS_REFUSAL =>
+                {
+                    (
+                        "system-info-account-password-tools",
+                        "No usable password tool (chpasswd -e or usermod) is on the host.",
+                    )
+                }
+                CoreError::Validation { subject, .. }
+                    if *subject
+                        == lovelyhawk_core::account_password::ACCOUNT_PASSWORD_FIELD_REFUSAL =>
+                {
+                    (
+                        "system-info-account-password-field",
+                        "The account has no writable local password slot.",
+                    )
+                }
+                CoreError::Validation { subject, .. }
+                    if *subject
+                        == lovelyhawk_core::account_password::ACCOUNT_PASSWORD_SECRET_REFUSAL =>
+                {
+                    (
+                        "system-info-account-password-secret",
+                        "The new password does not meet the required policy.",
+                    )
+                }
+                CoreError::Validation { subject, .. }
+                    if *subject
+                        == lovelyhawk_core::account_password::ACCOUNT_PASSWORD_CHANGED_REFUSAL =>
+                {
+                    (
+                        "system-info-account-password-changed",
+                        "The account's password record changed after the plan was made.",
+                    )
+                }
+                CoreError::Validation { subject, .. }
+                    if *subject == lovelyhawk_core::firewall_block::FIREWALL_PRIVILEGE_REFUSAL =>
+                {
+                    (
+                        "system-info-firewall-privilege",
+                        "Changing firewall rules needs root or passwordless sudo.",
+                    )
+                }
+                CoreError::Validation { subject, .. }
+                    if *subject == lovelyhawk_core::firewall_block::FIREWALL_UFW_REFUSAL =>
+                {
+                    (
+                        "system-info-firewall-ufw",
+                        "The host manages its rules with ufw, which is not supported yet.",
+                    )
+                }
+                CoreError::Validation { subject, .. }
+                    if *subject == lovelyhawk_core::firewall_block::FIREWALL_BACKEND_REFUSAL =>
+                {
+                    (
+                        "system-info-firewall-backend",
+                        "No supported firewall backend was found.",
+                    )
+                }
+                CoreError::Validation { subject, .. }
+                    if *subject == lovelyhawk_core::firewall_block::FIREWALL_SESSION_REFUSAL =>
+                {
+                    (
+                        "system-info-firewall-session",
+                        "Blocking that address inbound would cut this SSH session.",
+                    )
+                }
                 _ => (
                     "system-info-action-unavailable",
                     "That action does not apply to the selected row any more.",
@@ -5955,6 +6052,32 @@ fn emergency_path_failure(error: EmergencyPathApiError) -> RpcFailure {
             code: "emergency-command-timeout",
             public_message: "The emergency command operation exceeded its deadline.",
             source: None,
+        },
+        EmergencyPathApiError::Refused(refusal) => match refusal {
+            PathRefusal::Tools => RpcFailure {
+                operation: "plan a capability removal",
+                code: "emergency-path-capability-tools",
+                public_message: "The target lacks the tools needed to safely change file capabilities.",
+                source: None,
+            },
+            PathRefusal::Privilege => RpcFailure {
+                operation: "plan a capability removal",
+                code: "emergency-path-capability-privilege",
+                public_message: "Changing file capabilities needs root or passwordless sudo on the target.",
+                source: None,
+            },
+            PathRefusal::Kind => RpcFailure {
+                operation: "plan a capability removal",
+                code: "emergency-path-capability-kind",
+                public_message: "Only a regular file's capabilities can be removed this way.",
+                source: None,
+            },
+            PathRefusal::Empty => RpcFailure {
+                operation: "plan a capability removal",
+                code: "emergency-path-capability-empty",
+                public_message: "That file currently has no capabilities to remove.",
+                source: None,
+            },
         },
     }
 }

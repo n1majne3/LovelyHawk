@@ -5,6 +5,8 @@ import {
   baselineCategoryLabel,
   baselineComplianceLabel,
   baselineHistoryStateLabel,
+  baselineObservedLabel,
+  baselineRecommendationLabel,
   baselineRiskLabel,
   baselineScope,
   baselineNeedsReview,
@@ -111,5 +113,26 @@ describe("baseline read helpers", () => {
     expect(baselineComplianceLabel(scan.statuses[0]!)).toBe("不符合");
     expect(baselineValueKindLabel(items[0]!.valueKind)).toBe("选项：yes / no");
     expect(baselineValueKindLabel(items[1]!.valueKind)).toBe("整数范围：0–2");
+  });
+
+  it("translates the read-only checks' inert tokens without touching real values", () => {
+    const tokenItem = (component: string, recommendation: string): BaselineCatalogItem => ({
+      ...items[0]!,
+      component: component as BaselineCatalogItem["component"],
+      recommendation,
+    });
+    expect(baselineObservedLabel(tokenItem("ssh", "none"), "none")).toBe("未发现弱算法");
+    expect(baselineObservedLabel(tokenItem("ssh", "enabled"), "absent")).toBe("未配置");
+    expect(baselineObservedLabel(tokenItem("ssh", "restricted"), "unrestricted")).toBe("未限制");
+    expect(baselineObservedLabel(tokenItem("system", "within-900"), "within-900")).toBe("不超过 900 秒");
+    expect(baselineObservedLabel(tokenItem("system", "within-900"), "1200")).toBe("1200 秒");
+    expect(baselineObservedLabel(tokenItem("system", "ge-5"), "ge-5")).toBe("至少 5 次");
+    expect(baselineObservedLabel(tokenItem("system", "ge-5"), "3")).toBe("3 次");
+    expect(baselineObservedLabel(tokenItem("system", "required"), "required")).toBe("已要求 wheel 组");
+    expect(baselineObservedLabel(tokenItem("system", "none"), "none")).toBe("无");
+    // Real values and unknown checks pass through untouched.
+    expect(baselineObservedLabel(tokenItem("system", "none"), "admin,svc(+2)")).toBe("admin,svc(+2)");
+    expect(baselineObservedLabel(items[0]!, "enabled")).toBe("enabled");
+    expect(baselineRecommendationLabel(tokenItem("system", "within-900"))).toBe("不超过 900 秒");
   });
 });

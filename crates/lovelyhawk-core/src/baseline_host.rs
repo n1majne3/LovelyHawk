@@ -186,6 +186,40 @@ LH_AUDIT_STATUS:'*}
   else lh_fa=- lh_fd=-; fi
   printf 'AUDIT|%s|%s|%s|%s|%s|%s\n' "$lh_fa" "$lh_fd" "$lh_boot" "$lh_pid" "$lh_rule_data" "$lh_watched"
 }
+lh_sshd() {
+  lh_t=$(sshd -T 2>/dev/null) || return 1
+  printf '%s\n' "$lh_t" | awk '$1~/^(ciphers|macs|kexalgorithms|subsystem|allowusers|allowgroups)$/{print "SSHD|"$0}' | head -n 40
+  echo SSHD_OK
+}
+lh_tmout() {
+  command -v awk >/dev/null 2>&1 || return 1
+  cat /etc/profile /etc/profile.d/*.sh /etc/bashrc /etc/bash.bashrc 2>/dev/null |
+    awk -F= '/^[ 	]*(#|$)/{next} /(^|[ 	;])(export[ 	]+|readonly[ 	]+)?TMOUT=/ {gsub(/[ 	;]/,"",$2); if ($2 ~ /^[0-9]+$/) v=$2; else v="x"} END{print "TMOUT|" (v==""?"unset":v); print "TMOUT_OK"}'
+}
+lh_pwhist() {
+  command -v awk >/dev/null 2>&1 || return 1
+  cat /etc/pam.d/common-password /etc/pam.d/system-auth /etc/pam.d/password-auth 2>/dev/null | awk '
+    /^[ 	]*(#|$)/{next}
+    $1=="password" && /pam_pwhistory[.]so/{ph=1}
+    $1=="password" && /(pam_pwhistory|pam_unix)[.]so/ && match($0,/remember=[0-9]+/){print "PWHIST|pam:" substr($0,RSTART+9,RLENGTH-9)}
+    END{if(ph) print "PWHIST|uses-pwhistory"}'
+  if [ -r /etc/security/pwhistory.conf ]; then
+    awk '/^[ 	]*(#|$)/{next} match($0,/remember[ 	]*=[ 	]*[0-9]+/){v=substr($0,RSTART,RLENGTH); gsub(/[ 	]/,"",v); sub(/remember=/,"",v); print "PWHIST|conf:" v}' /etc/security/pwhistory.conf
+  fi
+  echo PWHIST_OK
+}
+lh_wheel() {
+  [ -f /etc/pam.d/su ] && [ -r /etc/pam.d/su ] || return 1
+  command -v awk >/dev/null 2>&1 || return 1
+  awk '/^[ 	]*(#|$)/{next} $1=="auth" && $2=="required" && /pam_wheel[.]so/{print "WHEEL|required"; found=1} END{if(!found) print "WHEEL|unset"; print "WHEEL_OK"}' /etc/pam.d/su
+}
+lh_dormant() {
+  command -v lastlog >/dev/null 2>&1 || return 1
+  command -v awk >/dev/null 2>&1 || return 1
+  for lh_u in $(awk -F: '$7!~/\/(nologin|false|sync|shutdown|halt)$/{print $1}' /etc/passwd 2>/dev/null); do
+    lastlog -b 90 -u "$lh_u" 2>/dev/null | tail -n 1
+  done | awk 'NF && $1!="Username" {print "DORMANT|"$1; n++} END{print "DORMANT_N|" (n+0); print "DORMANT_OK"}'
+}
 "#;
 
 fn error(message: impl Into<String>) -> CoreError {
@@ -355,11 +389,9 @@ fn audit_policy(probe: &AuditProbe) -> CoreResult<String> {
 }
 
 pub(super) fn scan_item(definition: &BaselineDefinition) -> String {
-    format!(
-        "printf 'ITEM=%s\\t__unverified__\\t%s\\n' {} {}; ",
-        shq(definition.id),
-        shq(definition.file)
-    )
+    // `lr_h` is defined once in the scan functions; the scan has to fit in
+    // one argument.
+    format!("lr_h {} {};", shq(definition.id), shq(definition.file))
 }
 async fn run(
     service: &BaselineService,
@@ -381,7 +413,7 @@ async fn run(
 }
 pub(super) fn scan_script() -> String {
     format!(
-        "\n{PROBE}\nfor lh_target in {}; do (lh_perm \"$lh_target\") 2>/dev/null || printf 'GAP|%s\\n' \"$lh_target\"; done; (lh_audit) 2>/dev/null || printf 'GAP|audit\\n'",
+        "\n{PROBE}\nfor lh_target in {}; do (lh_perm \"$lh_target\") 2>/dev/null || printf 'GAP|%s\\n' \"$lh_target\"; done; (lh_audit) 2>/dev/null || printf 'GAP|audit\\n'; (lh_sshd) 2>/dev/null || printf 'GAP|sshd\\n'; (lh_tmout) 2>/dev/null || printf 'GAP|tmout\\n'; (lh_pwhist) 2>/dev/null || printf 'GAP|pwhist\\n'; (lh_wheel) 2>/dev/null || printf 'GAP|wheel\\n'; (lh_dormant) 2>/dev/null || printf 'GAP|dormant\\n'",
         AUTH_FILES
             .iter()
             .map(|p| shq(p))
@@ -389,12 +421,248 @@ pub(super) fn scan_script() -> String {
             .join(" ")
     )
 }
+pub(super) const SSH_WEAK_NONE: &str = "none";
+pub(super) const SSH_SFTP_ENABLED: &str = "enabled";
+pub(super) const SSH_LOGIN_RESTRICTED: &str = "restricted";
+const SSH_WEAK: &[(&str, &str)] = &[
+    ("ciphers", "aes128-cbc"),
+    ("ciphers", "aes192-cbc"),
+    ("ciphers", "aes256-cbc"),
+    ("ciphers", "3des-cbc"),
+    ("ciphers", "arcfour"),
+    ("ciphers", "arcfour128"),
+    ("ciphers", "arcfour256"),
+    ("ciphers", "blowfish-cbc"),
+    ("ciphers", "cast128-cbc"),
+    ("ciphers", "rijndael-cbc@lysator.liu.se"),
+    ("macs", "hmac-md5"),
+    ("macs", "hmac-md5-96"),
+    ("macs", "hmac-md5-etm@openssh.com"),
+    ("macs", "hmac-sha1"),
+    ("macs", "hmac-sha1-etm@openssh.com"),
+    ("macs", "hmac-sha1-96"),
+    ("macs", "umac-64@openssh.com"),
+    ("macs", "umac-64-etm@openssh.com"),
+    ("macs", "hmac-ripemd160"),
+    ("macs", "hmac-ripemd160-etm@openssh.com"),
+    ("macs", "hmac-ripemd160@openssh.com"),
+    ("kexalgorithms", "diffie-hellman-group1-sha1"),
+    ("kexalgorithms", "diffie-hellman-group14-sha1"),
+    ("kexalgorithms", "diffie-hellman-group-exchange-sha1"),
+    ("kexalgorithms", "gss-g1-sha1-"),
+    ("kexalgorithms", "gss-g14-sha1-"),
+    ("kexalgorithms", "gss-group1-sha1-"),
+    ("kexalgorithms", "gss-group14-sha1-"),
+];
+
+fn sshd_observed(item_id: &str, output: &str) -> BaselineObservedValue {
+    let mut ciphers = "";
+    let mut macs = "";
+    let mut kex = "";
+    let mut sftp = false;
+    let mut acl = false;
+    if !output.lines().any(|line| line == "SSHD_OK") {
+        return BaselineObservedValue::Unverified;
+    }
+    for line in output.lines().filter_map(|l| l.strip_prefix("SSHD|")) {
+        let mut parts = line.splitn(2, ' ');
+        let key = parts.next().unwrap_or("");
+        let value = parts.next().unwrap_or("").trim();
+        match key {
+            "ciphers" => ciphers = value,
+            "macs" => macs = value,
+            "kexalgorithms" => kex = value,
+            "subsystem" => {
+                if value.split_whitespace().next() == Some("sftp") {
+                    sftp = true;
+                }
+            }
+            "allowusers" | "allowgroups" => acl = true,
+            _ => {}
+        }
+    }
+    // Observed values stay inert ASCII tokens (see `validate_observed`);
+    // algorithm names are public and already in that alphabet.
+    let token = |value: &str| BaselineObservedValue::Value(value.to_owned());
+    match item_id {
+        "ssh-weak-algorithms" => {
+            let weak: Vec<&str> = [("ciphers", ciphers), ("macs", macs), ("kexalgorithms", kex)]
+                .iter()
+                .flat_map(|(section, list)| {
+                    list.split(',').filter(move |name| {
+                        !name.is_empty()
+                            && SSH_WEAK.iter().any(|(k, weak)| {
+                                k == section
+                                    && if weak.ends_with('-') {
+                                        name.starts_with(weak)
+                                    } else {
+                                        weak == name
+                                    }
+                            })
+                    })
+                })
+                .collect();
+            if weak.is_empty() {
+                return token(SSH_WEAK_NONE);
+            }
+            let mut value = String::new();
+            for (index, name) in weak.iter().enumerate() {
+                let next = if value.is_empty() {
+                    name.len()
+                } else {
+                    value.len() + 1 + name.len()
+                };
+                let rest = format!(",+{}", weak.len() - index);
+                if next + rest.len() > 64 {
+                    value.push_str(&rest);
+                    break;
+                }
+                if !value.is_empty() {
+                    value.push(',');
+                }
+                value.push_str(name);
+            }
+            token(&value)
+        }
+        "ssh-sftp-subsystem" => token(if sftp { SSH_SFTP_ENABLED } else { "absent" }),
+        "ssh-login-restriction" => token(if acl {
+            SSH_LOGIN_RESTRICTED
+        } else {
+            "unrestricted"
+        }),
+        _ => BaselineObservedValue::Unverified,
+    }
+}
+
+fn tmout_observed(output: &str) -> BaselineObservedValue {
+    if !output.lines().any(|line| line == "TMOUT_OK") {
+        return BaselineObservedValue::Unverified;
+    }
+    let value = output
+        .lines()
+        .filter_map(|line| line.strip_prefix("TMOUT|"))
+        .next()
+        .unwrap_or("unset");
+    match value.parse::<u32>() {
+        Ok(n) if (1..=900).contains(&n) => BaselineObservedValue::Value("within-900".to_owned()),
+        Ok(n) => BaselineObservedValue::Value(n.to_string()),
+        Err(_) => BaselineObservedValue::Value("unset".to_owned()),
+    }
+}
+
+fn pwhist_observed(output: &str) -> BaselineObservedValue {
+    if !output.lines().any(|line| line == "PWHIST_OK") {
+        return BaselineObservedValue::Unverified;
+    }
+    let uses_pwhistory = output.lines().any(|line| line == "PWHIST|uses-pwhistory");
+    let mut best: Option<u32> = None;
+    for line in output
+        .lines()
+        .filter_map(|line| line.strip_prefix("PWHIST|"))
+    {
+        let Some((kind, number)) = line.split_once(':') else {
+            continue;
+        };
+        if kind == "conf" && !uses_pwhistory {
+            continue;
+        }
+        if matches!(kind, "pam" | "conf")
+            && let Ok(n) = number.parse::<u32>()
+        {
+            best = Some(best.map_or(n, |b| b.max(n)));
+        }
+    }
+    match best {
+        Some(n) if n >= 5 => BaselineObservedValue::Value("ge-5".to_owned()),
+        Some(n) => BaselineObservedValue::Value(n.to_string()),
+        None => BaselineObservedValue::Value("unset".to_owned()),
+    }
+}
+
+fn wheel_observed(output: &str) -> BaselineObservedValue {
+    if !output.lines().any(|line| line == "WHEEL_OK") {
+        return BaselineObservedValue::Unverified;
+    }
+    BaselineObservedValue::Value(
+        if output.lines().any(|line| line == "WHEEL|required") {
+            "required"
+        } else {
+            "unset"
+        }
+        .to_owned(),
+    )
+}
+
+fn dormant_observed(output: &str) -> BaselineObservedValue {
+    if !output.lines().any(|line| line == "DORMANT_OK") {
+        return BaselineObservedValue::Unverified;
+    }
+    let names: Vec<&str> = output
+        .lines()
+        .filter_map(|line| line.strip_prefix("DORMANT|"))
+        .filter(|name| {
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+        })
+        .take(20)
+        .collect();
+    let total = output
+        .lines()
+        .filter_map(|line| line.strip_prefix("DORMANT_N|"))
+        .next()
+        .and_then(|n| n.parse::<usize>().ok())
+        .unwrap_or(names.len());
+    if total == 0 {
+        return BaselineObservedValue::Value("none".to_owned());
+    }
+    let mut label = String::new();
+    let mut shown = 0usize;
+    for name in &names {
+        let extra = if total.saturating_sub(shown) > 1 {
+            4
+        } else {
+            0
+        };
+        if label.len() + name.len() + extra > 60 && !label.is_empty() {
+            break;
+        }
+        if !label.is_empty() {
+            label.push(',');
+        }
+        label.push_str(name);
+        shown += 1;
+    }
+    if total > shown {
+        if !label.is_empty() {
+            label.push(',');
+        }
+        label.push('+');
+        label.push_str(&(total - shown).to_string());
+    }
+    BaselineObservedValue::Value(if label.is_empty() {
+        format!("+{total}")
+    } else {
+        label
+    })
+}
 pub(super) fn scan_from_output(output: &str) -> CoreResult<Vec<BaselineStatus>> {
     BASELINE_CATALOG
         .iter()
         .filter(|d| matches!(d.reading, Reading::HostState))
         .map(|d| {
-            let observed = if d.file == AUDIT_FILE {
+            let observed = if d.id.starts_with("ssh-") && d.file == "/etc/ssh/sshd_config" {
+                Some(sshd_observed(d.id, output))
+            } else if d.id == "session-idle-timeout" {
+                Some(tmout_observed(output))
+            } else if d.id == "password-history" {
+                Some(pwhist_observed(output))
+            } else if d.id == "su-wheel-restriction" {
+                Some(wheel_observed(output))
+            } else if d.id == "dormant-login-accounts" {
+                Some(dormant_observed(output))
+            } else if d.file == AUDIT_FILE {
                 output
                     .lines()
                     .find(|s| s.starts_with("AUDIT|"))
@@ -1113,7 +1381,7 @@ mod tests {
             assert!(parse_permission(line).is_err());
         }
         let missing = scan_from_output("GAP|audit\nGAP|/etc/shadow").unwrap();
-        assert_eq!(missing.len(), 5);
+        assert_eq!(missing.len(), 12);
         assert!(missing.iter().all(
             |status| status.observed == BaselineObservedValue::Unverified && !status.compliant
         ));
@@ -1309,5 +1577,369 @@ mod tests {
             serde_json::to_vec_pretty(&output).unwrap(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn sshd_state_tokens_and_unknowns() {
+        use super::{scan_from_output, sshd_observed};
+        use crate::baseline::BaselineObservedValue::{Unverified, Value};
+        let v = |s: &str| Value(s.to_owned());
+        // sshd -T unreadable (no marker), even with stray lines: never compliant.
+        for output in [
+            "",
+            "GAP|sshd
+",
+            "SSHD|ciphers aes256-ctr
+",
+        ] {
+            let statuses = scan_from_output(output).unwrap();
+            for id in [
+                "ssh-weak-algorithms",
+                "ssh-sftp-subsystem",
+                "ssh-login-restriction",
+            ] {
+                let status = statuses.iter().find(|s| s.item_id == id).expect(id);
+                assert_eq!(status.observed, Unverified, "{id} {output:?}");
+                assert!(!status.compliant, "{id}");
+            }
+        }
+        let defaults = "SSHD|ciphers aes256-ctr,chacha20-poly1305@openssh.com
+SSHD|macs hmac-sha2-256
+SSHD|kexalgorithms curve25519-sha256
+SSHD|subsystem sftp /usr/lib/openssh/sftp-server
+SSHD_OK
+";
+        assert_eq!(sshd_observed("ssh-weak-algorithms", defaults), v("none"));
+        assert_eq!(sshd_observed("ssh-sftp-subsystem", defaults), v("enabled"));
+        assert_eq!(
+            sshd_observed("ssh-login-restriction", defaults),
+            v("unrestricted")
+        );
+        let weak = "SSHD|ciphers aes128-cbc,3des-cbc,aes256-ctr
+SSHD|macs hmac-sha1,hmac-sha2-256
+SSHD|kexalgorithms gss-group14-sha1-toWM5Slw5Ew8Mqkay+al2g==,curve25519-sha256
+SSHD|allowusers root deploy
+SSHD_OK
+";
+        assert_eq!(
+            sshd_observed("ssh-weak-algorithms", weak),
+            v("aes128-cbc,3des-cbc,hmac-sha1,+1")
+        );
+        assert_eq!(
+            sshd_observed("ssh-login-restriction", weak),
+            v("restricted")
+        );
+        assert_eq!(
+            sshd_observed(
+                "ssh-sftp-subsystem",
+                "SSHD|subsystem internal-x y
+SSHD_OK
+"
+            ),
+            v("absent")
+        );
+        assert_eq!(
+            sshd_observed(
+                "ssh-login-restriction",
+                "SSHD|allowgroups admins
+SSHD_OK
+"
+            ),
+            v("restricted")
+        );
+        let statuses = scan_from_output(&format!(
+            "{defaults}SSHD|allowusers root
+"
+        ))
+        .unwrap();
+        for id in [
+            "ssh-weak-algorithms",
+            "ssh-sftp-subsystem",
+            "ssh-login-restriction",
+        ] {
+            assert!(
+                statuses.iter().find(|s| s.item_id == id).unwrap().compliant,
+                "{id}"
+            );
+        }
+        let statuses = scan_from_output(weak).unwrap();
+        assert!(
+            !statuses
+                .iter()
+                .find(|s| s.item_id == "ssh-weak-algorithms")
+                .unwrap()
+                .compliant
+        );
+    }
+
+    #[test]
+    fn sshd_state_items_are_check_only() {
+        for id in [
+            "ssh-weak-algorithms",
+            "ssh-sftp-subsystem",
+            "ssh-login-restriction",
+            "session-idle-timeout",
+            "password-history",
+            "su-wheel-restriction",
+            "dormant-login-accounts",
+        ] {
+            let definition = crate::baseline::definition(id).expect(id);
+            assert!(!definition.is_writable(), "{id}");
+        }
+        // The managed permission/audit HostState items keep their write path.
+        assert!(
+            crate::baseline::definition("logging-auth-file-watches")
+                .unwrap()
+                .is_writable()
+        );
+    }
+
+    #[test]
+    fn auth_state_parsers_cover_values_comments_and_gaps() {
+        use super::{dormant_observed, pwhist_observed, tmout_observed, wheel_observed};
+        use crate::baseline::BaselineObservedValue::{Unverified, Value};
+        let v = |s: &str| Value(s.to_owned());
+        // Missing markers -> Unverified everywhere, never compliant.
+        for f in [
+            tmout_observed,
+            pwhist_observed,
+            wheel_observed,
+            dormant_observed,
+        ] {
+            assert_eq!(f(""), Unverified);
+            assert_eq!(
+                f("GAP|x
+"),
+                Unverified
+            );
+        }
+        // TMOUT: in range -> within-900; out of range -> the number; unset.
+        assert_eq!(
+            tmout_observed(
+                "TMOUT|600
+TMOUT_OK
+"
+            ),
+            v("within-900")
+        );
+        assert_eq!(
+            tmout_observed(
+                "TMOUT|900
+TMOUT_OK
+"
+            ),
+            v("within-900")
+        );
+        assert_eq!(
+            tmout_observed(
+                "TMOUT|1
+TMOUT_OK
+"
+            ),
+            v("within-900")
+        );
+        assert_eq!(
+            tmout_observed(
+                "TMOUT|0
+TMOUT_OK
+"
+            ),
+            v("0")
+        );
+        assert_eq!(
+            tmout_observed(
+                "TMOUT|1200
+TMOUT_OK
+"
+            ),
+            v("1200")
+        );
+        assert_eq!(
+            tmout_observed(
+                "TMOUT|unset
+TMOUT_OK
+"
+            ),
+            v("unset")
+        );
+        // History: >=5 compliant; pwhistory.conf only counts when pam_pwhistory is referenced.
+        assert_eq!(
+            pwhist_observed(
+                "PWHIST|pam:5
+PWHIST_OK
+"
+            ),
+            v("ge-5")
+        );
+        assert_eq!(
+            pwhist_observed(
+                "PWHIST|pam:3
+PWHIST_OK
+"
+            ),
+            v("3")
+        );
+        assert_eq!(
+            pwhist_observed(
+                "PWHIST|conf:10
+PWHIST_OK
+"
+            ),
+            v("unset")
+        );
+        assert_eq!(
+            pwhist_observed(
+                "PWHIST|uses-pwhistory
+PWHIST|conf:6
+PWHIST|pam:2
+PWHIST_OK
+"
+            ),
+            v("ge-5")
+        );
+        assert_eq!(
+            pwhist_observed(
+                "PWHIST_OK
+"
+            ),
+            v("unset")
+        );
+        // Wheel: required/unset; no marker (file missing) -> Unverified.
+        assert_eq!(
+            wheel_observed(
+                "WHEEL|required
+WHEEL_OK
+"
+            ),
+            v("required")
+        );
+        assert_eq!(
+            wheel_observed(
+                "WHEEL|unset
+WHEEL_OK
+"
+            ),
+            v("unset")
+        );
+        assert_eq!(
+            wheel_observed(
+                "WHEEL|unset
+"
+            ),
+            Unverified
+        );
+        // Dormant: none; names; +N truncation stays inside the token alphabet.
+        assert_eq!(
+            dormant_observed(
+                "DORMANT_N|0
+DORMANT_OK
+"
+            ),
+            v("none")
+        );
+        assert_eq!(
+            dormant_observed(
+                "DORMANT|olduser
+DORMANT|www
+DORMANT_N|2
+DORMANT_OK
+"
+            ),
+            v("olduser,www")
+        );
+        let many: String = (0..25)
+            .map(|i| {
+                format!(
+                    "DORMANT|user{i:02}
+"
+                )
+            })
+            .collect();
+        let observed = dormant_observed(&format!(
+            "{many}DORMANT_N|25
+DORMANT_OK
+"
+        ));
+        match &observed {
+            Value(label) => {
+                assert!(label.len() <= 64, "{label}");
+                assert!(label.ends_with(|c: char| c.is_ascii_digit()), "{label}");
+                assert!(label.contains('+'), "{label}");
+                assert!(
+                    label.bytes().all(|b| b.is_ascii_alphanumeric()
+                        || matches!(b, b'_' | b'-' | b'.' | b':' | b'*' | b'/' | b',' | b'+')),
+                    "{label}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    #[ignore = "needs disposable containers named in LOVELYHAWK_LAB_CONTAINERS"]
+    fn auth_state_collectors_report_real_container_state() {
+        let containers = std::env::var("LOVELYHAWK_LAB_CONTAINERS").expect("containers");
+        let cli = std::env::var("LOVELYHAWK_LAB_CLI").unwrap_or_else(|_| "podman".to_owned());
+        let exec = |container: &str, script: &str| -> String {
+            let output = std::process::Command::new(&cli)
+                .args(["exec", container, "/bin/sh", "-c", script])
+                .output()
+                .expect("container CLI");
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        };
+        let ids = [
+            "session-idle-timeout",
+            "password-history",
+            "su-wheel-restriction",
+            "dormant-login-accounts",
+        ];
+        let values = |output: &str| {
+            let statuses = super::scan_from_output(output).unwrap();
+            ids.iter()
+                .map(|id| {
+                    format!(
+                        "{id}={:?}",
+                        statuses.iter().find(|s| s.item_id == *id).unwrap().observed
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let fixture = "cp -a /etc/pam.d/common-password /tmp/common-password.bak 2>/dev/null; cp -a /etc/pam.d/su /tmp/su.bak 2>/dev/null;             printf 'TMOUT=600
+' > /etc/profile.d/lh-tmout.sh 2>/dev/null || true;             mkdir -p /etc/pam.d; printf 'password required pam_pwhistory.so remember=5
+' > /etc/pam.d/common-password;             printf 'auth required pam_wheel.so use_uid
+' > /etc/pam.d/su;             (useradd -m -s /bin/bash olduser 2>/dev/null || adduser -D -s /bin/bash olduser 2>/dev/null || true)";
+        let restore = "[ -f /tmp/common-password.bak ] && cp -a /tmp/common-password.bak /etc/pam.d/common-password;             [ -f /tmp/su.bak ] && cp -a /tmp/su.bak /etc/pam.d/su || rm -f /etc/pam.d/su;             rm -f /etc/profile.d/lh-tmout.sh; (userdel -r olduser 2>/dev/null || deluser olduser 2>/dev/null || true)";
+        let script = super::scan_script();
+        let mut failures = Vec::new();
+        for pair in containers.split(',') {
+            let (name, container) = pair.split_once('=').expect("family=container");
+            let before = values(&exec(container, &script));
+            println!("== {name} defaults: {before}");
+            exec(container, fixture);
+            let after = values(&exec(container, &script));
+            println!("== {name} fixtures: {after}");
+            exec(container, restore);
+            if name == "debian" && !after.contains("session-idle-timeout=Value(\"within-900\")") {
+                failures.push(format!("{name}: TMOUT fixture not observed: {after}"));
+            }
+            if name == "debian" && !after.contains("password-history=Value(\"ge-5\")") {
+                failures.push(format!("{name}: pwhistory fixture not observed: {after}"));
+            }
+            if name == "debian" && !after.contains("su-wheel-restriction=Value(\"required\")") {
+                failures.push(format!("{name}: wheel fixture not observed: {after}"));
+            }
+            if name == "debian" && !after.contains("olduser") {
+                failures.push(format!("{name}: dormant fixture not observed: {after}"));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{}",
+            failures.join(
+                "
+"
+            )
+        );
     }
 }

@@ -254,5 +254,19 @@ export function reason(text: string, action: EmergencyPathAction | null): string
   if (action === "disarm" && text.includes("could not act on that path")) {
     return "暂时无法修改该文件权限，请重新查看文件属性并确认访问权限后再试。";
   }
+  if (action === "remove-capabilities") {
+    if (/\(emergency-path-capability-tools\)$/u.test(text)) {
+      return "目标机缺少 setcap/getcap 等工具，无法安全移除并复核文件能力。";
+    }
+    if (/\(emergency-path-capability-privilege\)$/u.test(text)) {
+      return "需要 root 或免密码 sudo 才能修改文件能力，当前账号权限不足。";
+    }
+    if (/\(emergency-path-capability-kind\)$/u.test(text)) {
+      return "只能移除普通文件的能力；符号链接、目录等类型不支持。";
+    }
+    if (/\(emergency-path-capability-empty\)$/u.test(text)) {
+      return "这个文件当前没有文件能力，无需移除。";
+    }
+  }
   return text;
 }

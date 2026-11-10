@@ -30,16 +30,20 @@ export interface EmergencyPathDialogProps {
 const ACTION_LABELS: Record<EmergencyPathAction, string> = {
   disarm: "去掉执行权限",
   quarantine: "隔离",
+  "remove-capabilities": "移除文件能力",
 };
 
 const ACTION_INTENT: Record<EmergencyPathAction, string> = {
   disarm: "去掉所有人的执行位，连同 setuid、setgid 一起摘掉。文件本身保留，随时还能打开看。",
   quarantine: "把文件从原位置移进目标机上的备份目录。原路径不再有它，需要时可以取回。",
+  "remove-capabilities":
+    "清除这个文件的 Linux 能力集（如 cap_setuid）。文件保留，但依赖这些能力提权的用法不再生效；本来需要它的正常程序可能无法工作。",
 };
 
 const UNDO_EFFECT: Record<EmergencyPathAction, string> = {
   disarm: "撤销会把权限改回操作前的样子，连同 setuid、setgid。这个文件会重新可以执行。",
   quarantine: "撤销会把文件从备份目录移回原路径。原路径会重新出现这个文件，可以再被运行或加载。",
+  "remove-capabilities": "撤销会把移除前记录的能力集写回这个文件，依赖它的提权功能重新生效。",
 };
 
 /**

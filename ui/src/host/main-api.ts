@@ -87,6 +87,8 @@ import {
   isSshMfaResponses,
   isSshOpaqueHandle,
   isSystemInfoMaximumRows,
+  isSystemInfoFirewallAddress,
+  isSystemInfoFirewallDirection,
   isSystemInfoOpaqueHandle,
   isSystemInfoRowActionKey,
   isSystemInfoTabKey,
@@ -440,13 +442,19 @@ export function createMainApi(transport: BackendTransport = hostBackendTransport
       return backend.inspectSystemInfoRow(bindingHandle, snapshotHandle, rowId, action);
     },
     planSystemInfoRowAction: async (...values: unknown[]) => {
-      requireArity(values, 4, "Invalid system-information row plan request.");
-      const [bindingHandle, snapshotHandle, rowId, action] = values;
-      if (!isSshOpaqueHandle(bindingHandle) || !isSystemInfoOpaqueHandle(snapshotHandle) ||
-        !isSystemInfoRowId(rowId) || !isSystemInfoRowActionKey(action)) {
+      if (values.length !== 4 && values.length !== 5) {
         refuse("Invalid system-information row plan request.");
       }
-      return backend.planSystemInfoRowAction(bindingHandle, snapshotHandle, rowId, action);
+      const [bindingHandle, snapshotHandle, rowId, action, password] = values;
+      if (!isSshOpaqueHandle(bindingHandle) || !isSystemInfoOpaqueHandle(snapshotHandle) ||
+        !isSystemInfoRowId(rowId) || !isSystemInfoRowActionKey(action) ||
+        (values.length === 5 && !boundedString(password, 1_024, false))) {
+        refuse("Invalid system-information row plan request.");
+      }
+      return backend.planSystemInfoRowAction(
+        bindingHandle, snapshotHandle, rowId, action,
+        values.length === 5 ? password as string : undefined,
+      );
     },
     confirmSystemInfoRowAction: async (...values: unknown[]) => {
       requireArity(values, 2, "Invalid system-information row confirmation request.");
@@ -471,6 +479,39 @@ export function createMainApi(transport: BackendTransport = hostBackendTransport
         refuse("Invalid system-information row cancellation request.");
       }
       return backend.cancelSystemInfoRowAction(bindingHandle, planHandle);
+    },
+    planSystemInfoFirewallBlock: async (...values: unknown[]) => {
+      requireArity(values, 3, "Invalid firewall block plan request.");
+      const [bindingHandle, address, direction] = values;
+      if (!isSshOpaqueHandle(bindingHandle) || !isSystemInfoFirewallAddress(address) ||
+        !isSystemInfoFirewallDirection(direction)) {
+        refuse("Invalid firewall block plan request.");
+      }
+      return backend.planSystemInfoFirewallBlock(bindingHandle, address, direction);
+    },
+    executeSystemInfoFirewallBlock: async (...values: unknown[]) => {
+      requireArity(values, 2, "Invalid firewall block execution request.");
+      const [bindingHandle, planHandle] = values;
+      if (!isSshOpaqueHandle(bindingHandle) || !isSystemInfoOpaqueHandle(planHandle)) {
+        refuse("Invalid firewall block execution request.");
+      }
+      return backend.executeSystemInfoFirewallBlock(bindingHandle, planHandle);
+    },
+    planSystemInfoFirewallRestore: async (...values: unknown[]) => {
+      requireArity(values, 2, "Invalid firewall restore plan request.");
+      const [bindingHandle, restoreHandle] = values;
+      if (!isSshOpaqueHandle(bindingHandle) || !isSystemInfoOpaqueHandle(restoreHandle)) {
+        refuse("Invalid firewall restore plan request.");
+      }
+      return backend.planSystemInfoFirewallRestore(bindingHandle, restoreHandle);
+    },
+    executeSystemInfoFirewallRestore: async (...values: unknown[]) => {
+      requireArity(values, 2, "Invalid firewall restore execution request.");
+      const [bindingHandle, planHandle] = values;
+      if (!isSshOpaqueHandle(bindingHandle) || !isSystemInfoOpaqueHandle(planHandle)) {
+        refuse("Invalid firewall restore execution request.");
+      }
+      return backend.executeSystemInfoFirewallRestore(bindingHandle, planHandle);
     },
     getBaselineCatalog: async (...values: unknown[]) => {
       requireArity(values, 0, "Invalid baseline catalog request.");

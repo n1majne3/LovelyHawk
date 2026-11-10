@@ -234,6 +234,21 @@ impl DatabaseProfileSnapshot {
     pub fn same_revision(&self, other: &Self) -> bool {
         self.view.config.id == other.view.config.id && self.digest == other.digest
     }
+
+    pub(crate) fn digest(&self) -> &str {
+        &self.digest
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_fixture() -> Self {
+        Self {
+            view: DatabaseProfileView {
+                config: DatabaseProfileConfig::new("fixture", DatabaseEngine::Postgresql),
+                has_password: true,
+            },
+            digest: "fixture-digest".to_owned(),
+        }
+    }
 }
 
 enum ProfileExpectation<'a> {
@@ -489,14 +504,23 @@ impl DatabaseCredentials {
 }
 
 #[derive(Debug)]
-struct ResolvedDatabaseProfile {
-    ssh_connection_id: Option<String>,
-    connection: DatabaseConnection,
-    credentials: DatabaseCredentials,
-    postgresql_tls: Option<PostgresqlTlsSettings>,
+pub(crate) struct ResolvedDatabaseProfile {
+    pub(crate) ssh_connection_id: Option<String>,
+    pub(crate) connection: DatabaseConnection,
+    pub(crate) credentials: DatabaseCredentials,
+    pub(crate) postgresql_tls: Option<PostgresqlTlsSettings>,
 }
 
-fn validate_profile_session(
+impl ResolvedDatabaseProfile {
+    pub(crate) fn password(&self) -> Option<SecretValue> {
+        self.credentials
+            .password
+            .as_ref()
+            .map(|password| SecretValue::new(password.expose()))
+    }
+}
+
+pub(crate) fn validate_profile_session(
     profile: &ResolvedDatabaseProfile,
     session: &BoundSshSession,
 ) -> CoreResult<()> {
@@ -519,7 +543,7 @@ struct DatabaseRuntimeWireCommand {
 }
 
 #[derive(Debug, Clone)]
-struct DatabaseProfileRepository {
+pub(crate) struct DatabaseProfileRepository {
     store: PortableStore,
     crypto: Arc<CryptoVault>,
     lock: Arc<Mutex<()>>,
@@ -691,7 +715,7 @@ impl DatabaseProfileRepository {
             .map(|(profile, _)| profile)
     }
 
-    fn resolve_with_digest(
+    pub(crate) fn resolve_with_digest(
         &self,
         profile_id: &str,
     ) -> CoreResult<(ResolvedDatabaseProfile, String)> {
@@ -721,7 +745,7 @@ impl DatabaseProfileRepository {
         ))
     }
 
-    fn ensure_snapshot(
+    pub(crate) fn ensure_snapshot(
         &self,
         profile_id: &str,
         expected_digest: &str,
@@ -984,9 +1008,9 @@ pub struct DatabaseActionOutcome {
 
 #[derive(Debug, Clone)]
 pub struct DatabaseService {
-    ssh: SshService,
-    target: Arc<TargetContext>,
-    profiles: DatabaseProfileRepository,
+    pub(crate) ssh: SshService,
+    pub(crate) target: Arc<TargetContext>,
+    pub(crate) profiles: DatabaseProfileRepository,
 }
 
 impl DatabaseService {

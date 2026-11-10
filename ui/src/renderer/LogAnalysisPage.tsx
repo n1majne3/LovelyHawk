@@ -844,6 +844,20 @@ export function LogThreatCards({ summary }: { summary: LogThreatSummary }) {
         <article><strong>{summary.privilegeEscalationCount}</strong><span>提权活动</span></article>
         <article><strong>{summary.suspiciousActivityCount}</strong><span>可疑活动</span></article>
       </div>
+      {summary.breachedSources.length === 0 ? (
+        <p>本次分析的日志行内未发现多次失败后成功登录的来源。</p>
+      ) : (
+        <section>
+          <h3>爆破后成功登录</h3>
+          <p>同一来源多次口令失败后登录成功，口令可能已被猜中；请核查该来源登录后的操作并考虑封禁、改口令。</p>
+          {summary.breachedSources.map((item, index) => (
+            <p key={`${item.ip}\0${index}`}>
+              {item.ip} · 失败 {item.failuresBeforeSuccess} 次后登录成功 · {item.firstSuccessAt}
+              {item.user ? ` · 账号 ${item.user}` : ""}{item.method ? ` · ${item.method === "password" ? "口令" : "公钥"}` : ""}
+            </p>
+          ))}
+        </section>
+      )}
       <details>
         <summary>来源、用户与小时分布</summary>
         <div className="log-analysis-threat-detail">

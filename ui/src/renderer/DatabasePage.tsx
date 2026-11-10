@@ -6,6 +6,9 @@ import { DialogHost } from "./DialogHost";
 import { useConfirmDialog } from "./use-confirm-dialog";
 import { PostgresqlHostProcessPanel } from "./PostgresqlHostProcessPanel";
 import { PostgresqlAccessPanel } from "./PostgresqlAccessPanel";
+import { PostgresqlPasswordDialog, type PasswordDirty } from "./PostgresqlPasswordDialog";
+import type { PostgresqlRoleRow } from "../shared/postgresql-access-contract";
+import type { PostgresqlProfileSummary } from "../shared/postgresql-runtime-contract";
 import "./database-page.css";
 
 export interface DatabasePageHandle { beforeDeactivate(): Promise<boolean> }
@@ -62,6 +65,9 @@ export const DatabasePage = forwardRef<DatabasePageHandle, DatabasePageProps>(fu
   const [query, setQuery] = useState("");
   const [saving, setSaving] = useState(false);
   const [dialogBusy, setDialogBusy] = useState(false);
+  const [passwordRole, setPasswordRole] = useState<PostgresqlRoleRow | "current" | null>(null);
+  const passwordDirty = useRef<PasswordDirty>("none");
+  const passwordOpener = useRef<HTMLElement | null>(null);
   const dialog = useConfirmDialog();
   const nameInput = useRef<HTMLInputElement>(null);
   const heading = useRef<HTMLHeadingElement>(null);
@@ -92,6 +98,14 @@ export const DatabasePage = forwardRef<DatabasePageHandle, DatabasePageProps>(fu
   };
   useImperativeHandle(ref, () => ({ beforeDeactivate: async () => {
     if (dialogBusy) return false;
+    if (passwordDirty.current === "busy") {
+      await dialog.ask("口令修改正在执行", "口令修改或放回正在执行，完成前不能离开此页面。", "继续等待");
+      return false;
+    }
+    if (passwordDirty.current === "dirty") {
+      if (!(await dialog.ask("丢弃口令修改？", "口令对话框中还有输入或待确认的计划，离开会丢弃这些内容。", "丢弃并离开"))) return false;
+      passwordDirty.current = "none"; setPasswordRole(null);
+    }
     await savingTask.current;
     if (activeController.current !== controller) return false;
     if (!(await leaveEditor())) return false;
@@ -179,6 +193,7 @@ export const DatabasePage = forwardRef<DatabasePageHandle, DatabasePageProps>(fu
           <button disabled={blocked || !selected || selected.unassigned} onClick={() => { setQuery(""); void controller.begin(); }}>读取数据库状态</button>
           <button disabled={blocked || !selected || selected.unassigned} onClick={() => { setQuery(""); void controller.begin(true); }}>读取并留证</button>
           {reading ? <button onClick={() => void controller.cancel()}>取消读取</button> : null}
+          <button disabled={blocked || !selected || selected.unassigned || !selected.hasPassword} onClick={event => { passwordOpener.current = event.currentTarget; setPasswordRole("current"); }}>修改此账号的口令</button>
           {selected?.unassigned ? <p>此旧连接需要先编辑并保存，明确关联当前 SSH 主机。</p> : selected ? <p>{selected.username}@{selected.host}:{selected.port}/{selected.database} · {selected.tlsMode === "verify-full" ? "TLS 校验证书与地址" : "SSH 加密 / 数据库回环连接"} · {selected.hasPassword ? "已保存口令" : "未保存口令"}</p> : null}
         </div>}
         {!editor && state.profiles.length ? <p className="database-hint">“读取并留证”会把会话与进程对应状态、十项重点参数、访问诊断数量及检查结果保存到开始时的采集案件，未选择时创建案件。失败和取消也记录结果；普通读取仅在内存展示。</p> : null}
@@ -200,7 +215,7 @@ export const DatabasePage = forwardRef<DatabasePageHandle, DatabasePageProps>(fu
           <p>以下是观察值，不等同于完整基线合规或业务恢复结论。可能包含秘密的值已隐藏。</p>
           <PostgresqlObservationPanel session={state.job.result.session} expert={expert} />
           <PostgresqlHostProcessPanel inspection={state.job.result.hostProcess} expert={expert} />
-          <PostgresqlAccessPanel key={state.job.jobHandle} summary={state.job.result.access} page={state.accessRows} busy={state.busy} expert={expert} onRead={controller.accessRows} rolePage={state.rolePage} onRoleRead={controller.roleAccess} objectPage={state.objectPage} objectDetail={state.objectDetail} onObjectRead={controller.objectRows} onObjectDetail={controller.objectDetail} />
+          <PostgresqlAccessPanel key={state.job.jobHandle} summary={state.job.result.access} page={state.accessRows} busy={state.busy} expert={expert} onRead={controller.accessRows} rolePage={state.rolePage} onRoleRead={controller.roleAccess} objectPage={state.objectPage} objectDetail={state.objectDetail} onObjectRead={controller.objectRows} onObjectDetail={controller.objectDetail} onPasswordRole={role => { passwordOpener.current = document.activeElement as HTMLElement | null; setPasswordRole(role); }} />
           <div className="database-observations">{state.job.result.observations.map(row => <article key={row.name}><h4>{row.name}</h4><strong>{runtimeValue(row)}</strong><p>{explanations[row.name]}</p><small>来源：{row.source ?? "未提供"}{row.pendingRestart ? " · 等待重启生效" : ""}</small></article>)}</div>
           {expert ? <section aria-label="全部参数"><form className="database-toolbar" onSubmit={event => { event.preventDefault(); void controller.rows(query, 0); }}><label>搜索参数名<input type="search" maxLength={128} value={query} onChange={event => setQuery(event.target.value)} placeholder="例如 ssl、log、password" /></label><button disabled={state.busy}>搜索</button></form>
             {state.rows ? <><p>匹配 {state.rows.matched} / {state.rows.total} 项 · 当前筛选：{state.rows.query || "全部"} · 第 {Math.min(state.rows.offset + 1, state.rows.matched)}–{Math.min(state.rows.offset + 50, state.rows.matched)} 项</p>
@@ -212,6 +227,14 @@ export const DatabasePage = forwardRef<DatabasePageHandle, DatabasePageProps>(fu
         </> : null}
       </section> : null}
     </div>
+    {passwordRole && selected ? <PostgresqlPasswordDialog api={api} bindingHandle={bindingHandle!} profile={selected} targetLabel={targetLabel}
+      role={passwordRole === "current" ? { kind: "current" } : { kind: "oid", oid: passwordRole.oid }}
+      roleName={passwordRole === "current" ? selected.username : passwordRole.name}
+      onClose={() => { setPasswordRole(null); if (passwordOpener.current?.isConnected) passwordOpener.current.focus(); else heading.current?.focus(); }}
+      onInvalidate={controller.clearReview}
+      onDirty={dirty => { passwordDirty.current = dirty; }}
+      onProfile={_profile => void controller.request({ action: "list", bindingHandle: controller.binding })}
+      ask={dialog.ask} /> : null}
     {dialog.dialog ? <DialogHost dialog={dialog.dialog} onResolve={dialog.resolve} /> : null}
   </section>;
 });

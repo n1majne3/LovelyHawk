@@ -1,3 +1,4 @@
+import { isSystemInfoFirewallAddress } from "../shared/system-info-contract";
 import type {
   SystemInfoRisk,
   SystemInfoRow,
@@ -330,4 +331,24 @@ function formatDuration(seconds: number): string {
   return [days > 0 ? `${days} 天` : "", hours > 0 ? `${hours} 小时` : "", `${minutes} 分钟`]
     .filter((part) => part.length > 0)
     .join(" ");
+}
+
+/**
+ * The remote host address a connection row points at, when it is one a block
+ * could target. Wildcards, loopback and the unspecified address are not.
+ */
+export function firewallBlockAddress(tab: string, row: SystemInfoRow): string | null {
+  const raw = tab === "network" ? row.cells[2] : tab === "established" ? row.cells[1] : undefined;
+  if (raw === undefined) return null;
+  let value = raw.trim();
+  if (tab === "network") {
+    const bracketed = /^\[([^\]]+)\](?::\d+)?$/u.exec(value);
+    if (bracketed?.[1] !== undefined) value = bracketed[1];
+    else if (/^[^:]+:\d+$/u.test(value)) value = value.slice(0, value.lastIndexOf(":"));
+    else if ((value.match(/:/gu)?.length ?? 0) > 1 && /:\d+$/u.test(value) && value.includes(".")) value = value.slice(0, value.lastIndexOf(":"));
+  }
+  value = value.replace(/%.*$/u, "").replace(/^::ffff:/iu, "");
+  if (!isSystemInfoFirewallAddress(value)) return null;
+  if (/^(0\.0\.0\.0|127\.|::$|::1$)/u.test(value) || value === "*") return null;
+  return value;
 }

@@ -6,7 +6,12 @@ import type { EmergencyCommandPathOffer } from "../shared/emergency-command-cont
 import { InfoIcon, PermissionIcon, TrashIcon } from "./file-icons";
 import "./emergency-path.css";
 
-export type EmergencyPathMenuAction = "properties" | "evidence" | "disarm" | "quarantine";
+export type EmergencyPathMenuAction =
+  | "properties"
+  | "evidence"
+  | "disarm"
+  | "remove-capabilities"
+  | "quarantine";
 
 export interface EmergencyPathMenuProps {
   /** Where the menu was summoned, in client coordinates. */
@@ -34,6 +39,11 @@ const ITEMS: MenuItem[] = [
   {
     action: "disarm",
     label: "去掉执行权限",
+    icon: <PermissionIcon />,
+  },
+  {
+    action: "remove-capabilities",
+    label: "移除文件能力",
     icon: <PermissionIcon />,
   },
   {

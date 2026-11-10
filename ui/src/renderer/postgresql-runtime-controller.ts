@@ -21,6 +21,7 @@ export class PostgresqlRuntimeController {
   subscribe = (fn: () => void): (() => void) => { this.listeners.add(fn); return () => { this.listeners.delete(fn); }; };
   private set(next: Partial<PostgresqlState>): void { if (!this.disposed) { this.state = { ...this.state, ...next }; this.listeners.forEach(fn => fn()); } }
   hasUnsaved = (): boolean => this.state.job?.retention?.state === "unsaved";
+  clearReview = (): void => this.set({ job: null, rows: null, accessRows: null, rolePage: null, objectPage: null, objectDetail: null, notice: "口令修改已提交，请重新读取数据库状态。" });
   select = (id: string): void => { if (!this.state.busy && this.state.job?.state !== "reading" && !this.hasUnsaved()) this.set({ selected: id, job: null, rows: null, accessRows: null, rolePage: null, objectPage: null, objectDetail: null, error: null, notice: null }); };
   private async exchange(request: PostgresqlRuntimeRequest): Promise<PostgresqlRuntimeResponse> {
     if (!isPostgresqlRuntimeRequest(request)) throw new Error("请求内容无效，请检查输入长度、地址、端口和证书。");

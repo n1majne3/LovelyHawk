@@ -135,6 +135,20 @@ pub struct UserCount {
     pub fail_count: usize,
 }
 
+/// Failures-per-IP threshold before a later accepted login counts as
+/// possibly breached.
+pub const BREACH_FAILURE_THRESHOLD: usize = 5;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BreachedSource {
+    pub ip: String,
+    pub failures_before_success: usize,
+    pub first_success_at: String,
+    pub user: Option<String>,
+    /// `password` or `publickey`, when the line carries it.
+    pub method: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ThreatSummary {
     pub brute_force_count: usize,
@@ -145,9 +159,11 @@ pub struct ThreatSummary {
     pub top_target_users: Vec<UserCount>,
     pub hourly_distribution: Vec<usize>,
     pub threat_level: ThreatLevel,
+    #[serde(default)]
+    pub breached_sources: Vec<BreachedSource>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "lowercase")]
 pub enum ThreatLevel {
     None,
@@ -1188,6 +1204,8 @@ pub fn analyze_threats(entries: &[LogEntry]) -> ThreatSummary {
     let mut privilege_escalation = 0;
     let mut suspicious_activity = 0;
     let mut ips: HashMap<String, (usize, String, String)> = HashMap::new();
+    let mut pending_failures: HashMap<String, usize> = HashMap::new();
+    let mut first_success: HashMap<String, (String, Option<String>, String)> = HashMap::new();
     let mut users: HashMap<String, (usize, usize)> = HashMap::new();
     let mut hourly_distribution = vec![0; 24];
 
@@ -1205,13 +1223,33 @@ pub fn analyze_threats(entries: &[LogEntry]) -> ThreatSummary {
                 users.entry(user).or_insert((0, 0)).1 += 1;
             }
         }
+        if (lower.contains("failed password") || lower.contains("authentication failure"))
+            && let Some(ip) = extract_ip(&entry.raw)
+            && !first_success.contains_key(&ip)
+        {
+            *pending_failures.entry(ip).or_insert(0) += 1;
+        }
         if lower.contains("accepted password") || lower.contains("accepted publickey") {
             successful_login += 1;
             if let Some(ip) = extract_ip(&entry.raw) {
-                let value = ips.entry(ip).or_insert((0, String::new(), String::new()));
+                let value = ips
+                    .entry(ip.clone())
+                    .or_insert((0, String::new(), String::new()));
                 value.0 += 1;
                 value.1.clone_from(&entry.timestamp);
                 value.2 = "accepted_login".to_owned();
+                first_success.entry(ip).or_insert_with(|| {
+                    let method = if lower.contains("accepted password") {
+                        "password"
+                    } else {
+                        "publickey"
+                    };
+                    (
+                        entry.timestamp.clone(),
+                        extract_target_user(&entry.raw),
+                        method.to_owned(),
+                    )
+                });
             }
             if let Some(user) = extract_target_user(&entry.raw) {
                 users.entry(user).or_insert((0, 0)).0 += 1;
@@ -1256,7 +1294,28 @@ pub fn analyze_threats(entries: &[LogEntry]) -> ThreatSummary {
     top_target_users.sort_by_key(|left| std::cmp::Reverse(left.count));
     top_target_users.truncate(20);
 
-    let threat_level = if brute_force > 100 || suspicious_activity > 10 {
+    let mut breached_sources: Vec<BreachedSource> = first_success
+        .into_iter()
+        .filter_map(|(ip, (at, user, method))| {
+            let failures = pending_failures.get(&ip).copied().unwrap_or(0);
+            (failures >= BREACH_FAILURE_THRESHOLD).then_some(BreachedSource {
+                ip,
+                failures_before_success: failures,
+                first_success_at: at,
+                user,
+                method: Some(method),
+            })
+        })
+        .collect();
+    breached_sources.sort_by_key(|source| std::cmp::Reverse(source.failures_before_success));
+    breached_sources.truncate(20);
+    let threat_level = if !breached_sources.is_empty() {
+        ThreatLevel::High.max(if brute_force > 100 || suspicious_activity > 10 {
+            ThreatLevel::Critical
+        } else {
+            ThreatLevel::High
+        })
+    } else if brute_force > 100 || suspicious_activity > 10 {
         ThreatLevel::Critical
     } else if brute_force > 50 || suspicious_activity > 5 {
         ThreatLevel::High
@@ -1276,6 +1335,7 @@ pub fn analyze_threats(entries: &[LogEntry]) -> ThreatSummary {
         top_target_users,
         hourly_distribution,
         threat_level,
+        breached_sources,
     }
 }
 

@@ -11,6 +11,10 @@ use lovelyhawk_core::{
         DatabaseConfigRuntimeApply, DatabaseConfigRuntimeRow, DatabaseConfigRuntimeSensitivity,
         DatabaseConfigRuntimeValuePresence, PostgreSqlRuntimeContext,
     },
+    database_password::{
+        DatabasePasswordPlan, DatabasePasswordRestorePlan, DatabasePasswordRestoreToken,
+        PostgresqlPasswordRole, PostgresqlPasswordVerification, SavedPasswordUpdate,
+    },
     investigation::{AddEvidence, CaseCollectionReservation},
     operations::DangerousConfirmation,
     postgresql_access::AccessSection,
@@ -124,6 +128,58 @@ pub(crate) enum PostgresqlRuntimeRequest {
         query: String,
         offset: usize,
     },
+    PlanPassword {
+        binding_handle: String,
+        profile_handle: String,
+        role: PasswordRoleInput,
+        #[serde(deserialize_with = "read_password")]
+        password: SecretValue,
+        update_saved_password: bool,
+    },
+    ExecutePassword {
+        binding_handle: String,
+        plan_handle: String,
+    },
+    PlanPasswordRestore {
+        binding_handle: String,
+        restore_handle: String,
+        profile_handle: String,
+    },
+    ExecutePasswordRestore {
+        binding_handle: String,
+        plan_handle: String,
+    },
+}
+
+#[derive(Clone)]
+pub(crate) enum PasswordRoleInput {
+    Current,
+    Oid { oid: u32 },
+}
+impl<'de> Deserialize<'de> for PasswordRoleInput {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Wire {
+            kind: String,
+            #[serde(default)]
+            oid: Option<u32>,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        match wire.kind.as_str() {
+            "current" if wire.oid.is_none() => Ok(Self::Current),
+            "oid" => wire
+                .oid
+                .map(|oid| Self::Oid { oid })
+                .ok_or_else(|| serde::de::Error::missing_field("oid")),
+            _ => Err(serde::de::Error::unknown_variant(
+                &wire.kind,
+                &["current", "oid"],
+            )),
+        }
+    }
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -234,6 +290,25 @@ struct DeletePlan {
     core: DatabaseProfileDeletePlan,
     created: Instant,
 }
+struct PasswordPlan {
+    handle: String,
+    core: DatabasePasswordPlan,
+    profile_id: String,
+    profile_handle: String,
+    created: Instant,
+}
+struct RestorePlan {
+    handle: String,
+    core: DatabasePasswordRestorePlan,
+    profile_id: String,
+    profile_handle: String,
+    created: Instant,
+}
+struct RestoreSlot {
+    handle: String,
+    token: DatabasePasswordRestoreToken,
+    created: Instant,
+}
 struct Entry {
     scope: Scope,
     touched: Instant,
@@ -241,6 +316,10 @@ struct Entry {
     job: Option<Job>,
     delete: Option<DeletePlan>,
     deleting: bool,
+    password_plan: Option<PasswordPlan>,
+    restore_plan: Option<RestorePlan>,
+    restore: Option<RestoreSlot>,
+    password_busy: bool,
 }
 #[derive(Clone)]
 pub(crate) struct PostgresqlRuntimeApi {
@@ -261,6 +340,9 @@ pub(crate) enum PostgresqlRuntimeError {
     Busy,
     Capacity,
     Store,
+    /// Core rejected with its closed text; the dispatch keeps the message and
+    /// a fixed code so the page can react distinctly.
+    Rejected(&'static str, String),
 }
 type Result<T> = std::result::Result<T, PostgresqlRuntimeError>;
 fn text(value: &str, cap: usize, empty: bool) -> bool {
@@ -274,6 +356,10 @@ fn handle(value: &str) -> Result<()> {
     } else {
         Err(PostgresqlRuntimeError::Invalid)
     }
+}
+fn core_error(error: CoreError) -> PostgresqlRuntimeError {
+    let (code, detail) = lovelyhawk_core::database_password::public_reason(&error);
+    PostgresqlRuntimeError::Rejected(code, detail)
 }
 fn new_handle() -> String {
     Uuid::new_v4().to_string()
@@ -355,6 +441,7 @@ impl PostgresqlRuntimeApi {
         let mut entries = self.entries.lock();
         entries.retain(|_, entry| {
             entry.deleting
+                || entry.password_busy
                 || entry.job.as_ref().is_some_and(Job::unsaved)
                 || entry.touched.elapsed() < TTL
         });
@@ -381,6 +468,27 @@ impl PostgresqlRuntimeApi {
         {
             entry.delete = None;
         }
+        if entry
+            .password_plan
+            .as_ref()
+            .is_some_and(|plan| plan.created.elapsed() >= PLAN_TTL)
+        {
+            entry.password_plan = None;
+        }
+        if entry
+            .restore_plan
+            .as_ref()
+            .is_some_and(|plan| plan.created.elapsed() >= PLAN_TTL)
+        {
+            entry.restore_plan = None;
+        }
+        if entry
+            .restore
+            .as_ref()
+            .is_some_and(|slot| slot.created.elapsed() >= TTL)
+        {
+            entry.restore = None;
+        }
         work(entry)
     }
     fn profile(&self, entry: &Entry, id: &str) -> Result<DatabaseProfileSnapshot> {
@@ -395,8 +503,32 @@ impl PostgresqlRuntimeApi {
             .map_err(|_| PostgresqlRuntimeError::Stale)?;
         Ok(snapshot.clone())
     }
+    /// Re-issue a fresh handle for a profile whose stored secret changed.
+    fn refresh_profile(
+        &self,
+        scope: &Scope,
+        profile_id: &str,
+        old_handle: &str,
+    ) -> Result<Option<ProfileDto>> {
+        let snapshot = self
+            .services
+            .database()
+            .profile_snapshots()
+            .map_err(|_| PostgresqlRuntimeError::Store)?
+            .into_iter()
+            .find(|snapshot| snapshot.view().config.id == profile_id)
+            .ok_or(PostgresqlRuntimeError::Stale)?;
+        self.with_entry(scope, |entry| {
+            entry.profiles.remove(old_handle);
+            let id = new_handle();
+            let dto = profile_dto(&id, &snapshot);
+            entry.profiles.insert(id, snapshot);
+            Ok(Some(dto))
+        })
+    }
     fn idle(entry: &Entry) -> Result<()> {
         if entry.deleting
+            || entry.password_busy
             || entry
                 .job
                 .as_ref()
@@ -425,11 +557,15 @@ impl PostgresqlRuntimeApi {
             ObjectDetail { .. } => "object-detail",
             RoleAccess { .. } => "role-access",
             AccessRows { .. } => "access-rows",
+            PlanPassword { .. } => "plan-password",
+            ExecutePassword { .. } => "execute-password",
+            PlanPasswordRestore { .. } => "plan-password-restore",
+            ExecutePasswordRestore { .. } => "execute-password-restore",
         };
         match self.dispatch_inner(request).await {
             Ok(response) => response,
             Err(error) => {
-                let (code, detail) = match error {
+                let (code, detail): (&str, &str) = match error {
                     PostgresqlRuntimeError::Invalid => (
                         "invalid-params",
                         "数据库请求无效。请检查地址、端口、证书和账号；旧连接需先保存并关联当前主机。",
@@ -449,6 +585,9 @@ impl PostgresqlRuntimeApi {
                         "store",
                         "无法保存或读取数据库连接。请刷新确认最新配置，并检查本机数据目录的权限与空间。",
                     ),
+                    PostgresqlRuntimeError::Rejected(code, detail) => {
+                        return json!({"kind":"rejected", "action":action, "code":code, "detail":detail});
+                    }
                 };
                 json!({"kind":"rejected", "action":action, "code":code, "detail":detail})
             }
@@ -471,7 +610,11 @@ impl PostgresqlRuntimeApi {
             | ObjectRows { binding_handle, .. }
             | ObjectDetail { binding_handle, .. }
             | RoleAccess { binding_handle, .. }
-            | AccessRows { binding_handle, .. } => binding_handle,
+            | AccessRows { binding_handle, .. }
+            | PlanPassword { binding_handle, .. }
+            | ExecutePassword { binding_handle, .. }
+            | PlanPasswordRestore { binding_handle, .. }
+            | ExecutePasswordRestore { binding_handle, .. } => binding_handle,
         };
         let (scope, session) = self.capture(binding)?;
         let response = match request {
@@ -482,7 +625,7 @@ impl PostgresqlRuntimeApi {
                 entries.retain(|_, entry| entry.deleting || entry.job.as_ref().is_some_and(Job::unsaved) || entry.touched.elapsed() < TTL);
                 if entries.get(&scope.binding).is_some_and(|entry| entry.scope != scope) { entries.remove(&scope.binding); }
                 if !entries.contains_key(&scope.binding) && entries.len() >= MAX_BINDINGS { return Err(PostgresqlRuntimeError::Capacity); }
-                let entry = entries.entry(scope.binding.clone()).or_insert_with(|| Entry { scope: scope.clone(), touched: Instant::now(), profiles: HashMap::new(), job: None, delete: None, deleting: false });
+                let entry = entries.entry(scope.binding.clone()).or_insert_with(|| Entry { scope: scope.clone(), touched: Instant::now(), profiles: HashMap::new(), job: None, delete: None, deleting: false, password_plan: None, restore_plan: None, restore: None, password_busy: false });
                 Self::idle(entry)?;
                 let mut refreshed = HashMap::new();
                 let mut profiles = Vec::new();
@@ -608,6 +751,168 @@ impl PostgresqlRuntimeApi {
                 entry.job.as_mut().expect("inserted job").abort = Some(task.abort_handle());
                 Ok(json!({"kind":"job","job":dto}))
             })? },
+            PlanPassword { profile_handle, role, password, update_saved_password, .. } => {
+                let snapshot = self.with_entry(&scope, |entry| {
+                    Self::idle(entry)?;
+                    let snapshot = self.profile(entry, &profile_handle)?;
+                    if let PasswordRoleInput::Oid { oid } = &role {
+                        if *oid == 0 { return Err(PostgresqlRuntimeError::Invalid); }
+                        let observed = entry.job.as_ref()
+                            .filter(|job| job.dto.state == "completed")
+                            .and_then(|job| job.snapshot.as_ref())
+                            .and_then(|snapshot| snapshot.postgresql_access())
+                            .is_some_and(|access| access.observed_role(*oid));
+                        if !observed { return Err(PostgresqlRuntimeError::Invalid); }
+                    }
+                    Ok(snapshot)
+                })?;
+                let role = match role {
+                    PasswordRoleInput::Current => PostgresqlPasswordRole::Current,
+                    PasswordRoleInput::Oid { oid } => PostgresqlPasswordRole::Oid(oid),
+                };
+                let plan = self.services.database()
+                    .plan_postgresql_password(&session, &snapshot, role, password, update_saved_password)
+                    .await.map_err(core_error)?;
+                let view = serde_json::to_value(plan.view()).map_err(|_| PostgresqlRuntimeError::Store)?;
+                self.with_entry(&scope, |entry| {
+                    Self::idle(entry)?;
+                    let id = new_handle();
+                    entry.password_plan = Some(PasswordPlan {
+                        handle: id.clone(), core: plan,
+                        profile_id: snapshot.view().config.id.clone(),
+                        profile_handle: profile_handle.clone(), created: Instant::now(),
+                    });
+                    Ok(json!({"kind":"password-plan","planHandle":id,"expiresInMs":120000,"plan":view}))
+                })?
+            }
+            ExecutePassword { plan_handle, .. } => {
+                handle(&plan_handle)?;
+                let plan = self.with_entry(&scope, |entry| {
+                    Self::idle(entry)?;
+                    if entry.password_plan.as_ref().is_none_or(|plan| plan.handle != plan_handle) { return Err(PostgresqlRuntimeError::Stale); }
+                    entry.password_busy = true;
+                    Ok(entry.password_plan.take().expect("checked plan"))
+                })?;
+                let _lease = PasswordLease { entries: self.entries.clone(), scope: scope.clone() };
+                let confirmation = DangerousConfirmation::approve(plan.core.definition());
+                let execution = match self.services.database()
+                    .execute_postgresql_password(&session, plan.core, confirmation, self.services.operation_journal())
+                    .await
+                {
+                    Ok(execution) => execution,
+                    Err(error) => {
+                        let detail = error.to_string();
+                        let code = if detail.contains("未确认") { "unknown-state" } else if detail.contains("已变化") || detail.contains("过期") { "stale" } else { "rejected" };
+                        if code == "unknown-state" {
+                            let _ = self.with_entry(&scope, |entry| { entry.job = None; Ok(()) });
+                        }
+                        return Ok(json!({"kind":"rejected","action":"execute-password","code":code,"detail":detail}));
+                    }
+                };
+                let outcome = execution.outcome;
+                // The change already committed remotely; every bookkeeping
+                // step below is best-effort and must not lose the outcome.
+                let (restore_handle, restore_unavailable) = match execution.restore_token {
+                    Some(token) => {
+                        let handle = new_handle();
+                        match self.with_entry(&scope, |entry| {
+                            entry.restore = Some(RestoreSlot { handle: handle.clone(), token, created: Instant::now() });
+                            Ok(())
+                        }) {
+                            Ok(_) => (Some(handle), false),
+                            Err(_) => (None, true),
+                        }
+                    }
+                    None => (None, false),
+                };
+                let profile = if outcome.saved_password == SavedPasswordUpdate::Updated {
+                    self.refresh_profile(&scope, &plan.profile_id, &plan.profile_handle).unwrap_or_default()
+                } else { None };
+                let _ = self.with_entry(&scope, |entry| { entry.job = None; Ok(()) });
+                let (state, reason) = match outcome.verification {
+                    PostgresqlPasswordVerification::Passed => ("passed", None),
+                    PostgresqlPasswordVerification::Rejected => ("rejected", None),
+                    PostgresqlPasswordVerification::Unverifiable(reason) => {
+                        let code = match reason {
+                            lovelyhawk_core::database_password::PostgresqlVerifyBlock::AccessRule => "access-rule",
+                            lovelyhawk_core::database_password::PostgresqlVerifyBlock::Network => "network",
+                            lovelyhawk_core::database_password::PostgresqlVerifyBlock::Timeout => "timeout",
+                            lovelyhawk_core::database_password::PostgresqlVerifyBlock::Other => "other",
+                        };
+                        ("unverifiable", Some(code))
+                    }
+                };
+                json!({"kind":"password-result","result":{
+                    "verification":{"state":state,"reason":reason},
+                    "savedPassword":outcome.saved_password,
+                    "restorable":outcome.restorable,
+                    "journalRecorded":outcome.journal_recorded,
+                    "restoreHandle":restore_handle,
+                    "restoreUnavailable":restore_unavailable,
+                    "profile":profile,
+                }})
+            }
+            PlanPasswordRestore { restore_handle, profile_handle, .. } => {
+                handle(&restore_handle)?;
+                let (token, snapshot) = self.with_entry(&scope, |entry| {
+                    Self::idle(entry)?;
+                    if entry.restore.as_ref().is_none_or(|slot| slot.handle != restore_handle) { return Err(PostgresqlRuntimeError::Stale); }
+                    let snapshot = self.profile(entry, &profile_handle)?;
+                    Ok((entry.restore.take().expect("checked restore").token, snapshot))
+                })?;
+                let plan = self.services.database()
+                    .plan_postgresql_password_restore(&session, &snapshot, token)
+                    .await.map_err(|error| {
+                        let (_, detail) = lovelyhawk_core::database_password::public_reason(&error);
+                        PostgresqlRuntimeError::Rejected(
+                            "stale",
+                            format!("{detail} 恢复令牌只能使用一次，旧口令已无法自动放回。"),
+                        )
+                    })?;
+                let view = serde_json::to_value(plan.view()).map_err(|_| PostgresqlRuntimeError::Store)?;
+                self.with_entry(&scope, |entry| {
+                    Self::idle(entry)?;
+                    let id = new_handle();
+                    entry.restore_plan = Some(RestorePlan {
+                        handle: id.clone(), core: plan,
+                        profile_id: snapshot.view().config.id.clone(),
+                        profile_handle: profile_handle.clone(), created: Instant::now(),
+                    });
+                    Ok(json!({"kind":"password-restore-plan","planHandle":id,"expiresInMs":120000,"plan":view}))
+                })?
+            }
+            ExecutePasswordRestore { plan_handle, .. } => {
+                handle(&plan_handle)?;
+                let plan = self.with_entry(&scope, |entry| {
+                    Self::idle(entry)?;
+                    if entry.restore_plan.as_ref().is_none_or(|plan| plan.handle != plan_handle) { return Err(PostgresqlRuntimeError::Stale); }
+                    entry.password_busy = true;
+                    Ok(entry.restore_plan.take().expect("checked plan"))
+                })?;
+                let _lease = PasswordLease { entries: self.entries.clone(), scope: scope.clone() };
+                let confirmation = DangerousConfirmation::approve(plan.core.definition());
+                let outcome = match self.services.database()
+                    .execute_postgresql_password_restore(&session, plan.core, confirmation, self.services.operation_journal())
+                    .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        let detail = error.to_string();
+                        let code = if detail.contains("未确认") { "unknown-state" } else if detail.contains("已变化") || detail.contains("过期") { "stale" } else { "rejected" };
+                        return Ok(json!({"kind":"rejected","action":"execute-password-restore","code":code,"detail":detail}));
+                    }
+                };
+                let profile = if outcome.saved_password == lovelyhawk_core::database_password::SavedPasswordRestore::Restored {
+                    self.refresh_profile(&scope, &plan.profile_id, &plan.profile_handle).unwrap_or_default()
+                } else { None };
+                let _ = self.with_entry(&scope, |entry| { entry.job = None; Ok(()) });
+                json!({"kind":"password-restore-result","result":{
+                    "verification":outcome.verification,
+                    "savedPassword":outcome.saved_password,
+                    "journalRecorded":outcome.journal_recorded,
+                    "profile":profile,
+                }})
+            }
             Poll { job_handle, .. } => self.job_response(&scope, &job_handle, false)?,
             Cancel { job_handle, .. } => self.job_response(&scope, &job_handle, true)?,
             Retain { job_handle, .. } => self.with_entry(&scope, |entry| {
@@ -904,6 +1209,19 @@ fn required_option<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
     Option::<T>::deserialize(deserializer)
 }
 
+struct PasswordLease {
+    entries: Arc<Mutex<HashMap<String, Entry>>>,
+    scope: Scope,
+}
+impl Drop for PasswordLease {
+    fn drop(&mut self) {
+        if let Some(entry) = self.entries.lock().get_mut(&self.scope.binding)
+            && entry.scope == self.scope
+        {
+            entry.password_busy = false;
+        }
+    }
+}
 struct DeleteLease {
     entries: Arc<Mutex<HashMap<String, Entry>>>,
     scope: Scope,
@@ -1113,6 +1431,34 @@ mod tests {
                 .err()
                 .expect("must refuse");
             assert!(!error.to_string().contains("test-secret"));
+        }
+    }
+    #[test]
+    fn password_requests_validate_shape_and_never_echo_secret_text() {
+        let secret = "Sup3r秘密$ecret";
+        let valid = json!({"action":"plan-password","bindingHandle":"b","profileHandle":"p","role":{"kind":"oid","oid":16384},"password":secret,"updateSavedPassword":true});
+        assert!(serde_json::from_value::<PostgresqlRuntimeRequest>(valid.clone()).is_ok());
+        let current = json!({"action":"plan-password","bindingHandle":"b","profileHandle":"p","role":{"kind":"current"},"password":secret,"updateSavedPassword":false});
+        assert!(serde_json::from_value::<PostgresqlRuntimeRequest>(current).is_ok());
+        for action in [
+            json!({"action":"plan-password","bindingHandle":"b","profileHandle":"p","role":{"kind":"oid","oid":16384,"name":"x"},"password":secret,"updateSavedPassword":true}),
+            json!({"action":"plan-password","bindingHandle":"b","profileHandle":"p","role":{"kind":"role","oid":16384},"password":secret,"updateSavedPassword":true}),
+            json!({"action":"plan-password","bindingHandle":"b","profileHandle":"p","role":{"kind":"current","extra":1},"password":secret,"updateSavedPassword":true}),
+            json!({"action":"plan-password","bindingHandle":"b","profileHandle":"p","role":{"kind":"oid","oid":"16384"},"password":secret,"updateSavedPassword":true}),
+            json!({"action":"plan-password","bindingHandle":"b","role":{"kind":"current"},"password":secret,"updateSavedPassword":true,"profileHandle":"p","sql":"ALTER"}),
+            json!({"action":"execute-password","bindingHandle":"b","planHandle":"h","role":{"kind":"current"}}),
+            json!({"action":"plan-password-restore","bindingHandle":"b","restoreHandle":"r"}),
+            json!({"action":"execute-password-restore","bindingHandle":"b","planHandle":"h","token":"x"}),
+        ] {
+            let error = serde_json::from_value::<PostgresqlRuntimeRequest>(action)
+                .err()
+                .expect("must refuse");
+            assert!(!error.to_string().contains(secret));
+        }
+        for password in ["".to_owned(), "x".repeat(16385), "with\0nul".to_owned()] {
+            let mut candidate = valid.clone();
+            candidate["password"] = json!(password);
+            assert!(serde_json::from_value::<PostgresqlRuntimeRequest>(candidate).is_err());
         }
     }
     #[test]

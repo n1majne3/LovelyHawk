@@ -21,6 +21,12 @@ use std::{
 
 use lovelyhawk_core::{
     CoreError, CoreResult,
+    account_password::AccountPasswordPlan,
+    crypto::SecretValue,
+    firewall_block::{
+        FirewallBlockOutcome, FirewallBlockPlan, FirewallBlockRequest, FirewallBlockRestorePlan,
+        FirewallDirection,
+    },
     operations::{DangerousConfirmation, OperationPlan, VerificationResult},
     system_info::{
         ArtifactInvestigationAction, ArtifactMutationAction, ArtifactMutationPlan,
@@ -66,6 +72,9 @@ pub(crate) enum RowAction {
     ServiceRuntime(ServiceRuntimeAction),
     UserInspect(UserInvestigationAction),
     UserAccount(UserAccountAction),
+    /// `account.password` — the change needs a secret the renderer supplies
+    /// once, so it is its own variant rather than a `UserAccountAction`.
+    UserPassword,
     LoginInspect(LoginInvestigationAction),
     NetworkInspect(NetworkInvestigationAction),
     NetworkDisconnect,
@@ -84,6 +93,7 @@ impl RowAction {
             Self::ServiceRuntime(action) => format!("service.runtime.{}", kebab(action)),
             Self::UserInspect(action) => format!("user.{}", kebab(action)),
             Self::UserAccount(action) => format!("account.{}", kebab(action)),
+            Self::UserPassword => "account.password".to_owned(),
             Self::LoginInspect(action) => format!("login.{}", kebab(action)),
             Self::NetworkInspect(action) => format!("network.{}", kebab(action)),
             Self::NetworkDisconnect => "network.disconnect".to_owned(),
@@ -132,7 +142,10 @@ impl RowAction {
                 None => from_kebab(rest).map(Self::ServiceInspect),
             },
             "user" => from_kebab(rest).map(Self::UserInspect),
-            "account" => from_kebab(rest).map(Self::UserAccount),
+            "account" => match rest {
+                "password" => Some(Self::UserPassword),
+                _ => from_kebab(rest).map(Self::UserAccount),
+            },
             "login" => from_kebab(rest).map(Self::LoginInspect),
             "network" => match rest {
                 "disconnect" => Some(Self::NetworkDisconnect),
@@ -206,6 +219,7 @@ impl RowAction {
             Self::ServiceRuntime(action) => action.label(),
             Self::UserInspect(action) => action.label(),
             Self::UserAccount(action) => action.label(),
+            Self::UserPassword => "修改账户口令",
             Self::LoginInspect(action) => action.label(),
             Self::NetworkInspect(action) => action.label(),
             Self::NetworkDisconnect => "断开此连接",
@@ -221,6 +235,7 @@ impl RowAction {
             Self::ProcessSignal(_)
                 | Self::ServiceRuntime(_)
                 | Self::UserAccount(_)
+                | Self::UserPassword
                 | Self::NetworkDisconnect
                 | Self::ArtifactMutation(_)
         )
@@ -241,6 +256,7 @@ impl RowAction {
             Self::UserAccount(action) => {
                 matches!(action, UserAccountAction::Lock | UserAccountAction::Delete)
             }
+            Self::UserPassword => true,
             _ => false,
         }
     }
@@ -257,6 +273,7 @@ impl RowAction {
             Self::ProcessSignal(_)
             | Self::ServiceRuntime(_)
             | Self::UserAccount(_)
+            | Self::UserPassword
             | Self::NetworkDisconnect
             | Self::ArtifactMutation(_) => ("change".to_owned(), "处置"),
         }
@@ -305,6 +322,7 @@ impl RowAction {
                     ]
                     .map(Self::UserAccount),
                 );
+                actions.push(Self::UserPassword);
             }
             SystemInfoTab::LoginHistory => {
                 actions.extend(LoginInvestigationAction::ALL.map(Self::LoginInspect));
@@ -412,6 +430,7 @@ fn applies(table: &SystemInfoTable, row_id: &str, action: RowAction) -> bool {
         RowAction::ServiceRuntime(inner) => table.runtime_change_request(row_id, inner).is_ok(),
         RowAction::UserInspect(inner) => table.user_investigation_request(row_id, inner).is_ok(),
         RowAction::UserAccount(inner) => table.user_account_request(row_id, inner).is_ok(),
+        RowAction::UserPassword => table.user_password_request(row_id).is_ok(),
         RowAction::LoginInspect(inner) => table.login_investigation_request(row_id, inner).is_ok(),
         RowAction::NetworkInspect(inner) => {
             table.network_investigation_request(row_id, inner).is_ok()
@@ -567,6 +586,7 @@ enum RowPlan {
     /// The same request on a host that boots with scripts instead of units.
     BootScriptRuntime(BootScriptRuntimePlan),
     UserAccount(UserAccountPlan),
+    UserPassword(AccountPasswordPlan),
     NetworkDisconnect(NetworkDisconnectPlan),
     ArtifactMutation(ArtifactMutationPlan),
 }
@@ -578,6 +598,7 @@ impl RowPlan {
             Self::ServiceRuntime(plan) => plan.definition(),
             Self::BootScriptRuntime(plan) => plan.definition(),
             Self::UserAccount(plan) => plan.definition(),
+            Self::UserPassword(plan) => plan.definition(),
             Self::NetworkDisconnect(plan) => plan.definition(),
             Self::ArtifactMutation(plan) => plan.definition(),
         }
@@ -771,6 +792,7 @@ impl SystemInfoApi {
                 RowAction::ProcessSignal(_)
                 | RowAction::ServiceRuntime(_)
                 | RowAction::UserAccount(_)
+                | RowAction::UserPassword
                 | RowAction::NetworkDisconnect
                 | RowAction::ArtifactMutation(_) => Err(CoreError::Validation {
                     subject: "system-information row action",
@@ -805,9 +827,15 @@ impl SystemInfoApi {
         snapshot_handle: &str,
         row_id: &str,
         action_key: &str,
+        password: Option<SecretValue>,
     ) -> Result<SystemInfoRowPlanDto, SystemInfoApiError> {
         let action = RowAction::parse(action_key).ok_or(SystemInfoApiError::InvalidAction)?;
         if !action.changes_host() {
+            return Err(SystemInfoApiError::InvalidAction);
+        }
+        // A secret is only meaningful to the one action that asks for it;
+        // anywhere else its presence is a boundary violation, not a hint.
+        if !matches!(action, RowAction::UserPassword) && password.is_some() {
             return Err(SystemInfoApiError::InvalidAction);
         }
         let scope = self.capture_scope(binding_handle)?;
@@ -844,6 +872,17 @@ impl SystemInfoApi {
                         .plan_user_account(&session, &request)
                         .await
                         .map(RowPlan::UserAccount)
+                }
+                RowAction::UserPassword => {
+                    let identity = table.user_password_request(row_id)?;
+                    let password = password.ok_or_else(|| CoreError::Validation {
+                        subject: "system-information row action",
+                        message: "the password change needs the new password".to_owned(),
+                    })?;
+                    service
+                        .plan_account_password(&session, row_id, &identity.username, password)
+                        .await
+                        .map(RowPlan::UserPassword)
                 }
                 RowAction::NetworkDisconnect => {
                     let request = table.network_disconnect_request(row_id)?;
@@ -967,6 +1006,15 @@ impl SystemInfoApi {
                         }),
                     RowPlan::UserAccount(plan) => service
                         .execute_user_account(&session, plan, confirmation, journal)
+                        .await
+                        .map(|outcome| {
+                            (
+                                outcome.verification,
+                                outcome.restored_after_failed_verification,
+                            )
+                        }),
+                    RowPlan::UserPassword(plan) => service
+                        .execute_account_password(&session, plan, confirmation, journal)
                         .await
                         .map(|outcome| {
                             (
@@ -1160,6 +1208,368 @@ fn bounded_text(text: &str, maximum_bytes: usize) -> String {
         end -= 1;
     }
     format!("{}…", &text[..end])
+}
+
+// ---- firewall block (batch 7b) ----
+const FIREWALL_PLAN_TTL: Duration = Duration::from_secs(120);
+const FIREWALL_RESTORE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+struct StoredFirewallPlan {
+    binding_handle: String,
+    request: FirewallBlockRequest,
+    plan: FirewallBlockPlan,
+    expires_at: Instant,
+}
+
+struct StoredFirewallRestorePlan {
+    binding_handle: String,
+    request: FirewallBlockRequest,
+    plan: FirewallBlockRestorePlan,
+    expires_at: Instant,
+}
+
+struct StoredFirewallRestore {
+    binding_handle: String,
+    request: FirewallBlockRequest,
+    token: String,
+    expires_at: Instant,
+}
+
+#[derive(Default)]
+pub(crate) struct FirewallRegistry {
+    plans: HashMap<String, StoredFirewallPlan>,
+    restore_plans: HashMap<String, StoredFirewallRestorePlan>,
+    restores: HashMap<String, StoredFirewallRestore>,
+}
+
+impl FirewallRegistry {
+    pub(crate) fn close_binding(&mut self, binding_handle: &str) {
+        self.plans.retain(|_, p| p.binding_handle != binding_handle);
+        self.restore_plans
+            .retain(|_, p| p.binding_handle != binding_handle);
+        self.restores
+            .retain(|_, r| r.binding_handle != binding_handle);
+    }
+
+    fn prune(&mut self, now: Instant) {
+        self.plans.retain(|_, p| p.expires_at > now);
+        self.restore_plans.retain(|_, p| p.expires_at > now);
+        self.restores.retain(|_, r| r.expires_at > now);
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(tag = "action", rename_all = "kebab-case", deny_unknown_fields)]
+pub(crate) enum FirewallRequest {
+    Plan {
+        #[serde(rename = "bindingHandle")]
+        binding_handle: String,
+        address: String,
+        direction: String,
+    },
+    Execute {
+        #[serde(rename = "bindingHandle")]
+        binding_handle: String,
+        #[serde(rename = "planHandle")]
+        plan_handle: String,
+    },
+    #[serde(rename = "plan-restore")]
+    PlanRestore {
+        #[serde(rename = "bindingHandle")]
+        binding_handle: String,
+        #[serde(rename = "restoreHandle")]
+        restore_handle: String,
+    },
+    #[serde(rename = "execute-restore")]
+    ExecuteRestore {
+        #[serde(rename = "bindingHandle")]
+        binding_handle: String,
+        #[serde(rename = "planHandle")]
+        plan_handle: String,
+    },
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct FirewallPlanDto {
+    plan_handle: String,
+    backend: String,
+    address: String,
+    direction: String,
+    commands: Vec<String>,
+    warnings: Vec<String>,
+    expires_in_ms: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct FirewallResultDto {
+    verified: bool,
+    detail: String,
+    restore_handle: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct FirewallRestorePlanDto {
+    plan_handle: String,
+    backend: String,
+    address: String,
+    direction: String,
+    expires_in_ms: u64,
+}
+
+fn firewall_direction(value: &str) -> Result<FirewallDirection, SystemInfoApiError> {
+    match value {
+        "inbound" => Ok(FirewallDirection::Inbound),
+        "outbound" => Ok(FirewallDirection::Outbound),
+        "both" => Ok(FirewallDirection::Both),
+        _ => Err(SystemInfoApiError::InvalidAction),
+    }
+}
+
+fn direction_key(direction: FirewallDirection) -> &'static str {
+    match direction {
+        FirewallDirection::Inbound => "inbound",
+        FirewallDirection::Outbound => "outbound",
+        FirewallDirection::Both => "both",
+    }
+}
+impl SystemInfoApi {
+    pub(crate) async fn firewall(
+        &self,
+        request: FirewallRequest,
+    ) -> Result<serde_json::Value, SystemInfoApiError> {
+        match request {
+            FirewallRequest::Plan {
+                binding_handle,
+                address,
+                direction,
+            } => {
+                self.firewall_plan(&binding_handle, &address, &direction)
+                    .await
+            }
+            FirewallRequest::Execute {
+                binding_handle,
+                plan_handle,
+            } => self.firewall_execute(&binding_handle, &plan_handle).await,
+            FirewallRequest::PlanRestore {
+                binding_handle,
+                restore_handle,
+            } => {
+                self.firewall_plan_restore(&binding_handle, &restore_handle)
+                    .await
+            }
+            FirewallRequest::ExecuteRestore {
+                binding_handle,
+                plan_handle,
+            } => {
+                self.firewall_execute_restore(&binding_handle, &plan_handle)
+                    .await
+            }
+        }
+    }
+
+    async fn firewall_plan(
+        &self,
+        binding_handle: &str,
+        address: &str,
+        direction: &str,
+    ) -> Result<serde_json::Value, SystemInfoApiError> {
+        let direction = firewall_direction(direction)?;
+        let address = address
+            .parse::<std::net::IpAddr>()
+            .map_err(|_| SystemInfoApiError::InvalidAction)?;
+        let request = FirewallBlockRequest::new(address, direction)
+            .map_err(SystemInfoApiError::ActionUnavailable)?;
+        let session = self.binding_session(binding_handle)?;
+        let plan = timeout(PLAN_DEADLINE, async {
+            self.services
+                .system_info()
+                .plan_firewall_block(&session, &request)
+                .await
+        })
+        .await
+        .map_err(|_| SystemInfoApiError::Deadline)?
+        .map_err(action_failure)?;
+        self.ensure_binding_unchanged(binding_handle, &session)?;
+        let now = Instant::now();
+        let dto = FirewallPlanDto {
+            plan_handle: Uuid::new_v4().to_string(),
+            backend: plan.backend().name().to_owned(),
+            address: request.address().to_string(),
+            direction: direction_key(request.direction()).to_owned(),
+            commands: plan.commands().to_vec(),
+            warnings: plan.warnings().to_vec(),
+            expires_in_ms: FIREWALL_PLAN_TTL.as_millis() as u64,
+        };
+        self.lock_firewall()?.plans.insert(
+            dto.plan_handle.clone(),
+            StoredFirewallPlan {
+                binding_handle: binding_handle.to_owned(),
+                request,
+                plan,
+                expires_at: now + FIREWALL_PLAN_TTL,
+            },
+        );
+        serde_json::to_value(&dto).map_err(|_| SystemInfoApiError::RegistryUnavailable)
+    }
+
+    async fn firewall_execute(
+        &self,
+        binding_handle: &str,
+        plan_handle: &str,
+    ) -> Result<serde_json::Value, SystemInfoApiError> {
+        let stored = {
+            let now = Instant::now();
+            let mut registry = self.lock_firewall()?;
+            registry.prune(now);
+            let stored = registry
+                .plans
+                .remove(plan_handle)
+                .ok_or(SystemInfoApiError::PlanStale)?;
+            if stored.binding_handle != binding_handle || stored.expires_at <= now {
+                return Err(SystemInfoApiError::PlanStale);
+            }
+            stored
+        };
+        let session = self.binding_session(binding_handle)?;
+        let confirmation = DangerousConfirmation::approve(stored.plan.definition());
+        let journal = self.services.operation_journal();
+        let request = stored.request.clone();
+        let outcome = timeout(EXECUTE_DEADLINE, async {
+            self.services
+                .system_info()
+                .execute_firewall_block(&session, stored.plan, confirmation, journal)
+                .await
+        })
+        .await
+        .map_err(|_| SystemInfoApiError::Deadline)?
+        .map_err(action_failure)?;
+        self.ensure_binding_unchanged(binding_handle, &session)?;
+        let dto = FirewallResultDto {
+            verified: outcome.verification.passed,
+            detail: bounded_text(&outcome.verification.detail, MAX_PLAN_TEXT_BYTES),
+            restore_handle: outcome.restore_handle().map(|_| Uuid::new_v4().to_string()),
+        };
+        if let (Some(handle), Some(token)) = (&dto.restore_handle, outcome.restore_handle()) {
+            self.lock_firewall()?.restores.insert(
+                handle.clone(),
+                StoredFirewallRestore {
+                    binding_handle: binding_handle.to_owned(),
+                    request,
+                    token: token.to_owned(),
+                    expires_at: Instant::now() + FIREWALL_RESTORE_TTL,
+                },
+            );
+        }
+        serde_json::to_value(&dto).map_err(|_| SystemInfoApiError::RegistryUnavailable)
+    }
+    async fn firewall_plan_restore(
+        &self,
+        binding_handle: &str,
+        restore_handle: &str,
+    ) -> Result<serde_json::Value, SystemInfoApiError> {
+        let session = self.binding_session(binding_handle)?;
+        let now = Instant::now();
+        let (request, token) = {
+            let mut registry = self.lock_firewall()?;
+            registry.prune(now);
+            let stored = registry
+                .restores
+                .get(restore_handle)
+                .ok_or(SystemInfoApiError::PlanStale)?;
+            if stored.binding_handle != binding_handle || stored.expires_at <= now {
+                return Err(SystemInfoApiError::PlanStale);
+            }
+            (stored.request.clone(), stored.token.clone())
+        };
+        // The outcome shape the core planner expects is re-materialized from
+        // the stored token; the UUID itself is never handed to the core.
+        let outcome = FirewallBlockOutcome::from_token(token);
+        let plan = timeout(PLAN_DEADLINE, async {
+            self.services
+                .system_info()
+                .plan_firewall_block_restore(&session, &request, &outcome)
+                .await
+        })
+        .await
+        .map_err(|_| SystemInfoApiError::Deadline)?
+        .map_err(action_failure)?;
+        self.ensure_binding_unchanged(binding_handle, &session)?;
+        let dto = FirewallRestorePlanDto {
+            plan_handle: Uuid::new_v4().to_string(),
+            backend: plan.backend().name().to_owned(),
+            address: request.address().to_string(),
+            direction: direction_key(request.direction()).to_owned(),
+            expires_in_ms: FIREWALL_PLAN_TTL.as_millis() as u64,
+        };
+        self.lock_firewall()?.restore_plans.insert(
+            dto.plan_handle.clone(),
+            StoredFirewallRestorePlan {
+                binding_handle: binding_handle.to_owned(),
+                request,
+                plan,
+                expires_at: now + FIREWALL_PLAN_TTL,
+            },
+        );
+        serde_json::to_value(&dto).map_err(|_| SystemInfoApiError::RegistryUnavailable)
+    }
+
+    async fn firewall_execute_restore(
+        &self,
+        binding_handle: &str,
+        plan_handle: &str,
+    ) -> Result<serde_json::Value, SystemInfoApiError> {
+        let stored = {
+            let now = Instant::now();
+            let mut registry = self.lock_firewall()?;
+            registry.prune(now);
+            let stored = registry
+                .restore_plans
+                .remove(plan_handle)
+                .ok_or(SystemInfoApiError::PlanStale)?;
+            if stored.binding_handle != binding_handle || stored.expires_at <= now {
+                return Err(SystemInfoApiError::PlanStale);
+            }
+            stored
+        };
+        let session = self.binding_session(binding_handle)?;
+        let confirmation = DangerousConfirmation::approve(stored.plan.definition());
+        let journal = self.services.operation_journal();
+        let outcome = timeout(EXECUTE_DEADLINE, async {
+            self.services
+                .system_info()
+                .execute_firewall_block_restore(
+                    &session,
+                    stored.plan,
+                    &stored.request,
+                    confirmation,
+                    journal,
+                )
+                .await
+        })
+        .await
+        .map_err(|_| SystemInfoApiError::Deadline)?
+        .map_err(action_failure)?;
+        self.ensure_binding_unchanged(binding_handle, &session)?;
+        // The plan is taken before the run, so a second execute for the same
+        // tag fails here first and in the core precondition either way.
+        serde_json::to_value(&FirewallResultDto {
+            verified: outcome.verification.passed,
+            detail: bounded_text(&outcome.verification.detail, MAX_PLAN_TEXT_BYTES),
+            restore_handle: None,
+        })
+        .map_err(|_| SystemInfoApiError::RegistryUnavailable)
+    }
+
+    fn lock_firewall(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, FirewallRegistry>, SystemInfoApiError> {
+        self.firewall
+            .lock()
+            .map_err(|_| SystemInfoApiError::RegistryUnavailable)
+    }
 }
 
 #[cfg(test)]
@@ -1470,5 +1880,166 @@ mod tests {
             }),
             SystemInfoApiError::ActionUnavailable(_)
         ));
+    }
+
+    #[test]
+    fn firewall_requests_reject_extra_fields_and_bad_values() {
+        // Extra field anywhere is refused before any action runs.
+        assert!(serde_json::from_str::<FirewallRequest>(
+            r#"{"action":"plan","bindingHandle":"b","address":"1.2.3.4","direction":"both","extra":1}"#
+        )
+        .is_err());
+        // Unknown action tag.
+        assert!(
+            serde_json::from_str::<FirewallRequest>(
+                r#"{"action":"flush-all","bindingHandle":"b"}"#
+            )
+            .is_err()
+        );
+        // Missing required field per action.
+        assert!(
+            serde_json::from_str::<FirewallRequest>(r#"{"action":"execute","bindingHandle":"b"}"#)
+                .is_err()
+        );
+        for bad in ["", "in", "INBOUND", "everything"] {
+            assert!(
+                matches!(
+                    firewall_direction(bad),
+                    Err(SystemInfoApiError::InvalidAction)
+                ),
+                "{bad}"
+            );
+        }
+        for bad in [
+            "",
+            "not-an-ip",
+            "10.0.0.0/8",
+            "127.0.0.1",
+            "0.0.0.0",
+            "ff02::1",
+            "1.2.3.4/32",
+            "x".repeat(46).as_str(),
+        ] {
+            let parsed: Result<std::net::IpAddr, _> = bad.parse();
+            let rejected = parsed
+                .map_err(|_| ())
+                .and_then(|ip| {
+                    FirewallBlockRequest::new(ip, FirewallDirection::Both).map_err(|_| ())
+                })
+                .is_err();
+            assert!(rejected, "{bad}");
+        }
+        assert!(matches!(
+            firewall_direction("inbound"),
+            Ok(FirewallDirection::Inbound)
+        ));
+        assert!(
+            FirewallBlockRequest::new("198.51.100.9".parse().unwrap(), FirewallDirection::Outbound)
+                .is_ok()
+        );
+        assert_eq!(direction_key(FirewallDirection::Outbound), "outbound");
+    }
+
+    #[test]
+    fn firewall_registry_drops_state_on_close_binding() {
+        let now = Instant::now();
+        let mut registry = FirewallRegistry::default();
+        let request =
+            FirewallBlockRequest::new("198.51.100.9".parse().unwrap(), FirewallDirection::Both)
+                .unwrap();
+        registry.restores.insert(
+            "h1".to_owned(),
+            StoredFirewallRestore {
+                binding_handle: "b1".to_owned(),
+                request: request.clone(),
+                token: "iptables|lovelyhawk-block-a1b2c3d4|0".to_owned(),
+                expires_at: now + FIREWALL_RESTORE_TTL,
+            },
+        );
+        registry.restores.insert(
+            "h2".to_owned(),
+            StoredFirewallRestore {
+                binding_handle: "b2".to_owned(),
+                request,
+                token: "iptables|lovelyhawk-block-a1b2c3d5|0".to_owned(),
+                expires_at: now + FIREWALL_RESTORE_TTL,
+            },
+        );
+        // A second binding's handle is foreign to the first binding.
+        assert!(
+            registry
+                .restores
+                .get("h2")
+                .is_some_and(|r| r.binding_handle != "b1")
+        );
+        registry.close_binding("b1");
+        assert!(!registry.restores.contains_key("h1"));
+        assert!(registry.restores.contains_key("h2"));
+        // Expired restores are pruned, so a stale handle can never restore.
+        let mut registry = FirewallRegistry::default();
+        registry.restores.insert(
+            "old".to_owned(),
+            StoredFirewallRestore {
+                binding_handle: "b".to_owned(),
+                request: FirewallBlockRequest::new(
+                    "198.51.100.9".parse().unwrap(),
+                    FirewallDirection::Both,
+                )
+                .unwrap(),
+                token: "t".to_owned(),
+                expires_at: now - Duration::from_secs(1),
+            },
+        );
+        registry.prune(now);
+        assert!(registry.restores.is_empty());
+    }
+
+    #[test]
+    fn firewall_response_shapes_are_camel_case() {
+        let plan = serde_json::to_value(FirewallPlanDto {
+            plan_handle: "p".to_owned(),
+            backend: "iptables".to_owned(),
+            address: "198.51.100.9".to_owned(),
+            direction: "both".to_owned(),
+            commands: vec!["iptables -I INPUT 1".to_owned()],
+            warnings: vec!["w".to_owned()],
+            expires_in_ms: 120_000,
+        })
+        .unwrap();
+        assert!(
+            serde_json::to_string(&plan)
+                .unwrap()
+                .contains("\"planHandle\":")
+        );
+        for key in ["planHandle", "expiresInMs", "commands", "warnings"] {
+            assert!(plan.get(key).is_some(), "{key}");
+        }
+        assert!(plan.get("plan_handle").is_none());
+        let result = serde_json::to_value(FirewallResultDto {
+            verified: true,
+            detail: "d".to_owned(),
+            restore_handle: Some("r".to_owned()),
+        })
+        .unwrap();
+        for key in ["verified", "detail", "restoreHandle"] {
+            assert!(result.get(key).is_some(), "{key}");
+        }
+        let restore = serde_json::to_value(FirewallRestorePlanDto {
+            plan_handle: "p".to_owned(),
+            backend: "nft".to_owned(),
+            address: "fd00::9".to_owned(),
+            direction: "inbound".to_owned(),
+            expires_in_ms: 120_000,
+        })
+        .unwrap();
+        for key in [
+            "planHandle",
+            "backend",
+            "address",
+            "direction",
+            "expiresInMs",
+        ] {
+            assert!(restore.get(key).is_some(), "{key}");
+        }
     }
 }

@@ -62,7 +62,7 @@ const threatSummary = {
   topSourceIps: [{ ip: hostile, count: 2, lastSeen: hostile, actionType: hostile }],
   topTargetUsers: [{ username: hostile, count: 2, successCount: 1, failCount: 1 }],
   hourlyDistribution: Array.from({ length: 24 }, (_, index) => index),
-  threatLevel: "high" as const,
+  threatLevel: "high" as const, breachedSources: [] as const,
 };
 
 const readResult: LogSourceReadResult = {

@@ -30,6 +30,10 @@ import type {
 } from "./ssh-contract.js";
 import type {
   SystemInfoDetail,
+  SystemInfoFirewallDirection,
+  SystemInfoFirewallPlan,
+  SystemInfoFirewallRestorePlan,
+  SystemInfoFirewallResult,
   SystemInfoRowActions,
   SystemInfoRowInspection,
   SystemInfoRowPlan,
@@ -545,6 +549,7 @@ export interface LovelyHawkApi {
     snapshotHandle: string,
     rowId: string,
     action: string,
+    password?: string,
   ): Promise<SystemInfoRowPlan>;
   confirmSystemInfoRowAction(bindingHandle: string, planHandle: string): Promise<SystemInfoRowPlan>;
   executeSystemInfoRowAction(
@@ -552,6 +557,14 @@ export interface LovelyHawkApi {
     planHandle: string,
   ): Promise<SystemInfoRowReceipt>;
   cancelSystemInfoRowAction(bindingHandle: string, planHandle: string): Promise<void>;
+  planSystemInfoFirewallBlock(
+    bindingHandle: string,
+    address: string,
+    direction: SystemInfoFirewallDirection,
+  ): Promise<SystemInfoFirewallPlan>;
+  executeSystemInfoFirewallBlock(bindingHandle: string, planHandle: string): Promise<SystemInfoFirewallResult>;
+  planSystemInfoFirewallRestore(bindingHandle: string, restoreHandle: string): Promise<SystemInfoFirewallRestorePlan>;
+  executeSystemInfoFirewallRestore(bindingHandle: string, planHandle: string): Promise<SystemInfoFirewallResult>;
   getBaselineCatalog(): Promise<BaselineCatalog>;
   scanBaseline(bindingHandle: string): Promise<BaselineScan>;
   listBaselineHistory(bindingHandle: string): Promise<BaselineHistory>;

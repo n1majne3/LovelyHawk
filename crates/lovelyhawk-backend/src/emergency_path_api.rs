@@ -18,9 +18,13 @@ use std::{
 };
 
 use lovelyhawk_core::{
-    BackendServices,
+    BackendServices, CoreError, CoreResult,
+    capability_strip::{
+        CAPABILITY_EMPTY_REFUSAL, CAPABILITY_KIND_REFUSAL, CAPABILITY_PRIVILEGE_REFUSAL,
+        CAPABILITY_TOOLS_REFUSAL, CapabilityStripOperation,
+    },
     command_paths::paths_in_output,
-    operations::{DangerousConfirmation, OperationState},
+    operations::{DangerousConfirmation, OperationPlan, OperationState, VerificationResult},
     sftp::{BoundSftpSession, RemotePath, SftpFileKind, SftpMutation, SftpPlannedOperation},
     target::TargetGuard,
 };
@@ -73,6 +77,9 @@ pub(crate) enum EmergencyPathAction {
     Disarm,
     /// Move the file into the recoverable backup namespace.
     Quarantine,
+    /// Remove the file's Linux capability set (the `security.capability`
+    /// xattr) via `setcap -r`; the saved set can be written back once.
+    RemoveCapabilities,
 }
 
 impl EmergencyPathAction {
@@ -80,6 +87,7 @@ impl EmergencyPathAction {
         match self {
             Self::Disarm => "disarm",
             Self::Quarantine => "quarantine",
+            Self::RemoveCapabilities => "remove-capabilities",
         }
     }
 }
@@ -183,8 +191,68 @@ struct PlannedPath {
     path: String,
     action: EmergencyPathAction,
     scope: PathScope,
-    operation: SftpPlannedOperation,
+    operation: PathOperation,
     expires_at: Instant,
+}
+
+/// The one lifecycle a stored plan goes through, whichever transport carries
+/// the change: SFTP mutations and SSH-carried xattr edits share the
+/// plan/confirm/execute/verify/restore/undo surface.
+#[derive(Debug)]
+enum PathOperation {
+    Sftp(SftpPlannedOperation),
+    CapabilityStrip(CapabilityStripOperation),
+}
+
+impl PathOperation {
+    fn definition(&self) -> &OperationPlan {
+        match self {
+            Self::Sftp(operation) => operation.definition(),
+            Self::CapabilityStrip(operation) => operation.definition(),
+        }
+    }
+
+    fn state(&self) -> OperationState {
+        match self {
+            Self::Sftp(operation) => operation.state(),
+            Self::CapabilityStrip(operation) => operation.state(),
+        }
+    }
+
+    fn confirm(&mut self, confirmation: DangerousConfirmation) -> CoreResult<()> {
+        match self {
+            Self::Sftp(operation) => operation.confirm(confirmation),
+            Self::CapabilityStrip(operation) => operation.confirm(confirmation),
+        }
+    }
+
+    async fn execute_and_verify(&mut self) -> CoreResult<VerificationResult> {
+        match self {
+            Self::Sftp(operation) => operation.execute_and_verify().await,
+            Self::CapabilityStrip(operation) => operation.execute_and_verify().await,
+        }
+    }
+
+    async fn restore(&mut self) -> CoreResult<()> {
+        match self {
+            Self::Sftp(operation) => operation.restore().await,
+            Self::CapabilityStrip(operation) => operation.restore().await,
+        }
+    }
+
+    fn can_undo(&self) -> bool {
+        match self {
+            Self::Sftp(operation) => operation.can_undo(),
+            Self::CapabilityStrip(operation) => operation.can_undo(),
+        }
+    }
+
+    async fn undo(&mut self) -> CoreResult<String> {
+        match self {
+            Self::Sftp(operation) => operation.undo().await,
+            Self::CapabilityStrip(operation) => operation.undo().await,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -364,6 +432,34 @@ pub(crate) enum EmergencyPathApiError {
     Capacity,
     Deadline,
     RegistryUnavailable,
+    /// A read the core ran while planning said the file cannot be changed as
+    /// asked. The code tells the page which reason to show.
+    Refused(PathRefusal),
+}
+
+/// Which plan-time refusal the core reported, as a stable key.
+#[derive(Clone, Copy)]
+pub(crate) enum PathRefusal {
+    Tools,
+    Privilege,
+    Kind,
+    Empty,
+}
+
+/// Plan-time refusals the page can translate; anything else stays behind the
+/// generic boundary message.
+fn capability_plan_failure(error: &CoreError) -> EmergencyPathApiError {
+    let refusal = match error {
+        CoreError::Validation { subject, .. } => match *subject {
+            CAPABILITY_TOOLS_REFUSAL => PathRefusal::Tools,
+            CAPABILITY_PRIVILEGE_REFUSAL => PathRefusal::Privilege,
+            CAPABILITY_KIND_REFUSAL => PathRefusal::Kind,
+            CAPABILITY_EMPTY_REFUSAL => PathRefusal::Empty,
+            _ => return EmergencyPathApiError::Core,
+        },
+        _ => return EmergencyPathApiError::Core,
+    };
+    EmergencyPathApiError::Refused(refusal)
 }
 
 impl fmt::Debug for EmergencyPathApiError {
@@ -377,6 +473,7 @@ impl fmt::Debug for EmergencyPathApiError {
             Self::Capacity => "Capacity",
             Self::Deadline => "Deadline",
             Self::RegistryUnavailable => "RegistryUnavailable",
+            Self::Refused(_) => "Refused",
         })
     }
 }
@@ -536,14 +633,7 @@ impl EmergencyPathApi {
             registry.prune(now);
             registry.path(&scope, path_handle, now)?
         };
-        let session = self.bind_sftp(&scope).await?;
-        let mutation = self.build_mutation(&session, &path, action).await?;
-        self.validate_binding(&scope)?;
-        let operation = self
-            .services
-            .sftp()
-            .plan(&session, mutation)
-            .map_err(|_| EmergencyPathApiError::Core)?;
+        let operation = self.build_operation(&scope, &path, action).await?;
         self.validate_binding(&scope)?;
 
         let now = Instant::now();
@@ -703,40 +793,79 @@ impl EmergencyPathApi {
         Ok(())
     }
 
-    /// Turns a capability and an action into the one mutation the core takes.
-    async fn build_mutation(
+    /// Turns a capability and an action into the one planned operation the
+    /// core takes. SFTP mutations go through the file service; capability
+    /// removal plans over the bound SSH channel instead, because extended
+    /// attributes are outside the SFTP protocol.
+    async fn build_operation(
         &self,
-        session: &BoundSftpSession,
+        scope: &PathScope,
         path: &RemotePath,
         action: EmergencyPathAction,
-    ) -> Result<SftpMutation, EmergencyPathApiError> {
+    ) -> Result<PathOperation, EmergencyPathApiError> {
         match action {
-            EmergencyPathAction::Disarm => {
-                let metadata = timeout(
+            EmergencyPathAction::RemoveCapabilities => {
+                let session = self
+                    .ssh_api
+                    .binding_session_clone(&scope.binding_handle)
+                    .map_err(|_| EmergencyPathApiError::BindingUnavailable)?;
+                if session.session_id() != scope.session_id
+                    || session.connection_id() != scope.connection_id
+                {
+                    return Err(EmergencyPathApiError::BindingUnavailable);
+                }
+                let operation = timeout(
                     INSPECT_DEADLINE,
-                    self.services.sftp().metadata(session, path, false),
+                    self.services.system_info().plan_capability_strip(
+                        &session,
+                        path,
+                        self.services.operation_journal().clone(),
+                    ),
                 )
                 .await
                 .map_err(|_| EmergencyPathApiError::Deadline)?
-                .map_err(|_| EmergencyPathApiError::Core)?;
-                let expected_mode = metadata
-                    .permissions
-                    .map(|mode| mode & PERMISSION_BITS)
-                    .ok_or(EmergencyPathApiError::Core)?;
-                // Nothing to disarm, and a chmod to the mode it already has
-                // would verify as a change that never happened.
-                if expected_mode & EXECUTE_BITS == 0 {
-                    return Err(EmergencyPathApiError::Core);
-                }
-                // The expected mode makes the change fail rather than apply to
-                // a file that was altered between reading it and acting on it.
-                Ok(SftpMutation::ChmodIfMode {
-                    path: path.clone(),
-                    expected_mode,
-                    mode: expected_mode & !EXECUTE_BITS,
-                })
+                .map_err(|error| capability_plan_failure(&error))?;
+                Ok(PathOperation::CapabilityStrip(operation))
             }
-            EmergencyPathAction::Quarantine => Ok(SftpMutation::Remove { path: path.clone() }),
+            _ => {
+                let session = self.bind_sftp(scope).await?;
+                let mutation = match action {
+                    EmergencyPathAction::Disarm => {
+                        let metadata = timeout(
+                            INSPECT_DEADLINE,
+                            self.services.sftp().metadata(&session, path, false),
+                        )
+                        .await
+                        .map_err(|_| EmergencyPathApiError::Deadline)?
+                        .map_err(|_| EmergencyPathApiError::Core)?;
+                        let expected_mode = metadata
+                            .permissions
+                            .map(|mode| mode & PERMISSION_BITS)
+                            .ok_or(EmergencyPathApiError::Core)?;
+                        // Nothing to disarm, and a chmod to the mode it already
+                        // has would verify as a change that never happened.
+                        if expected_mode & EXECUTE_BITS == 0 {
+                            return Err(EmergencyPathApiError::Core);
+                        }
+                        // The expected mode makes the change fail rather than
+                        // apply to a file altered between reading and acting.
+                        SftpMutation::ChmodIfMode {
+                            path: path.clone(),
+                            expected_mode,
+                            mode: expected_mode & !EXECUTE_BITS,
+                        }
+                    }
+                    EmergencyPathAction::Quarantine => SftpMutation::Remove { path: path.clone() },
+                    EmergencyPathAction::RemoveCapabilities => unreachable!(),
+                };
+                self.validate_binding(scope)?;
+                let operation = self
+                    .services
+                    .sftp()
+                    .plan(&session, mutation)
+                    .map_err(|_| EmergencyPathApiError::Core)?;
+                Ok(PathOperation::Sftp(operation))
+            }
         }
     }
 
@@ -1200,5 +1329,57 @@ mod tests {
         assert_eq!(0o1777 & !EXECUTE_BITS, 0o1666);
         // Read and write are untouched, so the file can still be examined.
         assert_eq!(0o0700 & !EXECUTE_BITS, 0o0600);
+    }
+
+    #[test]
+    fn the_capability_action_round_trips_kebab_case_and_label() {
+        let action: EmergencyPathAction = serde_json::from_str("\"remove-capabilities\"").unwrap();
+        assert!(matches!(action, EmergencyPathAction::RemoveCapabilities));
+        assert_eq!(action.label(), "remove-capabilities");
+        // Existing actions keep their wire names.
+        assert!(matches!(
+            serde_json::from_str::<EmergencyPathAction>("\"disarm\"").unwrap(),
+            EmergencyPathAction::Disarm
+        ));
+        assert!(serde_json::from_str::<EmergencyPathAction>("\"removeCapabilities\"").is_err());
+    }
+
+    #[test]
+    fn plan_refusals_map_to_their_own_codes_and_nothing_else() {
+        for (subject, expected) in [
+            (CAPABILITY_TOOLS_REFUSAL, PathRefusal::Tools),
+            (CAPABILITY_PRIVILEGE_REFUSAL, PathRefusal::Privilege),
+            (CAPABILITY_KIND_REFUSAL, PathRefusal::Kind),
+            (CAPABILITY_EMPTY_REFUSAL, PathRefusal::Empty),
+        ] {
+            let error = CoreError::Validation {
+                subject,
+                message: "m".to_owned(),
+            };
+            match capability_plan_failure(&error) {
+                EmergencyPathApiError::Refused(found) => {
+                    assert!(std::mem::discriminant(&found) == std::mem::discriminant(&expected));
+                }
+                _ => panic!("{subject} should be a named refusal"),
+            }
+        }
+        // An unrelated validation failure and a non-validation error keep the
+        // generic boundary message.
+        let other = CoreError::Validation {
+            subject: "something else",
+            message: "m".to_owned(),
+        };
+        assert!(matches!(
+            capability_plan_failure(&other),
+            EmergencyPathApiError::Core
+        ));
+        let io = CoreError::InvalidOperationState {
+            state: "planned",
+            action: "confirm",
+        };
+        assert!(matches!(
+            capability_plan_failure(&io),
+            EmergencyPathApiError::Core
+        ));
     }
 }

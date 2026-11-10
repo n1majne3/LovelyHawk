@@ -5,7 +5,7 @@ export const emergencyCommandResultKinds = [
   "success", "empty", "non-zero", "timeout", "missing-command", "permission-denied", "unknown-exit",
 ] as const;
 
-export const emergencyPathActions = ["disarm", "quarantine"] as const;
+export const emergencyPathActions = ["disarm", "quarantine", "remove-capabilities"] as const;
 
 export type EmergencyCommandCategory = typeof emergencyCommandCategories[number];
 export type EmergencyCommandResultKind = typeof emergencyCommandResultKinds[number];

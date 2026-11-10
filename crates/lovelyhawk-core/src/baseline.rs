@@ -447,6 +447,11 @@ impl BaselineDefinition {
             self.component,
             BaselineComponent::Nginx | BaselineComponent::Redis | BaselineComponent::PostgreSql
         ) && !matches!(self.value_kind, BaselineValueKind::Presence)
+            // Host-state observations describe the running configuration;
+            // only the managed permission/audit files have a write path.
+            && !(matches!(self.reading, Reading::HostState)
+                && (matches!(self.component, BaselineComponent::Ssh)
+                    || matches!(self.category, BaselineCategory::Authentication)))
     }
 
     const fn reads_candidate_risks(&self) -> bool {
@@ -646,6 +651,118 @@ pub const BASELINE_CATALOG: &[BaselineDefinition] = &[
         key: "PermitRootLogin",
         format: FileFormat::Whitespace,
         reload: ReloadGroup::Sshd,
+    },
+    BaselineDefinition {
+        id: "ssh-weak-algorithms",
+        category: BaselineCategory::Ssh,
+        title: "SSH 弱加密与完整性算法",
+        description: "读取 sshd 生效的 ciphers、macs、kexalgorithms，发现已弃用的 CBC、MD5/SHA-1、group1/group14 等弱算法。none 表示未启用已知弱算法，否则列出启用的弱算法名（超过长度时以 +N 表示其余数量）。判定按 CIS 口径：OpenSSH 的默认 MAC 列表本身含 umac-64 与 hmac-sha1，未显式配置的主机通常会显示不合规。需要 root 运行 sshd -T，无法读取时明确说明，不推断合规。修改前先用 ssh -Q cipher|mac|kex 核对支持并以 sshd -t 检查，建议保留 chacha20-poly1305、aes-gcm、aes-ctr、hmac-sha2-*-etm、curve25519-sha256 等。",
+        recommendation: "none",
+        risk: BaselineRisk::High,
+        value_kind: BaselineValueKind::Choice(&["none"]),
+        component: BaselineComponent::Ssh,
+        reading: Reading::HostState,
+        implicit: None,
+        file: "/etc/ssh/sshd_config",
+        key: "sshd_algorithms",
+        format: FileFormat::Whitespace,
+        reload: ReloadGroup::None,
+    },
+    BaselineDefinition {
+        id: "ssh-sftp-subsystem",
+        category: BaselineCategory::Ssh,
+        title: "启用 SFTP 子系统",
+        description: "确认 sshd 生效配置包含 sftp 子系统（enabled）；absent 表示没有，本工作台的文件管理与留证在此主机不可用。可在 sshd_config 增加 Subsystem sftp internal-sftp（或发行版的 sftp-server 路径），sshd -t 检查后重载。",
+        recommendation: "enabled",
+        risk: BaselineRisk::Low,
+        value_kind: BaselineValueKind::Choice(&["enabled"]),
+        component: BaselineComponent::Ssh,
+        reading: Reading::HostState,
+        implicit: None,
+        file: "/etc/ssh/sshd_config",
+        key: "sshd_sftp",
+        format: FileFormat::Whitespace,
+        reload: ReloadGroup::None,
+    },
+    BaselineDefinition {
+        id: "ssh-login-restriction",
+        category: BaselineCategory::Ssh,
+        title: "限制可登录的用户或组",
+        description: "确认 sshd 生效配置使用 AllowUsers 或 AllowGroups 限定登录范围（restricted）；unrestricted 表示所有账号都可尝试登录。",
+        recommendation: "restricted",
+        risk: BaselineRisk::Low,
+        value_kind: BaselineValueKind::Choice(&["restricted"]),
+        component: BaselineComponent::Ssh,
+        reading: Reading::HostState,
+        implicit: None,
+        file: "/etc/ssh/sshd_config",
+        key: "sshd_login_acl",
+        format: FileFormat::Whitespace,
+        reload: ReloadGroup::None,
+    },
+    BaselineDefinition {
+        id: "session-idle-timeout",
+        category: BaselineCategory::Authentication,
+        title: "设置会话空闲超时",
+        description: "按全局 profile、profile.d 下的脚本、全局 bashrc 的读取顺序取 TMOUT 生效值；within-900 表示在 1–900 秒内，unset 表示未设置，否则显示秒数。只统计非注释行。",
+        recommendation: "within-900",
+        risk: BaselineRisk::Low,
+        value_kind: BaselineValueKind::Choice(&["within-900"]),
+        component: BaselineComponent::System,
+        reading: Reading::HostState,
+        implicit: None,
+        file: "/etc/profile",
+        key: "session_tmout",
+        format: FileFormat::Whitespace,
+        reload: ReloadGroup::None,
+    },
+    BaselineDefinition {
+        id: "password-history",
+        category: BaselineCategory::Authentication,
+        title: "启用口令历史记录",
+        description: "检查 PAM password 栈中 pam_pwhistory/pam_unix 的 remember=N，以及引用了 pam_pwhistory 时 pwhistory.conf 的 remember = N；ge-5 表示至少记住 5 次旧口令，unset 表示未启用，否则显示次数。",
+        recommendation: "ge-5",
+        risk: BaselineRisk::Low,
+        value_kind: BaselineValueKind::Choice(&["ge-5"]),
+        component: BaselineComponent::System,
+        reading: Reading::HostState,
+        implicit: None,
+        file: "/etc/pam.d/common-password",
+        key: "password_history",
+        format: FileFormat::Whitespace,
+        reload: ReloadGroup::None,
+    },
+    BaselineDefinition {
+        id: "su-wheel-restriction",
+        category: BaselineCategory::Authentication,
+        title: "限制 su 只允许 wheel 组",
+        description: "检查 su 的 PAM 配置中非注释的 auth required pam_wheel.so；required 表示已限制，unset 表示未限制；文件缺失时明确无法判断。",
+        recommendation: "required",
+        risk: BaselineRisk::Medium,
+        value_kind: BaselineValueKind::Choice(&["required"]),
+        component: BaselineComponent::System,
+        reading: Reading::HostState,
+        implicit: None,
+        file: "/etc/pam.d/su",
+        key: "pam_wheel",
+        format: FileFormat::Whitespace,
+        reload: ReloadGroup::None,
+    },
+    BaselineDefinition {
+        id: "dormant-login-accounts",
+        category: BaselineCategory::Authentication,
+        title: "排查长期不登录的可登录账号",
+        description: "列出 shell 不是 nologin/false/sync/shutdown/halt 且 lastlog 显示从未登录或超过 90 天未登录的账号；none 表示没有，否则列出账号名，超过 64 字节以 +N 表示其余数量。lastlog 不存在时明确无法判断。",
+        recommendation: "none",
+        risk: BaselineRisk::Low,
+        value_kind: BaselineValueKind::Choice(&["none"]),
+        component: BaselineComponent::System,
+        reading: Reading::HostState,
+        implicit: None,
+        file: "/etc/passwd",
+        key: "dormant_accounts",
+        format: FileFormat::Whitespace,
+        reload: ReloadGroup::None,
     },
     BaselineDefinition {
         id: "ssh-password-authentication",
@@ -3957,11 +4074,19 @@ impl ProgramTable {
 fn scan_command() -> String {
     let mut table = ProgramTable::default();
     let mut items = String::new();
+    let mut hosts = String::new();
     for definition in BASELINE_CATALOG {
-        items.push_str(&item_command(definition, &mut table));
+        // Host-state rows are placeholders the host observation replaces;
+        // one loop emits them all, which keeps the scan inside one argument.
+        if matches!(definition.reading, Reading::HostState) {
+            hosts.push_str(&shq(definition.id));
+            hosts.push(' ');
+        } else {
+            items.push_str(&item_command(definition, &mut table));
+        }
     }
     format!(
-        "set -u; printf '%s\\n' {SCAN_MARKER}; {}{}{items}",
+        "set -u; printf '%s\\n' {SCAN_MARKER}; {}{}{items}for lh_i in {hosts}; do lr_h \"$lh_i\"; done",
         table.prelude(),
         scan_functions(),
     )
@@ -3984,7 +4109,8 @@ fn scan_functions() -> String {
         // or, for sshd, `%sshd` and the main file whose Include lines decide
         // the rest. Bound readers in bytes, even when GNU awk inherits a
         // UTF-8 locale.
-        "lr_file() {{ lr_id=$1; lr_key=$2; lr_want=$3; lr_where=$4; lr_fallback=$4; \
+        "lr_h() {{ printf 'ITEM=%s\\t__unverified__\\t%s\\n' \"$1\" \"$2\"; }}; \
+         lr_file() {{ lr_id=$1; lr_key=$2; lr_want=$3; lr_where=$4; lr_fallback=$4; \
            lr_reader=$5; lr_witness=$6; lr_installed=$7; shift 7; \
            lr_files=; lr_odd=0; lr_unread=0; lr_mode=; \
            if [ \"${{1-}}\" = %sshd ]; then lr_mode=sshd; \
@@ -6090,7 +6216,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(BASELINE_CATALOG.len(), 113);
+        assert_eq!(BASELINE_CATALOG.len(), 120);
         // One plan carries every check this tool will write; the rest are read.
         assert!(
             BASELINE_CATALOG
@@ -7196,6 +7322,10 @@ mod tests {
         // sshd keeps the first value it is given; everything else is read by a
         // parser that overwrites as it goes.
         for definition in BASELINE_CATALOG {
+            // Host-state checks do not read the file line by line.
+            if matches!(definition.reading, Reading::HostState) {
+                continue;
+            }
             let expected = if definition.file() == "/etc/ssh/sshd_config" {
                 Precedence::First
             } else {
