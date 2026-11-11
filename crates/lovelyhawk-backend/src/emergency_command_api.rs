@@ -50,7 +50,9 @@ const MAX_OUTPUT_LINES: usize = 2_000;
 const MAX_OUTPUT_LINE_BYTES: usize = 4 * 1024;
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_CATALOG_RESPONSE_BYTES: usize = 256 * 1024;
-const MAX_RUN_RESPONSE_BYTES: usize = 384 * 1024;
+const MAX_RUN_RESPONSE_BYTES: usize = 1536 * 1024;
+const MAX_COMMAND_VIEW_BYTES: usize = 128 * 1024;
+const MAX_RAW_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_RECEIPT_DURATION_MS: u64 = 60_000;
 const CATALOG_TTL: Duration = Duration::from_secs(5 * 60);
 /// The outer bound on a probe, above the core's own so the core's answer — and
@@ -784,6 +786,14 @@ pub(crate) struct EmergencyCommandResultDto {
     pub(crate) finding_lines: Vec<u32>,
     pub(crate) finding_reason: Option<String>,
     pub(crate) truncated: bool,
+    /// The literal command string handed to the target, escapes applied so
+    /// control characters draw as text instead of acting on the window.
+    pub(crate) command: String,
+    pub(crate) command_truncated: bool,
+    /// What the target returned, before projection cuts it to the pane.
+    /// Control characters are escaped, not hidden.
+    pub(crate) raw_output: String,
+    pub(crate) raw_output_truncated: bool,
     /// One entry per displayed line that named a file, so the window can offer
     /// an action on the line the operator points at.
     pub(crate) paths: Vec<EmergencyPathDto>,
@@ -1294,6 +1304,10 @@ fn project_receipt(
 ) -> Result<(EmergencyCommandResultDto, Vec<u32>), EmergencyCommandApiError> {
     let projected = project_output(&receipt.output, &receipt.finding_lines)?;
     let clipped_lines = projected.clipped_lines;
+    let (command_view, command_truncated) =
+        escape_visible_text(&receipt.executed_command, MAX_COMMAND_VIEW_BYTES);
+    let (raw_output, raw_output_truncated) =
+        escape_visible_text(&receipt.output, MAX_RAW_OUTPUT_BYTES);
     Ok((
         EmergencyCommandResultDto {
             snapshot_handle: access.snapshot_handle.clone(),
@@ -1306,6 +1320,10 @@ fn project_receipt(
             finding_lines: projected.finding_lines,
             finding_reason: receipt.finding_reason,
             truncated: receipt.truncated || projected.truncated,
+            command: command_view,
+            command_truncated,
+            raw_output,
+            raw_output_truncated,
             paths: Vec::new(),
         },
         clipped_lines,
@@ -1382,6 +1400,33 @@ fn project_output(
         clipped_lines,
         truncated,
     })
+}
+
+/// Text drawn for the operator where control characters must stay visible.
+///
+/// `\n` and `\t` pass through (they are how output and commands separate);
+/// `\r` becomes the two characters `\r` so carriage-return tricks cannot hide
+/// text; every other control character becomes `\xNN` (`\u{NNNN}` beyond the
+/// byte range). The byte ceiling applies to the finished string, cut on a
+/// character boundary.
+fn escape_visible_text(value: &str, maximum_bytes: usize) -> (String, bool) {
+    let mut output = String::with_capacity(value.len().min(maximum_bytes));
+    let mut truncated = false;
+    for character in value.chars() {
+        let replacement = if character == '\n' || character == '\t' || !character.is_control() {
+            character.to_string()
+        } else if character == '\r' {
+            "\\r".to_owned()
+        } else {
+            format!("\\x{:02x}", u32::from(character))
+        };
+        if output.len().saturating_add(replacement.len()) > maximum_bytes {
+            truncated = true;
+            break;
+        }
+        output.push_str(&replacement);
+    }
+    (output, truncated)
 }
 
 fn normalize_plain_line(value: &str, maximum_bytes: usize) -> (String, bool) {
@@ -1527,6 +1572,7 @@ mod tests {
         CommandExecutionReceipt {
             command_id: command.raw_id.clone(),
             title: command.title.clone(),
+            executed_command: "sh -c fixture".to_owned(),
             finding_lines: Vec::new(),
             finding_reason: None,
             output,
@@ -2085,6 +2131,69 @@ mod tests {
             assert!(!encoded.contains(forbidden), "encoded {forbidden}");
         }
         assert!(encoded.len() <= MAX_RUN_RESPONSE_BYTES);
+    }
+
+    #[test]
+    fn raw_output_and_command_views_escape_and_bound() {
+        // Control characters stay visible instead of acting on the window or
+        // hiding text: carriage returns cannot rewrite a drawn line, ANSI
+        // draws as text, and newlines/tabs keep working.
+        let (escaped, truncated) =
+            escape_visible_text("one\rtwo\u{1b}[31mred\u{1b}[0m\ttab\nline", 4096);
+        assert!(!truncated);
+        assert_eq!(escaped, "one\\rtwo\\x1b[31mred\\x1b[0m\ttab\nline");
+        let (escaped, truncated) = escape_visible_text("a\u{0085}b", 4096);
+        assert!(!truncated);
+        assert_eq!(escaped, "a\\x85b");
+        // The ceiling applies to the finished, escaped string.
+        let (escaped, truncated) = escape_visible_text(&"x".repeat(9000), 8192);
+        assert!(truncated);
+        assert_eq!(escaped.len(), 8192);
+        let (escaped, truncated) = escape_visible_text("ab\u{1b}cd", 5);
+        assert!(truncated);
+        assert!(escaped.len() <= 5 && !escaped.contains('\u{1b}'));
+        // No cut mid-escape or mid-character.
+        let (escaped, _) = escape_visible_text("ab\u{1b}cd", 4);
+        assert_eq!(escaped, "ab");
+
+        let command = StoredCommand {
+            command_handle: "opaque-command".to_owned(),
+            raw_id: "network-listen".to_owned(),
+            category: EmergencyCommandCategory::Network,
+            title: "view".to_owned(),
+            description: "只读".to_owned(),
+            timeout_seconds: 30,
+        };
+        let access = RunAccess {
+            snapshot_handle: "opaque-snapshot".to_owned(),
+            snapshot_token: Uuid::new_v4(),
+            command_handle: command.command_handle.clone(),
+            run_token: Uuid::new_v4(),
+            scope: scope("binding-one", "target-one", 0),
+        };
+        let mut fixture = receipt(&command, "plain\u{0007}out\rcarriage".to_owned());
+        fixture.executed_command = "docker exec -i id sh -c 'ls\r'".to_owned();
+        let (dto, _) = project_receipt(&access, &command, fixture).unwrap();
+        assert_eq!(dto.command, "docker exec -i id sh -c 'ls\\r'");
+        assert!(!dto.command_truncated);
+        assert_eq!(dto.raw_output, "plain\\x07out\\rcarriage");
+        assert!(!dto.raw_output_truncated);
+        let encoded = serde_json::to_string(&dto).unwrap();
+        for key in [
+            "\"command\":",
+            "\"commandTruncated\":",
+            "\"rawOutput\":",
+            "\"rawOutputTruncated\":",
+        ] {
+            assert!(encoded.contains(key), "missing {key}");
+        }
+        // Oversize input is cut on the escaped side, never past the ceiling.
+        let mut fixture = receipt(&command, "x".repeat(MAX_RAW_OUTPUT_BYTES + 32));
+        fixture.executed_command = "c".repeat(MAX_COMMAND_VIEW_BYTES + 8);
+        let (dto, _) = project_receipt(&access, &command, fixture).unwrap();
+        assert!(dto.raw_output_truncated && dto.raw_output.len() <= MAX_RAW_OUTPUT_BYTES);
+        assert!(dto.command_truncated && dto.command.len() <= MAX_COMMAND_VIEW_BYTES);
+        ensure_serialized_bound(&dto, MAX_RUN_RESPONSE_BYTES).unwrap();
     }
 
     #[test]

@@ -1,4 +1,5 @@
 import type { AiAssistRequest, AiAssistResponse } from "./ai-assist-contract.js";
+import type { LocalScanChildRequest, LocalScanResult } from "./local-scan-contract.js";
 
 export const TERMINAL_LIMITS = Object.freeze({
   maximumTerminals: 16,
@@ -93,6 +94,12 @@ export interface TerminalApi {
   /** The operator's own machine, addressed by opaque directory handles. */
   openLocalBrowser(): Promise<unknown>;
   listLocalDirectory(directoryHandle: string): Promise<unknown>;
+  /**
+   * 取回本机扫描 for a file or directory this window's file manager offered.
+   * The binding is the host's record for this window — the request never
+   * carries one — and only the child request set is accepted.
+   */
+  localScan(request: LocalScanChildRequest): Promise<LocalScanResult | null>;
   /**
    * Open one file in a window of its own.
    *

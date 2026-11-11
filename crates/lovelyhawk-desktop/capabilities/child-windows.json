@@ -38,6 +38,8 @@
     "allow-sftp-stage-upload",
     "allow-local-open",
     "allow-local-list",
+    "allow-local-scan-child",
+    "allow-local-scan-child-configure",
     "allow-file-editor-open",
     "allow-directory-terminal-open",
     "allow-file-editor-target",

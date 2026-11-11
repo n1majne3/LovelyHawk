@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState, useSyncExternalStore, type FormEvent } from "react";
 
-import type { EmergencyCommandPathOffer } from "../shared/emergency-command-contract";
-import type { LocalScanApi, LocalScanFetchDto } from "../shared/local-scan-contract";
-import { LocalScanController, type LocalScanRun, type LocalScanState } from "./local-scan-controller";
+import type { LocalScanFetchDto } from "../shared/local-scan-contract";
+import {
+  LocalScanController, type LocalScanRun, type LocalScanState, type LocalScanTransport,
+} from "./local-scan-controller";
 import { useModalScrim } from "./modal-scrim";
 // The frame is the same one the file-action dialogs use; this dialog brings
 // that sheet itself so the page it opens from does not have to.
@@ -37,10 +38,18 @@ function transportLabel(transport: string): string {
  * local isolation folder, then hand that folder to a scanning program the
  * operator configured on this machine.
  */
-export function LocalScanDialog({ api, binding, offer, returnFocus, onClose }: {
-  api: LocalScanApi; binding: string; offer: EmergencyCommandPathOffer; returnFocus: HTMLElement | null; onClose(): void;
+/** What the dialog scans: a path plus where it came from, for the header and scope labels. */
+export interface LocalScanSubject {
+  path: string;
+  originLabel?: string;
+  entryKind: "file" | "directory";
+}
+
+export function LocalScanDialog({ transport, subject, returnFocus, onClose }: {
+  transport: LocalScanTransport; subject: LocalScanSubject;
+  returnFocus: HTMLElement | null; onClose(): void;
 }) {
-  const [controller] = useState(() => new LocalScanController(api, binding, offer));
+  const [controller] = useState(() => new LocalScanController(transport));
   const view = useSyncExternalStore(controller.subscribe, controller.getSnapshot, controller.getSnapshot);
   const root = useRef<HTMLElement>(null), close = useRef<HTMLButtonElement>(null);
   const closeRef = useRef(onClose); closeRef.current = onClose;
@@ -72,16 +81,20 @@ export function LocalScanDialog({ api, binding, offer, returnFocus, onClose }: {
   return <div className="emergency-path-backdrop">
     <section ref={root} className="emergency-path-dialog local-scan-dialog" role="dialog" aria-modal="true"
       aria-labelledby="local-scan-title" data-testid="local-scan-dialog">
-      <header><h2 id="local-scan-title">取回本机扫描</h2><p>{offer.path}</p></header>
-      <LocalScanBody controller={controller} view={view} onClose={onClose} />
+      <header>
+        <h2 id="local-scan-title">取回本机扫描</h2>
+        <p>{subject.path}</p>
+        {subject.originLabel ? <p className="emergency-path-note" data-testid="local-scan-origin">{subject.originLabel}</p> : null}
+      </header>
+      <LocalScanBody controller={controller} view={view} subject={subject} onClose={onClose} />
       <footer><button ref={close} type="button" onClick={onClose}>关闭</button></footer>
     </section>
   </div>;
 }
 
 /** The dialog's working area; kept apart so each phase can be rendered on its own. */
-export function LocalScanBody({ controller, view, onClose }: {
-  controller: LocalScanController; view: LocalScanState; onClose(): void;
+export function LocalScanBody({ controller, view, subject, onClose }: {
+  controller: LocalScanController; view: LocalScanState; subject: LocalScanSubject; onClose(): void;
 }) {
   const [scope, setScope] = useState<"file" | "directory">("file");
   const [configuring, setConfiguring] = useState(false);
@@ -124,12 +137,12 @@ export function LocalScanBody({ controller, view, onClose }: {
           <label>
             <input type="radio" name="local-scan-scope" checked={scope === "file"} disabled={busy}
               onChange={() => setScope("file")} />
-            该路径本身
+            {subject.entryKind === "directory" ? "该目录" : "该文件"}
           </label>
           <label>
             <input type="radio" name="local-scan-scope" checked={scope === "directory"} disabled={busy}
               onChange={() => setScope("directory")} />
-            所在目录（取回整层，有大小上限）
+            {subject.entryKind === "directory" ? "上一级目录" : "所在目录"}（取回整层，有大小上限）
           </label>
         </fieldset>
         <div className="local-scan-actions">
@@ -241,7 +254,8 @@ function LocalScanFetchSummary({ fetch }: { fetch: LocalScanFetchDto }) {
   return <div className="emergency-path-panel local-scan-summary" data-testid="local-scan-summary">
     <dl>
       <div><dt>来源类型</dt><dd>{sourceKindLabel(fetch.sourceKind)}</dd></div>
-      <div><dt>取回范围</dt><dd>{fetch.scope === "file" ? "该路径本身" : "所在目录"}</dd></div>
+      <div><dt>取回范围</dt><dd>{fetch.scope === "file" ? "该路径本身" : "整层目录"}</dd></div>
+      {fetch.originLabel !== "" ? <div><dt>来源</dt><dd data-testid="local-scan-summary-origin">{fetch.originLabel}</dd></div> : null}
       <div><dt>取回内容</dt><dd>{fetch.files} 个文件、{fetch.directories} 个目录，共 {byteLabel(fetch.bytes)}</dd></div>
       {fetch.skipped > 0 ? <div><dt>跳过</dt><dd>{fetch.skipped} 项</dd></div> : null}
       <div><dt>取回方式</dt><dd>{transportLabel(fetch.transport)}</dd></div>

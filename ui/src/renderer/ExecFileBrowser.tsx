@@ -27,6 +27,10 @@ export interface ExecFileBrowserProps {
   list: (path: string) => Promise<unknown>;
   /** What a regular file offers. Directories are entered; nothing else is opened. */
   fileActions: readonly ExecFileAction[];
+  /** What an openable directory offers besides entering it. */
+  directoryActions?: readonly ExecFileAction[];
+  /** One action on the listed directory itself, drawn in the path bar. */
+  currentDirectoryAction?: { label: string; testId: string; run: (path: string) => void } | undefined;
   initialPath?: string;
   /** While the surrounding dialog is busy, nothing here starts another call. */
   disabled?: boolean;
@@ -57,7 +61,9 @@ type Sort = "name" | "modified";
  * with control characters made visible, because a name built to look like
  * another is exactly what a responder needs to see.
  */
-export function ExecFileBrowser({ list, fileActions, initialPath = "/", disabled = false }: ExecFileBrowserProps) {
+export function ExecFileBrowser({
+  list, fileActions, directoryActions = [], currentDirectoryAction, initialPath = "/", disabled = false,
+}: ExecFileBrowserProps) {
   const [listing, setListing] = useState<ExecDirectoryListing | null>(null);
   const [status, setStatus] = useState<"loading" | "ready" | "error">("loading");
   const [error, setError] = useState<string | null>(null);
@@ -132,6 +138,12 @@ export function ExecFileBrowser({ list, fileActions, initialPath = "/", disabled
         </label>
         <button type="submit" disabled={busy}>前往</button>
         <button type="button" disabled={busy || current === null} onClick={() => current !== null && void go(current)}>刷新</button>
+        {currentDirectoryAction !== undefined ? (
+          <button type="button" disabled={busy || current === null} data-testid={currentDirectoryAction.testId}
+            onClick={() => { if (current !== null) currentDirectoryAction.run(current); }}>
+            {currentDirectoryAction.label}
+          </button>
+        ) : null}
       </form>
 
       <div className="exec-browser-places" aria-label="常看的位置">
@@ -207,6 +219,12 @@ export function ExecFileBrowser({ list, fileActions, initialPath = "/", disabled
                         title={flags ?? undefined}>{entry.mode ?? "—"}</span>
                     </td>
                     <td className="exec-browser-actions">
+                      {entry.kind === "directory" && entry.openable ? directoryActions.map((action) => (
+                        <button key={action.testId} type="button" disabled={busy || action.disabled === true}
+                          data-testid={action.testId}
+                          aria-label={action.describe(visibleName(entry.name))}
+                          onClick={() => action.run(path, entry)}>{action.label}</button>
+                      )) : null}
                       {entry.kind === "file" && entry.openable ? fileActions.map((action) => (
                         <button key={action.testId} type="button" disabled={busy || action.disabled === true}
                           data-testid={action.testId}

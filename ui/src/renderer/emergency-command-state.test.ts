@@ -30,6 +30,10 @@ const result: EmergencyCommandResult = {
   findingLines: [],
   findingReason: null,
   truncated: false,
+  command: "ss -tlnp",
+  commandTruncated: false,
+  rawOutput: "plain",
+  rawOutputTruncated: false,
   paths: [],
 };
 

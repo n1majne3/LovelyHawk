@@ -23,7 +23,10 @@ use std::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{CoreError, CoreResult, PortableStore, sftp::RemotePath, shell_escape::shq};
+use crate::{
+    CoreError, CoreResult, PortableStore, docker::ContainerIdentity, sftp::RemotePath,
+    shell_escape::shq,
+};
 
 /// Largest archive the remote may hand back before the download is refused.
 pub const MAX_FETCH_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
@@ -200,6 +203,41 @@ pub fn fetch_bundle_command(root: &FetchRoot, kind: FetchKind) -> String {
     )
 }
 
+/// Packs a path inside a container through its runtime, on the host.
+///
+/// `<runtime> cp -- <id>:<path> -` streams a tar to stdout, so it works for
+/// distroless and stopped containers and needs nothing installed inside them.
+/// The stream is cut at `MAX_FETCH_ARCHIVE_BYTES + 1` as it arrives; a bundle
+/// past the ceiling is removed and reported through the same `LH_BYTES=`
+/// marker `parse_fetch_bundle` already refuses, and a failed `cp` removes the
+/// file and prints `LH_FAILED=1`. The size is measured before the `cp` status
+/// is consulted: `head` closing the pipe kills `cp` with SIGPIPE, and that
+/// death is the size refusal, not a failure. `cp`'s status is captured
+/// without PIPESTATUS so any POSIX sh can run it.
+pub fn container_fetch_bundle_command(container: &ContainerIdentity, root: &FetchRoot) -> String {
+    format!(
+        "set -eu; \
+         LH_TMP=$(mktemp /tmp/lh-fetch-XXXXXX.tar); \
+         LH_RC=$(mktemp /tmp/lh-fetch-rc-XXXXXX); rm -f \"$LH_RC\"; \
+         {{ {runtime} cp -- {spec} - 2>/dev/null || echo $? > \"$LH_RC\"; }} | head -c {max_plus} > \"$LH_TMP\"; \
+         LH_B=$(wc -c < \"$LH_TMP\" | tr -d '[:space:]'); \
+         if [ \"$LH_B\" -gt {max} ]; then \
+             rm -f \"$LH_TMP\" \"$LH_RC\"; \
+             echo LH_ARCHIVE=\"$LH_TMP\"; \
+             echo LH_BYTES=$LH_B; \
+             exit 0; \
+         fi; \
+         if [ -s \"$LH_RC\" ]; then rm -f \"$LH_TMP\" \"$LH_RC\"; echo LH_FAILED=1; exit 1; fi; \
+         rm -f \"$LH_RC\"; \
+         echo LH_ARCHIVE=\"$LH_TMP\"; \
+         echo LH_BYTES=$LH_B",
+        runtime = container.runtime().command(),
+        spec = shq(&format!("{}:{}", container.id(), root.remote.as_str())),
+        max = MAX_FETCH_ARCHIVE_BYTES,
+        max_plus = MAX_FETCH_ARCHIVE_BYTES + 1,
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchBundleResult {
     pub archive: RemotePath,
@@ -307,6 +345,13 @@ pub fn is_fetch_staging(store: &PortableStore, dir: &Path) -> bool {
 pub struct LocalScanManifest {
     pub version: u32,
     pub source_path: String,
+    /// `host` for the target's own filesystem, `container` for a path copied
+    /// out of one of its containers.
+    #[serde(default = "manifest_origin_host")]
+    pub origin: String,
+    /// Who the content came from when it was not the host; empty for `host`.
+    #[serde(default)]
+    pub origin_label: String,
     pub source_kind: String,
     pub scope: String,
     pub target_label: String,
@@ -324,6 +369,10 @@ pub struct LocalScanManifest {
     pub entries: Vec<String>,
     #[serde(default)]
     pub limitations: Vec<String>,
+}
+
+fn manifest_origin_host() -> String {
+    "host".to_owned()
 }
 
 pub fn write_manifest(staging: &FetchStaging, manifest: &LocalScanManifest) -> CoreResult<()> {
@@ -402,10 +451,18 @@ pub fn extract_fetch_archive(archive: &Path, content: &Path) -> CoreResult<Fetch
                     skip(&mut report, "解压总量超出上限");
                     continue;
                 }
-                if let Some(parent) = dest.parent() {
-                    fs::create_dir_all(parent).map_err(|source| {
-                        CoreError::io("create fetched directory", parent, source)
-                    })?;
+                if let Some(parent) = dest.parent()
+                    && fs::create_dir_all(parent).is_err()
+                {
+                    // One member failing to land locally (path too long for
+                    // this machine, security software holding the file) loses
+                    // that member — the rest of the copy still extracts.
+                    reader.skip(header.size)?;
+                    skip(
+                        &mut report,
+                        "本机无法写入该成员（路径过长或被安全软件拦截）",
+                    );
+                    continue;
                 }
                 let mut file = match OpenOptions::new().create_new(true).write(true).open(&dest) {
                     Ok(file) => file,
@@ -415,10 +472,28 @@ pub fn extract_fetch_archive(archive: &Path, content: &Path) -> CoreResult<Fetch
                         continue;
                     }
                 };
-                let copied = std::io::copy(&mut reader.by_ref().take(header.size), &mut file)
-                    .map_err(|source| CoreError::io("write fetched file", &dest, source))?;
-                file.sync_all()
-                    .map_err(|source| CoreError::io("sync fetched file", &dest, source))?;
+                let copied = match std::io::copy(&mut reader.by_ref().take(header.size), &mut file)
+                {
+                    Ok(copied) => copied,
+                    Err(_) => {
+                        reader.finish()?;
+                        let _ = fs::remove_file(&dest);
+                        skip(
+                            &mut report,
+                            "本机无法写入该成员（路径过长或被安全软件拦截）",
+                        );
+                        continue;
+                    }
+                };
+                if file.sync_all().is_err() {
+                    reader.finish()?;
+                    let _ = fs::remove_file(&dest);
+                    skip(
+                        &mut report,
+                        "本机无法写入该成员（路径过长或被安全软件拦截）",
+                    );
+                    continue;
+                }
                 if copied != header.size {
                     let _ = fs::remove_file(&dest);
                     return Err(CoreError::validation(
@@ -437,10 +512,14 @@ pub fn extract_fetch_archive(archive: &Path, content: &Path) -> CoreResult<Fetch
                 if let Ok(name) = member_name(&header, pending_name.take())
                     && let Some(dest) = safe_member_path(content, &name)
                 {
-                    fs::create_dir_all(&dest).map_err(|source| {
-                        CoreError::io("create fetched directory", &dest, source)
-                    })?;
-                    report.directories += 1;
+                    if fs::create_dir_all(&dest).is_err() {
+                        skip(
+                            &mut report,
+                            "本机无法写入该成员（路径过长或被安全软件拦截）",
+                        );
+                    } else {
+                        report.directories += 1;
+                    }
                 }
                 reader.skip(header.size)?;
             }
@@ -450,10 +529,17 @@ pub fn extract_fetch_archive(archive: &Path, content: &Path) -> CoreResult<Fetch
             TarKind::Pax => {
                 pending_name = reader.take_pax_path(header.size)?.or(pending_name.take());
             }
-            TarKind::LongLink | TarKind::Skip => {
-                // Links, devices and anything else never land; the pending
-                // name stays because a `K`/`x` header still belongs to the
-                // next real member.
+            TarKind::LongLink => {
+                // A GNU long linkname describes the next member's link
+                // target; the pending name still belongs to that member.
+                reader.skip(header.size)?;
+            }
+            TarKind::Skip => {
+                // Links, devices and anything else never land. The pending
+                // name — an `L` or `x` record — described THIS member, so it
+                // is consumed with it; letting it leak would rename whatever
+                // follows and can turn a directory into a skipped file's name.
+                pending_name = None;
                 reader.skip(header.size)?;
                 if matches!(header.typeflag, b'1' | b'2' | b'3' | b'4' | b'6' | b'7') {
                     skip(&mut report, "仅保留普通文件与目录");
@@ -575,6 +661,14 @@ impl TarReader {
 
     fn skip(&mut self, size: u64) -> CoreResult<()> {
         self.drain(size)?;
+        self.remaining = 0;
+        Ok(())
+    }
+
+    /// Discards what is left of a partially read member so the next header
+    /// lines up; a short read inside it still aborts the whole extraction.
+    fn finish(&mut self) -> CoreResult<()> {
+        self.drain(self.remaining)?;
         self.remaining = 0;
         Ok(())
     }
@@ -972,6 +1066,109 @@ mod tests {
         let report = extract_fetch_archive(&archive, &content).unwrap();
         assert_eq!(report.files, 1);
         assert!(content.join(&long).is_file());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn container_bundle_command_streams_through_the_runtime_with_bounds() {
+        use crate::docker::{ContainerIdentity, ContainerRuntime};
+        let docker =
+            ContainerIdentity::new(ContainerRuntime::Docker, "a1b2c3d4e5f6a7b8".to_owned())
+                .unwrap();
+        let root = fetch_root(
+            &RemotePath::new("/var/www/html".to_owned()).unwrap(),
+            LocalScanScope::Path,
+        )
+        .unwrap();
+        let command = container_fetch_bundle_command(&docker, &root);
+        // The runtime does the packing on the host; nothing runs inside the
+        // container, so distroless and stopped ones both answer.
+        assert!(command.contains("docker cp -- 'a1b2c3d4e5f6a7b8:/var/www/html' -"));
+        assert!(command.contains(&format!("head -c {}", MAX_FETCH_ARCHIVE_BYTES + 1)));
+        // A failed cp removes the archive and marks the output; an oversized
+        // one is removed and reported through the same LH_BYTES= refuse path.
+        assert!(command.contains("echo LH_FAILED=1"));
+        assert!(command.contains("rm -f \"$LH_TMP\""));
+        assert!(command.contains(&format!("[ \"$LH_B\" -gt {} ]", MAX_FETCH_ARCHIVE_BYTES)));
+        // SIGPIPE from `head` is the size report, not a failure: the size is
+        // measured and the oversize branch exits before the cp status is read.
+        let size_check = command.find("[ \"$LH_B\" -gt").unwrap();
+        let rc_check = command.find("[ -s \"$LH_RC\" ]").unwrap();
+        assert!(size_check < rc_check);
+        assert!(command.find("LH_BYTES=$LH_B").unwrap() < rc_check);
+        let podman =
+            ContainerIdentity::new(ContainerRuntime::Podman, "a1b2c3d4e5f6a7b8".to_owned())
+                .unwrap();
+        assert!(container_fetch_bundle_command(&podman, &root).contains("podman cp --"));
+        // The container spec and the path are one quoted argument — a space or
+        // quote inside a path cannot smuggle another cp operand or flag.
+        let spaced = fetch_root(
+            &RemotePath::new("/var/www/has space/x".to_owned()).unwrap(),
+            LocalScanScope::Path,
+        )
+        .unwrap();
+        assert!(
+            container_fetch_bundle_command(&docker, &spaced)
+                .contains("'a1b2c3d4e5f6a7b8:/var/www/has space/x'")
+        );
+        // No PIPESTATUS: the pipeline's exit is head's; cp's status comes
+        // through a file so any POSIX sh reports a failure.
+        assert!(!command.contains("PIPESTATUS"));
+        assert!(command.contains("echo $? > \"$LH_RC\""));
+    }
+
+    /// `<len> path=<value>\n` pax record bytes, length prefix included.
+    fn pax_path_record(path: &str) -> Vec<u8> {
+        let body = format!(" path={path}\n");
+        let mut len = body.len() + 1;
+        while len.to_string().len() + body.len() != len {
+            len += 1;
+        }
+        format!("{len}{body}").into_bytes()
+    }
+
+    #[test]
+    fn a_skipped_members_pending_name_cannot_rename_the_next_member() {
+        let (dir, content) = stage();
+        let archive = dir.join("a.tar");
+        // Real-world shape from /etc: a pax path record describes a hardlink
+        // member that is skipped; the name must die with it, not rename the
+        // directory that follows.
+        let long_name = format!("pki/{}", "Certificate_Authority_".repeat(4));
+        let mut bytes = tar_entry("././@PaxHeader", b'x', &pax_path_record(&long_name));
+        bytes.extend(tar_entry("hard", b'1', b""));
+        bytes.extend(tar_entry("dir/", b'5', b""));
+        bytes.extend(tar_entry("dir/inner.txt", b'0', b"body"));
+        fs::write(&archive, &bytes).unwrap();
+        let report = extract_fetch_archive(&archive, &content).unwrap();
+        assert_eq!(report.files, 1, "{:?}", report.skipped_reasons);
+        assert_eq!(report.directories, 1);
+        assert!(content.join("dir/inner.txt").is_file());
+        assert!(!content.join(&long_name).exists());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_member_the_local_side_cannot_write_is_skipped_not_fatal() {
+        let (dir, content) = stage();
+        // A file where a directory will be needed: create_dir_all under it
+        // can never succeed, and that must cost the member, not the copy.
+        fs::write(content.join("blocked"), b"already a file").unwrap();
+        let archive = dir.join("a.tar");
+        let mut bytes = tar_entry("blocked/inner.txt", b'0', b"never lands");
+        bytes.extend(tar_entry("blocked/", b'5', b""));
+        bytes.extend(tar_entry("ok.txt", b'0', b"lands"));
+        fs::write(&archive, &bytes).unwrap();
+        let report = extract_fetch_archive(&archive, &content).unwrap();
+        assert!(content.join("ok.txt").is_file());
+        assert_eq!(report.files, 1);
+        assert!(report.skipped >= 2, "{:?}", report.skipped_reasons);
+        assert!(
+            report
+                .skipped_reasons
+                .iter()
+                .any(|reason| reason.contains("无法写入"))
+        );
         fs::remove_dir_all(&dir).ok();
     }
 

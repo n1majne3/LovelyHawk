@@ -8,8 +8,11 @@ import type {
   LocalScanResult,
 } from "../shared/local-scan-contract";
 import { EmergencyPathMenu } from "./EmergencyPathMenu";
-import { LocalScanController, type LocalScanState } from "./local-scan-controller";
-import { LocalScanBody, LocalScanDialog } from "./LocalScanDialog";
+import {
+  browserScanTransport, containerScanTransport,
+  LocalScanController, pathOfferScanTransport, type LocalScanState,
+} from "./local-scan-controller";
+import { LocalScanBody, LocalScanDialog, type LocalScanSubject } from "./LocalScanDialog";
 
 const offer: EmergencyCommandPathOffer = { pathHandle: "path-one", path: "/tmp/.cache/.helper", line: 0 };
 const engine = { id: "engine-one", name: "D盾网页查杀", kind: "gui" as const, programName: "D_Safe_Manage.exe" };
@@ -20,6 +23,7 @@ const fetched: LocalScanFetchDto = {
   truncated: false, archiveSha256: "a".repeat(64), archiveBytes: 4096, transport: "scp",
   stagingDirectory: "C:/scan/fetch-one/content", entries: ["a.sh", "b.conf", "c/"],
   fetchedAt: "2026-08-25T23:31:00+00:00", expiresInSeconds: 1800,
+  origin: "host", originLabel: "",
 };
 const enginesResult: LocalScanResult = { kind: "engines", engines: [engine, cli] };
 const fetchResult: LocalScanResult = { kind: "fetch", fetch: fetched };
@@ -50,7 +54,7 @@ function fixture() {
       default: return enginesResult;
     }
   });
-  const controller = new LocalScanController({ localScan }, "binding-one", offer);
+  const controller = new LocalScanController(pathOfferScanTransport({ localScan }, "binding-one", offer));
   controllers.push(controller);
   return { controller, localScan, override };
 }
@@ -84,15 +88,17 @@ describe("local scan menu entry", () => {
 
 describe("local scan dialog", () => {
   const api = { localScan: async () => enginesResult };
+  const subject: LocalScanSubject = { path: offer.path, entryKind: "file" };
 
   it("opens on the scope choice with the isolation warning already visible", () => {
     const html = renderToStaticMarkup(
-      <LocalScanDialog api={api} binding="binding-one" offer={offer} returnFocus={null} onClose={() => undefined} />,
+      <LocalScanDialog transport={pathOfferScanTransport(api, "binding-one", offer)} subject={subject}
+        returnFocus={null} onClose={() => undefined} />,
     );
     expect(html).toContain('data-testid="local-scan-dialog"');
     expect(html).toContain("取回本机扫描");
     expect(html).toContain("/tmp/.cache/.helper");
-    expect(html).toContain("该路径本身");
+    expect(html).toContain("该文件");
     expect(html).toContain("所在目录（取回整层，有大小上限）");
     expect(html).toContain("开始取回");
     expect(html).toContain("正在读取已配置的本机引擎");
@@ -104,7 +110,7 @@ describe("local scan dialog", () => {
 
   it("reports the fetched copy plainly, scp fallback included", () => {
     const controller = fixture().controller;
-    const html = renderToStaticMarkup(<LocalScanBody controller={controller} onClose={() => undefined}
+    const html = renderToStaticMarkup(<LocalScanBody controller={controller} subject={{ path: offer.path, entryKind: "file" }} onClose={() => undefined}
       view={idleView({ engines: [engine, cli], selectedEngineId: cli.id, fetch: fetched })} />);
     expect(html).toContain('data-testid="local-scan-summary"');
     expect(html).toContain("目录");
@@ -127,7 +133,7 @@ describe("local scan dialog", () => {
 
   it("keeps 启动扫描 down until both a copy and an engine exist", () => {
     const controller = fixture().controller;
-    const waiting = renderToStaticMarkup(<LocalScanBody controller={controller} onClose={() => undefined}
+    const waiting = renderToStaticMarkup(<LocalScanBody controller={controller} subject={{ path: offer.path, entryKind: "file" }} onClose={() => undefined}
       view={idleView({ engines: [], fetch: fetched })} />);
     const run = waiting.match(/<button[^>]*data-testid="local-scan-run"[^>]*>/u)?.[0] ?? "";
     expect(run).toContain('disabled=""');
@@ -137,7 +143,7 @@ describe("local scan dialog", () => {
 
   it("shows a launched engine and a finished command line run differently", () => {
     const controller = fixture().controller;
-    const launched = renderToStaticMarkup(<LocalScanBody controller={controller} onClose={() => undefined}
+    const launched = renderToStaticMarkup(<LocalScanBody controller={controller} subject={{ path: offer.path, entryKind: "file" }} onClose={() => undefined}
       view={idleView({
         engines: [engine], selectedEngineId: engine.id, fetch: fetched,
         run: { kind: "run", state: "launched", engineName: "D盾网页查杀", exitCode: null, output: null, detail: "已启动 D盾网页查杀" },
@@ -146,7 +152,7 @@ describe("local scan dialog", () => {
     expect(launched).toContain("本页不跟踪它的进度");
     expect(launched).not.toContain("退出码");
 
-    const finished = renderToStaticMarkup(<LocalScanBody controller={controller} onClose={() => undefined}
+    const finished = renderToStaticMarkup(<LocalScanBody controller={controller} subject={{ path: offer.path, entryKind: "file" }} onClose={() => undefined}
       view={idleView({
         engines: [cli], selectedEngineId: cli.id, fetch: fetched,
         run: { kind: "run", state: "finished", engineName: "clamscan", exitCode: 1, output: "<img src=x> FOUND", detail: "clamscan 已退出" },
@@ -160,7 +166,7 @@ describe("local scan dialog", () => {
 
   it("renders the backend's error verbatim in its own area", () => {
     const controller = fixture().controller;
-    const html = renderToStaticMarkup(<LocalScanBody controller={controller} onClose={() => undefined}
+    const html = renderToStaticMarkup(<LocalScanBody controller={controller} subject={{ path: offer.path, entryKind: "file" }} onClose={() => undefined}
       view={idleView({ error: "目标机缺少 tar 或 find，无法打包取回内容。 (local-scan-tools)" })} />);
     expect(html).toContain('role="alert"');
     expect(html).toContain("目标机缺少 tar 或 find，无法打包取回内容。 (local-scan-tools)");
@@ -263,5 +269,69 @@ describe("local scan controller", () => {
     expect(f.controller.getSnapshot().discarded).toBe(true);
     await f.controller.fetch("file");
     expect(f.localScan.mock.calls.filter(([request]) => request.action === "fetch")).toHaveLength(1);
+  });
+});
+
+describe("local scan transports", () => {
+  it("container transport sends fetch-container with the handles it was given", async () => {
+    const localScan = vi.fn(async (request: { action: string }) =>
+      request.action === "fetch-container" ? fetchResult : { kind: "done", detail: "已处理" } as LocalScanResult);
+    const transport = containerScanTransport({ localScan }, "binding-one", "snap-1", "ctr-9", "/etc/nginx");
+    await transport.fetch("directory");
+    expect(localScan).toHaveBeenCalledWith({
+      action: "fetch-container", bindingHandle: "binding-one",
+      snapshotHandle: "snap-1", containerHandle: "ctr-9", path: "/etc/nginx", scope: "directory",
+    });
+    // The container path never carries a binding the page invented on run/discard either.
+    await transport.discard("fetch-one");
+    expect(localScan).toHaveBeenLastCalledWith({
+      action: "discard", bindingHandle: "binding-one", fetchId: "fetch-one",
+    });
+  });
+
+  it("browser transport sends fetch-browser without any binding the page supplied", async () => {
+    const localScan = vi.fn(async (request: { action: string }) => {
+      if (request.action === "fetch-browser") return fetchResult;
+      if (request.action === "run") {
+        return { kind: "run", state: "finished", engineName: "clamscan", exitCode: 0, output: null, detail: "已退出" } as LocalScanResult;
+      }
+      return { kind: "done", detail: "已处理" } as LocalScanResult;
+    });
+    const transport = browserScanTransport({ localScan }, "browser-1", "entry-7");
+    await transport.fetch("file");
+    expect(localScan).toHaveBeenCalledWith({
+      action: "fetch-browser", browserHandle: "browser-1", entryHandle: "entry-7", scope: "file",
+    });
+    await transport.run("fetch-one", "engine-one");
+    expect(localScan).toHaveBeenLastCalledWith({ action: "run", fetchId: "fetch-one", engineId: "engine-one" });
+    await transport.discard("fetch-one");
+    expect(localScan).toHaveBeenLastCalledWith({ action: "discard", fetchId: "fetch-one" });
+    const sent = localScan.mock.calls.map(([request]) => request as Record<string, unknown>);
+    for (const request of sent) expect(request).not.toHaveProperty("bindingHandle");
+  });
+
+  it("controller over the browser transport keeps the late-fetch discard guarantee", async () => {
+    const pending = deferred<LocalScanResult | null>();
+    const localScan = vi.fn(async (request: { action: string }) => {
+      if (request.action === "fetch-browser") return pending.promise;
+      if (request.action === "discard") return { kind: "done", detail: "已删除" } as LocalScanResult;
+      return enginesResult;
+    });
+    const controller = new LocalScanController(browserScanTransport({ localScan }, "browser-1", "entry-7"));
+    controllers.push(controller);
+    controller.attach();
+    await vi.waitFor(() => expect(controller.getSnapshot().busy).toBeNull());
+    const request = controller.fetch("file");
+    controller.dispose();
+    pending.resolve(fetchResult);
+    await request;
+    expect(controller.getSnapshot().fetch).toBeNull();
+    expect(localScan).toHaveBeenLastCalledWith({ action: "discard", fetchId: "fetch-one" });
+  });
+
+  it("a mismatched answer is refused instead of shown", async () => {
+    const localScan = vi.fn(async () => ({ kind: "done", detail: "x" } as LocalScanResult));
+    const transport = containerScanTransport({ localScan }, "b", "s", "c", "/etc");
+    await expect(transport.fetch("file")).rejects.toThrow("不一致");
   });
 });

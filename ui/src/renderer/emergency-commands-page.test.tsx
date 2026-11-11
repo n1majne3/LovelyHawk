@@ -14,6 +14,7 @@ import {
   EmergencyCommandGroupView,
   EmergencyCommandOutput,
   EmergencyCommandResultView,
+  EmergencyCommandVerbatim,
   EmergencyCommandsPage,
   EmergencyCommandStatus,
   EmergencyCommandWorkbench,
@@ -57,6 +58,10 @@ const result: EmergencyCommandResult = {
   findingLines: [0],
   findingReason: "标红的行不在发行版自带的 SUID 名单内。",
   truncated: true,
+  command: "getent passwd",
+  commandTruncated: false,
+  rawOutput: "hostile raw",
+  rawOutputTruncated: false,
   paths: [],
 };
 
@@ -494,7 +499,8 @@ describe("EmergencyCommandsPage", () => {
   it("exposes loading, error, empty and empty-output states", () => {
     const emptyResult = { ...result, resultKind: "empty" as const, exitCode: 0, output: "",
       observedLineCount: 0, displayedLineCount: 0, findingLines: [], findingReason: null,
-      truncated: false, paths: [] };
+      truncated: false, command: "", commandTruncated: false, rawOutput: "",
+      rawOutputTruncated: false, paths: [] };
     const html = [
       renderToStaticMarkup(<EmergencyCommandStatus label="执行中…" />),
       renderToStaticMarkup(<EmergencyCommandError message="固定公开错误" />),
@@ -579,6 +585,55 @@ describe("EmergencyCommandsPage", () => {
     }
     const page = readFileSync(new URL("./emergency-commands.css", import.meta.url), "utf8");
     expect(page).not.toContain(".emergency-path-");
+  });
+
+  it("offers the escaped raw output and the executed command as their own tabs", () => {
+    const verbatim = {
+      ...result,
+      command: "docker exec -i c1 sh -c 'id\\r'",
+      commandTruncated: false,
+      rawOutput: "<script>steal()</script>\\x1b[31mcolored",
+      rawOutputTruncated: false,
+    };
+    const html = renderToStaticMarkup(<EmergencyCommandResultView result={verbatim}
+      writeClipboard={async () => undefined} />);
+    for (const label of ["全部输出", "关注与缺口", "原始输出", "执行的命令"]) {
+      expect(html).toContain(`>${label}</button>`);
+    }
+    // The tab content itself: what the target sent stays text — markup
+    // escapes and ANSI draws as \x1b.
+    const command = renderToStaticMarkup(<EmergencyCommandVerbatim
+      text={verbatim.command} writeClipboard={async () => undefined}
+      note="这是在目标上实际执行的完整命令（含容器包装和工具检查前置）"
+      truncatedNote="命令超过 128 KiB，只显示前 128 KiB" />);
+    expect(command).toContain("这是在目标上实际执行的完整命令");
+    expect(command).toContain("docker exec -i c1 sh -c");
+    const raw = renderToStaticMarkup(<EmergencyCommandVerbatim
+      text={verbatim.rawOutput} writeClipboard={async () => undefined}
+      note="目标返回的标准输出" truncated={verbatim.rawOutputTruncated}
+      truncatedNote="原始输出超过 1 MiB，只显示前 1 MiB" />);
+    expect(raw).toContain("&lt;script&gt;steal()");
+    expect(raw).toContain("\\x1b[31mcolored");
+    expect(raw).not.toContain("<script>");
+    expect(raw).toContain("目标返回的标准输出");
+    expect(raw).toContain("复制");
+    // Without the clipboard bridge there is no button to press.
+    const without = renderToStaticMarkup(<EmergencyCommandVerbatim
+      text={verbatim.rawOutput} note="目标返回的标准输出"
+      truncatedNote="原始输出超过 1 MiB，只显示前 1 MiB" />);
+    expect(without).not.toContain("复制");
+    // Past the clipboard ceiling the button explains instead of copying.
+    const tooLong = renderToStaticMarkup(<EmergencyCommandVerbatim
+      text={"x".repeat(128 * 1_024 + 1)} note="n"
+      truncatedNote="t" writeClipboard={async () => undefined} />);
+    expect(tooLong).toContain("内容超过 128 KiB，无法复制");
+    // Truncation is announced, not implied.
+    const truncated = renderToStaticMarkup(<EmergencyCommandVerbatim
+      text="x" note="n" truncated truncatedNote="原始输出超过 1 MiB，只显示前 1 MiB" />);
+    expect(truncated).toContain("原始输出超过 1 MiB，只显示前 1 MiB");
+    // The button hands the exact field to the bridge, nothing else.
+    const source = readFileSync(new URL("./EmergencyCommandsPage.tsx", import.meta.url), "utf8");
+    expect(source).toContain("void writeClipboard(text)");
   });
 
   it("uses global theme tokens with no color literals", () => {

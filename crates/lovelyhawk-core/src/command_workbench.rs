@@ -2185,6 +2185,10 @@ pub enum CommandResultKind {
 pub struct CommandExecutionReceipt {
     pub command_id: String,
     pub title: String,
+    /// The exact command string handed to the target, including any
+    /// container/pod wrapper and guard preamble.
+    #[serde(default)]
+    pub executed_command: String,
     pub output: String,
     /// Zero-based indexes of output lines that look abnormal, ascending.
     #[serde(default)]
@@ -2395,6 +2399,7 @@ impl CommandWorkbenchService {
         Ok(CommandExecutionReceipt {
             command_id: definition.entry.id.to_owned(),
             title: definition.entry.title.to_owned(),
+            executed_command: command,
             finding_lines: command_findings::finding_lines(&bounded_output, definition.abnormal),
             finding_reason: definition
                 .abnormal

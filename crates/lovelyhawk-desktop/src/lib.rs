@@ -294,6 +294,8 @@ pub fn run() -> ExitCode {
             child_commands::sftp_stage_upload,
             child_commands::local_open,
             child_commands::local_list,
+            child_commands::local_scan_child,
+            child_commands::local_scan_child_configure,
             child_commands::file_editor_open,
             child_commands::system_info_file_open,
             child_commands::directory_terminal_open,

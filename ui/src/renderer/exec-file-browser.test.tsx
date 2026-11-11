@@ -56,6 +56,14 @@ describe("the browser before its first listing arrives", () => {
     expect(source).not.toContain("dangerouslySetInnerHTML");
   });
 
+  it("renders directory actions on openable directories and the current-directory action in the path bar", () => {
+    const source = readFileSync(new URL("./ExecFileBrowser.tsx", import.meta.url), "utf8");
+    expect(source).toContain("entry.kind === \"directory\" && entry.openable ? directoryActions.map");
+    expect(source).toContain("currentDirectoryAction.testId");
+    // Directory actions default to none: existing callers change nothing.
+    expect(source).toContain("directoryActions = []");
+  });
+
   it("uses only theme tokens for colour", () => {
     const css = readFileSync(new URL("./exec-file-browser.css", import.meta.url), "utf8");
     expect(css).not.toMatch(/#[0-9a-f]{3,8}\b|rgba?\(|hsla?\(/iu);
@@ -84,6 +92,34 @@ describe("the dialogs that hold it", () => {
     expect(html).toContain("编辑文件");
     expect(html).toContain("复制文件");
     expect(html).not.toContain("handle");
+  });
+
+  it("offers 取回扫描 on the current directory only when the api carries localScan", () => {
+    const withScan = renderToStaticMarkup(
+      <DockerFileDialog api={{ ...dockerApi, localScan: vi.fn(async () => null) }}
+        bindingHandle="b" snapshotHandle="s" containerHandle="c"
+        containerName="web" onClose={() => undefined} />,
+    );
+    expect(withScan).toContain('data-testid="docker-browser-scan-current"');
+    expect(withScan).toContain("取回此目录扫描");
+    const without = renderToStaticMarkup(
+      <DockerFileDialog api={dockerApi} bindingHandle="b" snapshotHandle="s" containerHandle="c"
+        containerName="web" onClose={() => undefined} />,
+    );
+    expect(without).not.toContain("取回此目录扫描");
+  });
+
+  it("keeps the docker dialog inert while the nested scan dialog is open and passes handles, not a program", () => {
+    const source = readFileSync(new URL("./DockerFileDialog.tsx", import.meta.url), "utf8");
+    // The nested dialog swallows Escape: the file dialog must not close under it.
+    expect(source).toContain('|| scan !== null) return;');
+    expect(source).toContain("discard.dialog !== null || scan !== null ? true : undefined");
+    // The container stays a handle triple; the fetched path is inside it.
+    expect(source).toContain("containerScanTransport(api as LocalScanApi, bindingHandle, snapshotHandle, containerHandle, scan.path)");
+    expect(source).toContain('originLabel: `容器：${containerName}`');
+    // File and directory rows both get the scan action; a directory row keeps entering too.
+    expect(source).toContain('testId: "docker-browser-scan"');
+    expect(source).toContain('testId: "docker-browser-scan-directory"');
   });
 
   it("opens a pod's files read-only, and says why it is read-only", () => {

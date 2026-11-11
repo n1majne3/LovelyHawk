@@ -43,6 +43,10 @@ const result: EmergencyCommandResult = {
   findingLines: [],
   findingReason: null,
   truncated: false,
+  command: "ss -tlnp",
+  commandTruncated: false,
+  rawOutput: "</pre><script>steal()</script>\nplain evidence",
+  rawOutputTruncated: false,
   paths: [],
 };
 
@@ -206,6 +210,23 @@ describe("emergency command contract", () => {
     expect(isEmergencyCommandResult({ ...result, findingReason: "x".repeat(513) })).toBe(false);
     expect(isEmergencyCommandResult({ ...result, findingReason: 0 })).toBe(false);
     expect(isEmergencyCommandResult({ ...result, findingReason: undefined })).toBe(false);
+  });
+
+  it("accepts only escaped, bounded command and raw-output views", () => {
+    expect(isEmergencyCommandResult({ ...result, command: "docker exec id sh -c 'ls'" })).toBe(true);
+    expect(isEmergencyCommandResult({ ...result, command: "ls\\x1b[0m\nline" })).toBe(true);
+    // A control character arriving unescaped is exactly what must not pass.
+    expect(isEmergencyCommandResult({ ...result, command: "ls" })).toBe(false);
+    expect(isEmergencyCommandResult({ ...result, rawOutput: "carriage\rreturn" })).toBe(false);
+    expect(isEmergencyCommandResult({ ...result, rawOutput: "newline\nok" })).toBe(true);
+    expect(isEmergencyCommandResult({ ...result, command: "x".repeat(128 * 1_024 + 1) })).toBe(false);
+    expect(isEmergencyCommandResult({ ...result, rawOutput: "x".repeat(1_024 * 1_024 + 1) })).toBe(false);
+    for (const key of ["command", "commandTruncated", "rawOutput", "rawOutputTruncated"] as const) {
+      const clone = { ...result } as Record<string, unknown>;
+      delete clone[key];
+      expect(isEmergencyCommandResult(clone)).toBe(false);
+      expect(isEmergencyCommandResult({ ...result, [key]: 0 })).toBe(false);
+    }
   });
 
   it("enforces line, aggregate, serialized and result-kind semantics", () => {

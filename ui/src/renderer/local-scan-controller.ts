@@ -2,9 +2,11 @@ import type { EmergencyCommandPathOffer } from "../shared/emergency-command-cont
 import {
   matchesLocalScanResult,
   type LocalScanApi,
+  type LocalScanChildApi,
   type LocalScanEngineDto,
   type LocalScanFetchDto,
   type LocalScanRequest,
+  type LocalScanChildRequest,
   type LocalScanResult,
 } from "../shared/local-scan-contract";
 
@@ -50,6 +52,87 @@ function message(error: unknown): string {
 }
 
 /**
+ * What the dialog asks of its caller. Each transport knows which fetch
+ * request shape its source takes (path offer, SFTP browser entry or a
+ * container path); the dialog never builds one itself.
+ */
+export interface LocalScanTransport {
+  engines(): Promise<LocalScanResult | null>;
+  configure(name: string, kind: "gui" | "cli", args: string[]): Promise<LocalScanResult | null>;
+  removeEngine(engineId: string): Promise<LocalScanResult | null>;
+  fetch(scope: "file" | "directory"): Promise<LocalScanResult | null>;
+  run(fetchId: string, engineId: string): Promise<LocalScanResult | null>;
+  reveal(fetchId: string): Promise<LocalScanResult | null>;
+  discard(fetchId: string): Promise<LocalScanResult | null>;
+}
+
+type AnyRequest = LocalScanRequest | LocalScanChildRequest;
+
+function checked(
+  api: Pick<LocalScanApi, "localScan"> | Pick<LocalScanChildApi, "localScan">,
+): (request: AnyRequest) => Promise<LocalScanResult | null> {
+  return async (request) => {
+    const result = await api.localScan(request as never);
+    // The bridge checks the pairing too; a fake in a test still has to answer
+    // the action it was asked, or nothing it says is shown.
+    if (!matchesLocalScanResult(request as LocalScanRequest, result)) {
+      throw new Error("本机扫描结果与本次请求不一致，请重试。");
+    }
+    return result;
+  };
+}
+
+/** Emergency-command path offer: the main window's fetch action. */
+export function pathOfferScanTransport(
+  api: LocalScanApi, binding: string, offer: EmergencyCommandPathOffer,
+): LocalScanTransport {
+  const send = checked(api);
+  return {
+    engines: () => send({ action: "engines" }),
+    configure: (name, kind, args) => send({ action: "configure", name, kind, arguments: args }),
+    removeEngine: (engineId) => send({ action: "remove-engine", engineId }),
+    fetch: (scope) => send({ action: "fetch", bindingHandle: binding, pathHandle: offer.pathHandle, scope }),
+    run: (fetchId, engineId) => send({ action: "run", bindingHandle: binding, fetchId, engineId }),
+    reveal: (fetchId) => send({ action: "reveal", bindingHandle: binding, fetchId }),
+    discard: (fetchId) => send({ action: "discard", bindingHandle: binding, fetchId }),
+  };
+}
+
+/** A path inside a Docker/Podman container on the connected target. */
+export function containerScanTransport(
+  api: LocalScanApi, binding: string, snapshotHandle: string, containerHandle: string, path: string,
+): LocalScanTransport {
+  const send = checked(api);
+  return {
+    engines: () => send({ action: "engines" }),
+    configure: (name, kind, args) => send({ action: "configure", name, kind, arguments: args }),
+    removeEngine: (engineId) => send({ action: "remove-engine", engineId }),
+    fetch: (scope) => send({
+      action: "fetch-container", bindingHandle: binding, snapshotHandle, containerHandle, path, scope,
+    }),
+    run: (fetchId, engineId) => send({ action: "run", bindingHandle: binding, fetchId, engineId }),
+    reveal: (fetchId) => send({ action: "reveal", bindingHandle: binding, fetchId }),
+    discard: (fetchId) => send({ action: "discard", bindingHandle: binding, fetchId }),
+  };
+}
+
+/** An entry the SFTP file manager listed; a null entry handle is the listed directory itself. */
+export function browserScanTransport(
+  api: LocalScanChildApi, browserHandle: string, entryHandle: string,
+): LocalScanTransport {
+  const send = checked(api);
+  return {
+    engines: () => send({ action: "engines" }),
+    configure: (name, kind, args) => send({ action: "configure", name, kind, arguments: args }),
+    removeEngine: (engineId) => send({ action: "remove-engine", engineId }),
+    fetch: (scope) => send({ action: "fetch-browser", browserHandle, entryHandle, scope }),
+    run: (fetchId, engineId) => send({ action: "run", fetchId, engineId }),
+    reveal: (fetchId) => send({ action: "reveal", fetchId }),
+    discard: (fetchId) => send({ action: "discard", fetchId }),
+  };
+}
+
+/**
  * Drives the fetch-to-local-scan dialog for one offered path.
  *
  * Every request is a closed action plus handles the page was handed; the
@@ -65,7 +148,7 @@ export class LocalScanController {
   private disposed = false;
   private revision = 0;
 
-  constructor(private api: LocalScanApi, private binding: string, readonly offer: EmergencyCommandPathOffer) {}
+  constructor(private transport: LocalScanTransport) {}
 
   /** The dialog opened (or came back after a strict-mode remount): start over and read the engines. */
   attach = (): void => {
@@ -88,16 +171,6 @@ export class LocalScanController {
     this.listeners.forEach((fn) => fn());
   }
 
-  private async request(request: LocalScanRequest): Promise<LocalScanResult | null> {
-    const result = await this.api.localScan(request);
-    // The bridge checks the pairing too; a fake in a test still has to answer
-    // the action it was asked, or nothing it says is shown.
-    if (!matchesLocalScanResult(request, result)) {
-      throw new Error("本机扫描结果与本次请求不一致，请重试。");
-    }
-    return result;
-  }
-
   private keepSelection(engines: LocalScanEngineDto[], prefer: string | null): string | null {
     if (prefer !== null && engines.some((engine) => engine.id === prefer)) return prefer;
     if (this.state.selectedEngineId !== null && engines.some((engine) => engine.id === this.state.selectedEngineId)) {
@@ -109,7 +182,7 @@ export class LocalScanController {
   private async loadEngines(revision: number): Promise<void> {
     this.set({ ...this.state, busy: "engines", error: null });
     try {
-      const result = await this.request({ action: "engines" });
+      const result = await this.transport.engines();
       if (this.disposed || revision !== this.revision) return;
       if (result === null || result.kind !== "engines") throw new Error("本机扫描结果与本次请求不一致，请重试。");
       this.set({
@@ -143,7 +216,7 @@ export class LocalScanController {
     this.set({ ...this.state, busy: "configure", error: null });
     try {
       const before = new Set((this.state.engines ?? []).map((engine) => engine.id));
-      const result = await this.request({ action: "configure", name, kind, arguments: args });
+      const result = await this.transport.configure(name, kind, args);
       if (this.disposed || revision !== this.revision) return "failed";
       if (result === null) {
         // The system dialog was cancelled: nothing was added, keep the form.
@@ -170,7 +243,7 @@ export class LocalScanController {
     const revision = ++this.revision;
     this.set({ ...this.state, busy: "remove", error: null });
     try {
-      const result = await this.request({ action: "remove-engine", engineId });
+      const result = await this.transport.removeEngine(engineId);
       if (this.disposed || revision !== this.revision) return;
       if (result === null || result.kind !== "engines") throw new Error("本机扫描结果与本次请求不一致，请重试。");
       this.set({ ...this.state, engines: result.engines, busy: null, selectedEngineId: this.keepSelection(result.engines, null) });
@@ -185,18 +258,12 @@ export class LocalScanController {
     const revision = ++this.revision;
     this.set({ ...this.state, busy: "fetch", error: null, notice: null });
     try {
-      const result = await this.request({
-        action: "fetch",
-        bindingHandle: this.binding,
-        pathHandle: this.offer.pathHandle,
-        scope,
-      });
+      const result = await this.transport.fetch(scope);
       if (result === null || result.kind !== "fetch") throw new Error("本机扫描结果与本次请求不一致，请重试。");
       if (this.disposed || revision !== this.revision) {
         // The dialog is gone or superseded: the copy nobody will see should
         // not linger, so tell the backend to delete it and keep nothing.
-        void this.api.localScan({ action: "discard", bindingHandle: this.binding, fetchId: result.fetch.fetchId })
-          .catch(() => undefined);
+        void this.transport.discard(result.fetch.fetchId).catch(() => undefined);
         return;
       }
       this.set({ ...this.state, fetch: result.fetch, busy: null, error: null });
@@ -212,7 +279,7 @@ export class LocalScanController {
     const revision = ++this.revision;
     this.set({ ...this.state, busy: "run", error: null });
     try {
-      const result = await this.request({ action: "run", bindingHandle: this.binding, fetchId: fetched.fetchId, engineId });
+      const result = await this.transport.run(fetched.fetchId, engineId);
       if (this.disposed || revision !== this.revision) return;
       if (result === null || result.kind !== "run") throw new Error("本机扫描结果与本次请求不一致，请重试。");
       this.set({ ...this.state, run: result, busy: null, error: null });
@@ -228,7 +295,7 @@ export class LocalScanController {
     const revision = ++this.revision;
     this.set({ ...this.state, busy: "reveal", error: null });
     try {
-      const result = await this.request({ action: "reveal", bindingHandle: this.binding, fetchId: fetched.fetchId });
+      const result = await this.transport.reveal(fetched.fetchId);
       if (this.disposed || revision !== this.revision) return;
       if (result === null || result.kind !== "done") throw new Error("本机扫描结果与本次请求不一致，请重试。");
       this.set({ ...this.state, busy: null, notice: result.detail });
@@ -244,7 +311,7 @@ export class LocalScanController {
     const revision = ++this.revision;
     this.set({ ...this.state, busy: "discard", error: null });
     try {
-      const result = await this.request({ action: "discard", bindingHandle: this.binding, fetchId: fetched.fetchId });
+      const result = await this.transport.discard(fetched.fetchId);
       if (this.disposed || revision !== this.revision) return false;
       if (result === null || result.kind !== "done") throw new Error("本机扫描结果与本次请求不一致，请重试。");
       this.set({ ...this.state, busy: null, discarded: true });

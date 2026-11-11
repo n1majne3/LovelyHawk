@@ -18,6 +18,7 @@ import {
 
 export type SftpMenuAction =
   | "open"
+  | "local-scan"
   | "terminal"
   | "preview"
   | "edit"
@@ -35,6 +36,8 @@ export interface SftpContextMenuProps {
   /** Null when the operator asked the directory itself rather than a row. */
   entry: SftpBrowserEntry | null;
   busy: boolean;
+  /** The window offers 取回本机扫描; omit it where the host did not wire the scan in. */
+  localScan?: boolean;
   onAction: (action: SftpMenuAction) => void;
   onDismiss: () => void;
 }
@@ -54,6 +57,7 @@ export function SftpContextMenu({
   position,
   entry,
   busy,
+  localScan = false,
   onAction,
   onDismiss,
 }: SftpContextMenuProps) {
@@ -90,7 +94,7 @@ export function SftpContextMenu({
     };
   }, [onDismiss]);
 
-  const items = menuItems(entry);
+  const items = menuItems(entry, localScan);
   return (
     <div
       ref={ref}
@@ -123,12 +127,14 @@ export function SftpContextMenu({
   );
 }
 
-export function menuItems(entry: SftpBrowserEntry | null): MenuItem[] {
+export function menuItems(entry: SftpBrowserEntry | null, localScan = false): MenuItem[] {
   if (entry === null) {
-    return [
+    const items: MenuItem[] = [
       { action: "create-directory", label: "新建文件夹", icon: <NewFolderIcon /> },
       { action: "terminal", label: "在这里打开终端", icon: <TerminalHereIcon /> },
     ];
+    if (localScan) items.push({ action: "local-scan", label: "取回本机扫描", icon: <DownloadIcon /> });
+    return items;
   }
   const items: MenuItem[] = [];
   if (entry.action === "browse") {
@@ -146,6 +152,11 @@ export function menuItems(entry: SftpBrowserEntry | null): MenuItem[] {
   }
   if (entry.kind === "file") {
     items.push({ action: "download", label: "下载", icon: <DownloadIcon /> });
+  }
+  // A folder the pane can open or a regular file it can preview: the same two
+  // kinds the fetch resolver accepts — a link never reaches the backend.
+  if (localScan && (entry.action === "browse" || entry.action === "preview")) {
+    items.push({ action: "local-scan", label: "取回本机扫描", icon: <DownloadIcon /> });
   }
   items.push({ action: "rename", label: "重命名", icon: <RenameIcon /> });
   items.push({ action: "chmod", label: "设置权限", icon: <PermissionIcon /> });

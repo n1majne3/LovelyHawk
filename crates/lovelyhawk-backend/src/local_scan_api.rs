@@ -15,22 +15,27 @@ use std::{
 
 use lovelyhawk_core::{
     BackendServices, CoreError,
+    docker::ContainerIdentity,
     file_evidence::FileEvidenceProgress,
     local_scan::{
-        FETCH_KIND_REFUSAL, FETCH_SIZE_REFUSAL, FETCH_TOOLS_REFUSAL, FetchKind, LocalScanEngine,
-        LocalScanEngineKind, LocalScanManifest, LocalScanScope, create_fetch_staging,
-        engine_launch, extract_fetch_archive, fetch_bundle_command, fetch_probe_command,
-        fetch_root, parse_fetch_bundle, parse_fetch_probe, validate_engine, write_manifest,
+        FETCH_KIND_REFUSAL, FETCH_SIZE_REFUSAL, FETCH_TOOLS_REFUSAL, FetchKind, FetchRoot,
+        LocalScanEngine, LocalScanEngineKind, LocalScanManifest, LocalScanScope,
+        container_fetch_bundle_command, create_fetch_staging, engine_launch, extract_fetch_archive,
+        fetch_bundle_command, fetch_probe_command, fetch_root, parse_fetch_bundle,
+        parse_fetch_probe, validate_engine, write_manifest,
     },
     sftp::RemotePath,
     ssh::SshCommandOutput,
+    target::TargetGuard,
 };
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
+    docker_read_api::DockerReadApi,
     emergency_path_api::{EmergencyPathApi, PathScope},
+    sftp_browser_api::SftpBrowserApi,
     ssh_api::SshApi,
 };
 
@@ -69,6 +74,19 @@ pub(crate) enum LocalScanRequest {
         path_handle: String,
         scope: String,
     },
+    FetchBrowser {
+        binding_handle: String,
+        browser_handle: String,
+        entry_handle: String,
+        scope: String,
+    },
+    FetchContainer {
+        binding_handle: String,
+        snapshot_handle: String,
+        container_handle: String,
+        path: String,
+        scope: String,
+    },
     Inspect {
         binding_handle: String,
         fetch_id: String,
@@ -99,7 +117,7 @@ pub(crate) enum LocalScanResponse {
         engines: Vec<EngineDto>,
     },
     Fetch {
-        fetch: FetchDto,
+        fetch: Box<FetchDto>,
     },
     Run {
         state: String,
@@ -142,10 +160,37 @@ pub(crate) struct FetchDto {
     entries: Vec<String>,
     fetched_at: String,
     expires_in_seconds: u64,
+    /// `host` or `container`: where the fetched bytes came from.
+    origin: String,
+    /// Who the content came from when it was not the host; empty for `host`.
+    origin_label: String,
+}
+
+/// Who a fetch belongs to: the binding plus the session, connection and
+/// target identity it was minted under. Every fetch source mints the same
+/// owner, so later actions resolve identically no matter where the path came
+/// from.
+#[derive(Clone, PartialEq, Eq)]
+struct FetchOwner {
+    binding_handle: String,
+    session_id: String,
+    connection_id: String,
+    target: TargetGuard,
+}
+
+impl FetchOwner {
+    fn to_path_scope(&self) -> PathScope {
+        PathScope {
+            binding_handle: self.binding_handle.clone(),
+            session_id: self.session_id.clone(),
+            connection_id: self.connection_id.clone(),
+            target: self.target.clone(),
+        }
+    }
 }
 
 struct FetchEntry {
-    scope: PathScope,
+    owner: FetchOwner,
     dir: PathBuf,
     content_dir: PathBuf,
     created: Instant,
@@ -156,6 +201,8 @@ pub(crate) struct LocalScanApi {
     services: BackendServices,
     ssh_api: Arc<SshApi>,
     paths: EmergencyPathApi,
+    sftp_browser: SftpBrowserApi,
+    docker_read: Arc<DockerReadApi>,
     fetches: Arc<Mutex<HashMap<String, FetchEntry>>>,
 }
 impl std::fmt::Debug for LocalScanApi {
@@ -184,11 +231,15 @@ impl LocalScanApi {
         services: BackendServices,
         ssh_api: Arc<SshApi>,
         paths: EmergencyPathApi,
+        sftp_browser: SftpBrowserApi,
+        docker_read: Arc<DockerReadApi>,
     ) -> Self {
         Self {
             services,
             ssh_api,
             paths,
+            sftp_browser,
+            docker_read,
             fetches: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -197,7 +248,7 @@ impl LocalScanApi {
         let mut fetches = self.fetches.lock();
         let stale: Vec<String> = fetches
             .iter()
-            .filter(|(_, entry)| entry.scope.binding_handle == binding)
+            .filter(|(_, entry)| entry.owner.binding_handle == binding)
             .map(|(id, _)| id.clone())
             .collect();
         for id in stale {
@@ -226,6 +277,31 @@ impl LocalScanApi {
                 path_handle,
                 scope,
             } => self.fetch(&binding_handle, &path_handle, &scope).await,
+            LocalScanRequest::FetchBrowser {
+                binding_handle,
+                browser_handle,
+                entry_handle,
+                scope,
+            } => {
+                self.fetch_browser(&binding_handle, &browser_handle, &entry_handle, &scope)
+                    .await
+            }
+            LocalScanRequest::FetchContainer {
+                binding_handle,
+                snapshot_handle,
+                container_handle,
+                path,
+                scope,
+            } => {
+                self.fetch_container(
+                    &binding_handle,
+                    &snapshot_handle,
+                    &container_handle,
+                    &path,
+                    &scope,
+                )
+                .await
+            }
             LocalScanRequest::Inspect {
                 binding_handle,
                 fetch_id,
@@ -260,27 +336,55 @@ impl LocalScanApi {
         }
     }
 
+    /// Who the binding currently is, minted the same way for every fetch
+    /// source. The comparison on `validate_owner` is exact, so a reconnect or
+    /// a new session under the same binding ends the fetch.
+    fn capture_owner(&self, binding: &str) -> Result<FetchOwner, LocalScanError> {
+        if !valid_field(binding, 128) {
+            return Err(LocalScanError::Invalid);
+        }
+        let session = self
+            .ssh_api
+            .binding_session_clone(binding)
+            .map_err(|_| LocalScanError::Stale)?;
+        self.services
+            .target()
+            .validate(session.target())
+            .map_err(|_| LocalScanError::Stale)?;
+        Ok(FetchOwner {
+            binding_handle: binding.to_owned(),
+            session_id: session.session_id().to_owned(),
+            connection_id: session.connection_id().to_owned(),
+            target: session.target().clone(),
+        })
+    }
+
+    fn validate_owner(&self, owner: &FetchOwner) -> Result<(), LocalScanError> {
+        if &self.capture_owner(&owner.binding_handle)? != owner {
+            return Err(LocalScanError::Stale);
+        }
+        Ok(())
+    }
+
     fn live_entry(
         &self,
         binding: &str,
         fetch_id: &str,
-    ) -> Result<(PathScope, PathBuf, PathBuf), LocalScanError> {
+    ) -> Result<(FetchOwner, PathBuf, PathBuf), LocalScanError> {
         if !valid_field(fetch_id, 128) {
             return Err(LocalScanError::Invalid);
         }
         let fetches = self.fetches.lock();
         let entry = fetches
             .get(fetch_id)
-            .filter(|entry| entry.scope.binding_handle == binding)
+            .filter(|entry| entry.owner.binding_handle == binding)
             .ok_or(LocalScanError::Stale)?;
-        self.paths
-            .validate_binding(&entry.scope)
-            .map_err(|_| LocalScanError::Stale)?;
+        self.validate_owner(&entry.owner)?;
         if !lovelyhawk_core::local_scan::is_fetch_staging(self.services.store(), &entry.dir) {
             return Err(LocalScanError::Unavailable);
         }
         Ok((
-            entry.scope.clone(),
+            entry.owner.clone(),
             entry.dir.clone(),
             entry.content_dir.clone(),
         ))
@@ -376,6 +480,7 @@ impl LocalScanApi {
         self.engines()
     }
 
+    /// A path offered beside command output on the target's own filesystem.
     async fn fetch(
         &self,
         binding: &str,
@@ -390,52 +495,176 @@ impl LocalScanApi {
             .resolve_evidence_path(binding, path_handle)
             .map_err(|_| LocalScanError::Stale)?;
         let root = fetch_root(&path, scope).map_err(local_scan_core_failure)?;
-        let session = self
-            .ssh_api
-            .binding_session_clone(binding)
-            .map_err(|_| LocalScanError::Stale)?;
+        let owner = self.capture_owner(binding)?;
         self.paths
             .validate_binding(&path_scope)
             .map_err(|_| LocalScanError::Stale)?;
+        self.fetch_pipeline(
+            owner,
+            scope,
+            path.as_str().to_owned(),
+            FetchSource::Host { root },
+            "host",
+        )
+        .await
+    }
 
-        let probe = self
-            .exec(&session, fetch_probe_command(&root), PROBE_TIMEOUT)
-            .await?;
-        let probe = parse_fetch_probe(&probe.output);
-        if !probe.tar || (probe.kind == FetchKind::Directory && !probe.find) {
-            return Err(LocalScanError::Tools);
-        }
-        if probe.kind == FetchKind::Other {
-            return Err(LocalScanError::Kind);
-        }
-        if let Some(size) = probe.size
-            && probe.kind == FetchKind::File
-            && size > lovelyhawk_core::local_scan::MAX_FETCH_ARCHIVE_BYTES
-        {
-            return Err(LocalScanError::Size);
-        }
+    /// A file or directory entry an SFTP browser already offered.
+    async fn fetch_browser(
+        &self,
+        binding: &str,
+        browser_handle: &str,
+        entry_handle: &str,
+        scope_value: &str,
+    ) -> Result<LocalScanResponse, LocalScanError> {
+        let Some(scope) = LocalScanScope::parse(scope_value) else {
+            return Err(LocalScanError::Invalid);
+        };
+        let path = self
+            .sftp_browser
+            .path_for_fetch(binding, browser_handle, entry_handle)
+            .map_err(|_| LocalScanError::Stale)?;
+        let root = fetch_root(&path, scope).map_err(local_scan_core_failure)?;
+        let owner = self.capture_owner(binding)?;
+        self.fetch_pipeline(
+            owner,
+            scope,
+            path.as_str().to_owned(),
+            FetchSource::Host { root },
+            "host",
+        )
+        .await
+    }
 
-        let bundled = self
-            .exec(
-                &session,
-                fetch_bundle_command(&root, probe.kind),
-                BUNDLE_TIMEOUT,
-            )
-            .await?;
+    /// A path inside a listed container, copied out through its runtime.
+    async fn fetch_container(
+        &self,
+        binding: &str,
+        snapshot_handle: &str,
+        container_handle: &str,
+        path: &str,
+        scope_value: &str,
+    ) -> Result<LocalScanResponse, LocalScanError> {
+        let Some(scope) = LocalScanScope::parse(scope_value) else {
+            return Err(LocalScanError::Invalid);
+        };
+        let path = container_fetch_path(path)?;
+        let (_session, identity) = self
+            .docker_read
+            .resolve_container_for_mutation(binding, snapshot_handle, container_handle)
+            .map_err(|_| LocalScanError::Stale)?;
+        // The scope's directory means the directory holding the path, asked
+        // of the container path exactly as of a host path.
+        let root = fetch_root(&path, scope).map_err(local_scan_core_failure)?;
+        let owner = self.capture_owner(binding)?;
+        self.fetch_pipeline(
+            owner,
+            scope,
+            path.as_str().to_owned(),
+            FetchSource::Container {
+                root,
+                identity,
+                snapshot_handle: snapshot_handle.to_owned(),
+                container_handle: container_handle.to_owned(),
+            },
+            "container",
+        )
+        .await
+    }
+
+    /// Stage on the target, download, extract, manifest and register — the
+    /// tail every fetch source shares once it has resolved where the bytes
+    /// come from.
+    async fn fetch_pipeline(
+        &self,
+        owner: FetchOwner,
+        scope: LocalScanScope,
+        display_path: String,
+        source: FetchSource,
+        origin: &str,
+    ) -> Result<LocalScanResponse, LocalScanError> {
+        let session = self
+            .ssh_api
+            .binding_session_clone(&owner.binding_handle)
+            .map_err(|_| LocalScanError::Stale)?;
+        self.validate_owner(&owner)?;
+
+        let (bundle_command, probed_kind) = match &source {
+            FetchSource::Host { root } => {
+                let probe = self
+                    .exec(&session, fetch_probe_command(root), PROBE_TIMEOUT)
+                    .await?;
+                let probe = parse_fetch_probe(&probe.output);
+                if !probe.tar || (probe.kind == FetchKind::Directory && !probe.find) {
+                    return Err(LocalScanError::Tools);
+                }
+                if probe.kind == FetchKind::Other {
+                    return Err(LocalScanError::Kind);
+                }
+                if let Some(size) = probe.size
+                    && probe.kind == FetchKind::File
+                    && size > lovelyhawk_core::local_scan::MAX_FETCH_ARCHIVE_BYTES
+                {
+                    return Err(LocalScanError::Size);
+                }
+                (fetch_bundle_command(root, probe.kind), Some(probe.kind))
+            }
+            FetchSource::Container { root, identity, .. } => {
+                (container_fetch_bundle_command(identity, root), None)
+            }
+        };
+
+        let bundled = self.exec(&session, bundle_command, BUNDLE_TIMEOUT).await?;
         let bundle = parse_fetch_bundle(&bundled.output).map_err(local_scan_core_failure)?;
         if bundle.bytes > lovelyhawk_core::local_scan::MAX_FETCH_ARCHIVE_BYTES {
             self.cleanup_remote(&session, &bundle.archive).await;
             return Err(LocalScanError::Size);
         }
-        self.paths
-            .validate_binding(&path_scope)
-            .map_err(|_| LocalScanError::Stale)?;
+        self.validate_owner(&owner)?;
+        // The container the bytes came out of is re-resolved after the remote
+        // steps, like every other mutation path: a snapshot that moved on
+        // since the handle resolved means these bytes are nobody's.
+        let origin_label = match &source {
+            FetchSource::Host { .. } => String::new(),
+            FetchSource::Container {
+                identity,
+                snapshot_handle,
+                container_handle,
+                ..
+            } => {
+                let (_session, again) = self
+                    .docker_read
+                    .resolve_container_for_mutation(
+                        &owner.binding_handle,
+                        snapshot_handle,
+                        container_handle,
+                    )
+                    .map_err(|_| LocalScanError::Stale)?;
+                if &again != identity {
+                    self.cleanup_remote(&session, &bundle.archive).await;
+                    return Err(LocalScanError::Stale);
+                }
+                let name = self
+                    .services
+                    .docker()
+                    .inspect(&session, identity)
+                    .await
+                    .map(|inspection| inspection.name)
+                    .unwrap_or_else(|_| identity.short_id().to_owned());
+                format!(
+                    "{}（{}，{}）",
+                    name,
+                    identity.short_id(),
+                    identity.runtime().label().to_lowercase()
+                )
+            }
+        };
 
         let staging =
             create_fetch_staging(self.services.store()).map_err(|_| LocalScanError::Unavailable)?;
         let archive_local = staging.dir.join("bundle.tar");
         let result = self
-            .download_archive(&path_scope, &bundle.archive, &archive_local)
+            .download_archive(&owner.to_path_scope(), &bundle.archive, &archive_local)
             .await;
         self.cleanup_remote(&session, &bundle.archive).await;
         let proof = match result {
@@ -455,12 +684,32 @@ impl LocalScanApi {
         };
         let _ = std::fs::remove_file(&archive_local);
 
-        let target_label = self.target_label(&path_scope).await;
+        let source_kind = match probed_kind {
+            Some(FetchKind::File) => "file".to_owned(),
+            Some(FetchKind::Directory) => "directory".to_owned(),
+            Some(FetchKind::Other) | None => {
+                // A container bundle's kind was never probed: it is what the
+                // archive's single top-level member turned out to be.
+                top_level_kind(&staging.content_dir)
+            }
+        };
+
+        let target_label = self.target_label(&owner.to_path_scope()).await;
         let mut limitations = vec![
-            "取回内容按不可信来源隔离存放：去除执行权限并标记为来自网络；取回本身不代表文件安全。".to_owned(),
-            "远端 find 只覆盖普通文件与目录，符号链接、套接字与设备不会取回；超出边界的成员已跳过。".to_owned(),
-            "本机安全软件会实时检查取回内容，可能拦截或锁定命中文件——这是取回活动的固有面，不是错误。".to_owned(),
+            "取回内容按不可信来源隔离存放：去除执行权限并标记为来自网络；取回本身不代表文件安全。"
+                .to_owned(),
         ];
+        match &source {
+            FetchSource::Host { .. } => limitations.push(
+                "远端 find 只覆盖普通文件与目录，符号链接、套接字与设备不会取回；超出边界的成员已跳过。".to_owned(),
+            ),
+            FetchSource::Container { .. } => limitations.push(
+                "经容器运行时 cp 从容器文件系统取回；符号链接不会跟随，取回的是容器当前文件系统，不等于镜像原始内容。".to_owned(),
+            ),
+        }
+        limitations.push(
+            "本机安全软件会实时检查取回内容，可能拦截或锁定命中文件——这是取回活动的固有面，不是错误。".to_owned(),
+        );
         if bundle.truncated {
             limitations.push(format!(
                 "目录成员数超过 {} 上限，取回内容不完整。",
@@ -473,13 +722,10 @@ impl LocalScanApi {
         let fetched_at = proof.completed_at.to_rfc3339();
         let manifest = LocalScanManifest {
             version: 1,
-            source_path: path.as_str().to_owned(),
-            source_kind: match probe.kind {
-                FetchKind::File => "file",
-                FetchKind::Directory => "directory",
-                FetchKind::Other => "other",
-            }
-            .to_owned(),
+            source_path: display_path.clone(),
+            origin: origin.to_owned(),
+            origin_label: origin_label.clone(),
+            source_kind: source_kind.clone(),
             scope: scope.as_str().to_owned(),
             target_label: target_label.clone(),
             fetched_at: fetched_at.clone(),
@@ -502,8 +748,8 @@ impl LocalScanApi {
         let fetch_id = Uuid::new_v4().to_string();
         let dto = FetchDto {
             fetch_id: fetch_id.clone(),
-            path: path.as_str().to_owned(),
-            source_kind: manifest.source_kind.clone(),
+            path: display_path,
+            source_kind,
             scope: manifest.scope.clone(),
             files: report.files,
             directories: report.directories,
@@ -522,13 +768,15 @@ impl LocalScanApi {
                 .collect(),
             fetched_at,
             expires_in_seconds: FETCH_TTL.as_secs(),
+            origin: manifest.origin.clone(),
+            origin_label,
         };
         let mut fetches = self.fetches.lock();
         if fetches.len() >= MAX_FETCHES {
             // Make room by dropping this binding's oldest fetch, or refuse.
             let oldest = fetches
                 .iter()
-                .filter(|(_, entry)| entry.scope.binding_handle == binding)
+                .filter(|(_, entry)| entry.owner.binding_handle == owner.binding_handle)
                 .min_by_key(|(_, entry)| entry.created)
                 .map(|(id, _)| id.clone());
             match oldest {
@@ -547,13 +795,15 @@ impl LocalScanApi {
         fetches.insert(
             fetch_id,
             FetchEntry {
-                scope: path_scope,
+                owner,
                 dir: staging.dir,
                 content_dir: staging.content_dir,
                 created: Instant::now(),
             },
         );
-        Ok(LocalScanResponse::Fetch { fetch: dto })
+        Ok(LocalScanResponse::Fetch {
+            fetch: Box::new(dto),
+        })
     }
 
     fn inspect(&self, binding: &str, fetch_id: &str) -> Result<LocalScanResponse, LocalScanError> {
@@ -589,8 +839,12 @@ impl LocalScanApi {
             entries: manifest.entries.clone(),
             fetched_at: manifest.fetched_at.clone(),
             expires_in_seconds: remaining,
+            origin: manifest.origin.clone(),
+            origin_label: manifest.origin_label.clone(),
         };
-        Ok(LocalScanResponse::Fetch { fetch: dto })
+        Ok(LocalScanResponse::Fetch {
+            fetch: Box::new(dto),
+        })
     }
 
     async fn run(
@@ -788,6 +1042,38 @@ impl LocalScanApi {
     }
 }
 
+/// Where the bundle bytes come from once a fetch source has resolved: the
+/// target's own filesystem packed by tar, or a container path streamed out
+/// by `runtime cp`.
+enum FetchSource {
+    Host {
+        root: FetchRoot,
+    },
+    Container {
+        root: FetchRoot,
+        identity: ContainerIdentity,
+        snapshot_handle: String,
+        container_handle: String,
+    },
+}
+
+/// What the single top-level member of an extracted bundle turned out to be.
+///
+/// Container bundles are never probed, so their kind is read off the staged
+/// tree: one directory member is a directory fetch, everything else a file.
+fn top_level_kind(content_dir: &Path) -> String {
+    let mut top = match std::fs::read_dir(content_dir) {
+        Ok(top) => top,
+        Err(_) => return "file".to_owned(),
+    };
+    match (top.next(), top.next()) {
+        (Some(Ok(entry)), None) if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) => {
+            "directory".to_owned()
+        }
+        _ => "file".to_owned(),
+    }
+}
+
 fn valid_field(value: &str, max: usize) -> bool {
     !value.trim().is_empty() && value.len() <= max && !value.chars().any(char::is_control)
 }
@@ -823,6 +1109,16 @@ fn open_in_file_manager(path: &Path) -> bool {
         .is_ok()
 }
 
+/// A container path is the same shape `exec_directory_path` demands:
+/// absolute, bounded, never `/`, and `RemotePath` refuses `.`/`..`/empty
+/// components and non-absolute input — nothing becomes `cp` operand text.
+fn container_fetch_path(path: &str) -> Result<RemotePath, LocalScanError> {
+    if !valid_field(path, 4096) || path == "/" {
+        return Err(LocalScanError::Invalid);
+    }
+    RemotePath::new(path.to_owned()).map_err(|_| LocalScanError::Invalid)
+}
+
 fn local_scan_core_failure(error: CoreError) -> LocalScanError {
     match &error {
         CoreError::Validation { subject, .. } => match *subject {
@@ -845,5 +1141,62 @@ mod tests {
         assert_eq!(out, "ok\u{FFFD}\nline");
         let long = "x".repeat(MAX_RUN_OUTPUT_BYTES + 10);
         assert_eq!(bounded_output(&long).len(), MAX_RUN_OUTPUT_BYTES);
+    }
+
+    #[test]
+    fn request_shapes_are_exact_for_every_fetch_source() {
+        let browser: LocalScanRequest = serde_json::from_str(
+            r#"{"action":"fetch-browser","bindingHandle":"b","browserHandle":"w","entryHandle":"e","scope":"directory"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            browser,
+            LocalScanRequest::FetchBrowser {
+                scope,
+                ..
+            } if scope == "directory"
+        ));
+        let container: LocalScanRequest = serde_json::from_str(
+            r#"{"action":"fetch-container","bindingHandle":"b","snapshotHandle":"s","containerHandle":"c","path":"/var/www","scope":"file"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            container,
+            LocalScanRequest::FetchContainer { path, .. } if path == "/var/www"
+        ));
+        for bad in [
+            // Unknown keys never sneak a path or a second target past the shape.
+            r#"{"action":"fetch-browser","bindingHandle":"b","browserHandle":"w","entryHandle":"e","scope":"file","path":"/etc"}"#,
+            r#"{"action":"fetch-container","bindingHandle":"b","snapshotHandle":"s","containerHandle":"c","path":"/x","scope":"file","entryHandle":"e"}"#,
+            r#"{"action":"fetch-browser","bindingHandle":"b","browserHandle":"w","scope":"file"}"#,
+            r#"{"action":"fetch-container","bindingHandle":"b","snapshotHandle":"s","containerHandle":"c","scope":"file"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<LocalScanRequest>(bad).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn container_fetch_path_refuses_traversal_relative_and_root() {
+        for bad in [
+            "/var/../etc",
+            "var/www",
+            "/",
+            "./x",
+            "/a//b",
+            "/a/./b",
+            "relative/../path",
+            "",
+        ] {
+            assert!(
+                matches!(container_fetch_path(bad), Err(LocalScanError::Invalid)),
+                "{bad}"
+            );
+        }
+        for good in ["/var/www", "/etc/nginx/nginx.conf", "/var/www/has space/x"] {
+            assert!(container_fetch_path(good).is_ok(), "{good}");
+        }
     }
 }

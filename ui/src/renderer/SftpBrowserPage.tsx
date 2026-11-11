@@ -25,6 +25,9 @@ import {
   type SftpTextPreview,
 } from "../shared/sftp-browser-contract";
 import type { LocalBrowserApi } from "../shared/local-browser-contract";
+import type { LocalScanChildApi } from "../shared/local-scan-contract";
+import { LocalScanDialog } from "./LocalScanDialog";
+import { browserScanTransport } from "./local-scan-controller";
 import { LocalFilePane } from "./LocalFilePane";
 import { SftpContextMenu, type SftpMenuAction } from "./SftpContextMenu";
 import { SftpOperationDialog, type SftpOperationDraft } from "./SftpOperationDialog";
@@ -81,7 +84,7 @@ export interface SftpBrowserConnection {
 
 export interface SftpBrowserPageProps {
   connection: SftpBrowserConnection | null;
-  api: SftpBrowserApi & LocalBrowserApi;
+  api: SftpBrowserApi & LocalBrowserApi & Partial<LocalScanChildApi>;
   active?: boolean;
 }
 
@@ -107,6 +110,14 @@ export function SftpBrowserPage({
   const [transferNotice, setTransferNotice] = useState<string | null>(null);
   // The download running now, shown with a way to stop it.
   const [downloading, setDownloading] = useState<{ browserHandle: string; name: string; cancelling: boolean } | null>(null);
+  // The open 取回本机扫描 dialog: the browser entry it fetches, never a path this page typed.
+  const [localScan, setLocalScan] = useState<{
+    browserHandle: string;
+    entryHandle: string;
+    path: string;
+    entryKind: "file" | "directory";
+    returnFocus: HTMLElement | null;
+  } | null>(null);
   const [cancellingUpload, setCancellingUpload] = useState(false);
   const transferInFlight = useRef(false);
   // Opening a window is remote work too: a double click would ask twice.
@@ -408,6 +419,31 @@ export function SftpBrowserPage({
     dispatch({ type: "entry-selected", entryHandle });
   }
 
+  /**
+   * 取回本机扫描: the row's own entry handle, or the listed directory's handle
+   * when the operator asked the folder itself (blank area / toolbar with no
+   * selection). The path on the subject is only a label — the backend
+   * resolves the real path from the handles.
+   */
+  function openLocalScan(entry: SftpBrowserEntry | null): void {
+    if (api.localScan === undefined || directory === null) return;
+    const returnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    if (entry !== null) {
+      const path = directory.directoryLabel === "/" ? `/${entry.name}` : `${directory.directoryLabel}/${entry.name}`;
+      setLocalScan({
+        browserHandle: directory.browserHandle, entryHandle: entry.entryHandle, path,
+        entryKind: entry.kind === "directory" ? "directory" : "file",
+        returnFocus,
+      });
+    } else {
+      setLocalScan({
+        browserHandle: directory.browserHandle, entryHandle: directory.directoryHandle,
+        path: directory.directoryLabel, entryKind: "directory",
+        returnFocus,
+      });
+    }
+  }
+
   async function downloadSelected(): Promise<void> {
     // A second click while the dialog is open would open a second dialog.
     if (transferInFlight.current) return;
@@ -457,6 +493,7 @@ export function SftpBrowserPage({
     setMenu(null);
     // The context menu reaches here as well as the toolbar.
     if (listStale) return void setWindowError("目录列表已过期，先点“重新打开”。");
+    if (action === "local-scan") return void openLocalScan(entry);
     // A new window beside this one: a plan or a receipt on screen stays.
     if (action === "terminal") return void openFolderTerminal(entry);
     setPlan(null);
@@ -635,6 +672,20 @@ export function SftpBrowserPage({
           onClick={() => void downloadSelected()}>
           <DownloadIcon />下载
         </button>
+        {api.localScan === undefined ? null : (
+          <button type="button" className="sftp-browser-action" data-testid="sftp-local-scan"
+            disabled={busy || directory === null || listStale}
+            title={staleTitle ?? "把所选文件或目录（未选择时为当前目录）取回本机隔离目录扫描"}
+            onClick={() => {
+              if (selected !== null && (selected.action === "browse" || selected.action === "preview")) {
+                openLocalScan(selected);
+              } else {
+                openLocalScan(null);
+              }
+            }}>
+            <DownloadIcon />取回扫描
+          </button>
+        )}
         <button type="button" className="sftp-browser-action is-danger"
           disabled={busy || selected === null || listStale} title={staleTitle}
           onClick={() => startOperation("remove", selected)}>
@@ -787,11 +838,21 @@ export function SftpBrowserPage({
               position={menu.position}
               entry={menu.entry}
               busy={busy}
+              localScan={api.localScan !== undefined}
               onAction={(action) => startOperation(action, menu.entry)}
               onDismiss={() => setMenu(null)}
             />
           )}
-          {properties === null ? null : (
+          {localScan === null || api.localScan === undefined ? null : (
+        <LocalScanDialog
+          key={`${localScan.browserHandle}:${localScan.entryHandle}`}
+          transport={browserScanTransport(api as LocalScanChildApi, localScan.browserHandle, localScan.entryHandle)}
+          subject={{ path: localScan.path, entryKind: localScan.entryKind }}
+          returnFocus={localScan.returnFocus}
+          onClose={() => setLocalScan(null)}
+        />
+      )}
+      {properties === null ? null : (
         <SftpPropertiesDialog
           entry={properties}
           onChmod={() => startOperation("chmod", properties)}

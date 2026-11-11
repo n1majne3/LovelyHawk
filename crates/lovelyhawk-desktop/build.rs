@@ -61,6 +61,8 @@ const COMMANDS: &[&str] = &[
     "sftp_stage_upload",
     "local_open",
     "local_list",
+    "local_scan_child",
+    "local_scan_child_configure",
     "file_editor_open",
     "directory_terminal_open",
     "file_editor_target",

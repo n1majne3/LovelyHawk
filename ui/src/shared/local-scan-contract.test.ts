@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
+  isLocalScanChildRequest,
   isLocalScanRequest,
   isLocalScanResult,
   matchesLocalScanResult,
+  type LocalScanChildRequest,
   type LocalScanFetchDto,
   type LocalScanRequest,
 } from "./local-scan-contract";
@@ -27,6 +29,8 @@ const fetched: LocalScanFetchDto = {
   entries: [".helper"],
   fetchedAt: "2026-08-25T23:31:00+00:00",
   expiresInSeconds: 1800,
+  origin: "host",
+  originLabel: "",
 };
 const enginesResult = { kind: "engines", engines: [engine, cliEngine] };
 const fetchResult = { kind: "fetch", fetch: fetched };
@@ -47,6 +51,10 @@ describe("local scan boundary", () => {
       { action: "reveal", bindingHandle: "binding", fetchId: "fetch-one" },
       { action: "discard", bindingHandle: "binding", fetchId: "fetch-one" },
       { action: "run", bindingHandle: "binding", fetchId: "fetch-one", engineId: "engine-one" },
+      { action: "fetch-container", bindingHandle: "b", snapshotHandle: "s", containerHandle: "c",
+        path: "/var/www", scope: "file" },
+      { action: "fetch-container", bindingHandle: "b", snapshotHandle: "s", containerHandle: "c",
+        path: "/var/www", scope: "directory" },
     ];
     for (const request of valid) expect(isLocalScanRequest(request), JSON.stringify(request)).toBe(true);
 
@@ -99,6 +107,10 @@ describe("local scan boundary", () => {
       { kind: "fetch", fetch: { ...fetched, archiveSha256: "not-hex" } },
       { kind: "fetch", fetch: { ...fetched, bytes: -1 } },
       { kind: "fetch", fetch: { ...fetched, stagingDirectory: "" } },
+      { kind: "fetch", fetch: { ...fetched, origin: "container", originLabel: "x".repeat(257) } },
+      { kind: "fetch", fetch: { ...fetched, origin: "container", originLabel: 0 } },
+      { kind: "fetch", fetch: { ...fetched, origin: "host", originLabel: "web（a1b2，docker）" } },
+      { kind: "fetch", fetch: { ...fetched, origin: "runtime" } },
       { kind: "fetch", fetch: { ...fetched, extra: true } },
       { kind: "run", state: "running", engineName: "x", exitCode: null, output: null, detail: "" },
       { kind: "run", state: "finished", engineName: "", exitCode: 0, output: null, detail: "" },
@@ -149,5 +161,24 @@ describe("local scan boundary", () => {
       expect(matchesLocalScanResult(request, fetchResult)).toBe(false);
       expect(matchesLocalScanResult(request, runResult)).toBe(false);
     }
+
+    // Every fetch source pairs with a fetch result; the container and
+    // browser variants share the pairing rules.
+    for (const request of [
+      { action: "fetch-container", bindingHandle: "b", snapshotHandle: "s", containerHandle: "c",
+        path: "/x", scope: "file" },
+      { action: "fetch-browser", browserHandle: "w", entryHandle: "e", scope: "directory" },
+    ] as const satisfies readonly (LocalScanRequest | LocalScanChildRequest)[]) {
+      expect(matchesLocalScanResult(request, fetchResult)).toBe(true);
+      expect(matchesLocalScanResult(request, doneResult)).toBe(false);
+      expect(matchesLocalScanResult(request, null)).toBe(false);
+    }
+    // Child requests pair the same way for the shared actions.
+    expect(matchesLocalScanResult({ action: "run", fetchId: "f", engineId: "e" }, runResult)).toBe(true);
+    expect(matchesLocalScanResult({ action: "discard", fetchId: "f" }, doneResult)).toBe(true);
+    expect(matchesLocalScanResult({ action: "inspect", fetchId: "fetch-one" }, fetchResult)).toBe(true);
+    expect(matchesLocalScanResult(
+      { action: "inspect", fetchId: "other" }, fetchResult,
+    )).toBe(false);
   });
 });

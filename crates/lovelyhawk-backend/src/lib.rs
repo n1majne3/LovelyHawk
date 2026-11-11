@@ -319,12 +319,14 @@ impl BackendState {
         let mysql_runtime = MySqlRuntimeApi::new(services.clone(), Arc::clone(&ssh));
         let file_evidence =
             FileEvidenceApi::new(services.clone(), emergency_command.paths().clone());
+        let sftp_browser = SftpBrowserApi::new(services.clone(), Arc::clone(&ssh));
         let local_scan = LocalScanApi::new(
             services.clone(),
             Arc::clone(&ssh),
             emergency_command.paths().clone(),
+            sftp_browser.clone(),
+            Arc::clone(&docker_read),
         );
-        let sftp_browser = SftpBrowserApi::new(services.clone(), Arc::clone(&ssh));
         let integrity = Arc::new(IntegrityApi::new(
             services.clone(),
             Arc::clone(&ssh),

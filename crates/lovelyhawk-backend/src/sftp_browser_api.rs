@@ -489,6 +489,24 @@ impl SftpBrowserApi {
         )
     }
 
+    /// The path of an entry this browser offered, for a local-scan fetch.
+    /// A directory offered to open (Browse, including the browser's current
+    /// or root directory) and a regular file offered to preview qualify; a
+    /// symlink or anything else, a handle from another target, and an expired
+    /// browser do not.
+    pub(crate) fn path_for_fetch(
+        &self,
+        binding_handle: &str,
+        browser_handle: &str,
+        entry_handle: &str,
+    ) -> Result<RemotePath, SftpBrowserApiError> {
+        validate_handle(browser_handle)?;
+        validate_handle(entry_handle)?;
+        let (_, scope) = self.capture_binding(binding_handle)?;
+        self.lock_registry()?
+            .path_for_fetch(&scope, browser_handle, entry_handle, Instant::now())
+    }
+
     /// Drops every browser that belonged to a target that is going away.
     pub(crate) fn close_binding(&self, binding_handle: &str) {
         if let Ok(mut registry) = self.registry.lock() {
@@ -1457,6 +1475,38 @@ impl SftpBrowserRegistry {
                 node.action == EntryAction::Browse && node.kind == SftpBrowserEntryKind::Directory
             })
             .ok_or(SftpBrowserApiError::EntryUnavailable)?;
+        Ok(node.path.clone())
+    }
+
+    /// Same lookup shape as `directory_for_terminal`: no operation slot, so a
+    /// listing in progress does not refuse a fetch. A directory the browser
+    /// offers to open and a regular file it offers to preview both qualify;
+    /// anything else cannot be packed and is refused here rather than on the
+    /// target.
+    fn path_for_fetch(
+        &self,
+        scope: &BindingScope,
+        browser_handle: &str,
+        entry_handle: &str,
+        now: Instant,
+    ) -> Result<RemotePath, SftpBrowserApiError> {
+        let browser = self
+            .browsers
+            .get(browser_handle)
+            .filter(|browser| &browser.scope == scope && browser.expires_at > now)
+            .ok_or(SftpBrowserApiError::BrowserStale)?;
+        let node = browser
+            .nodes
+            .get(entry_handle)
+            .ok_or(SftpBrowserApiError::EntryUnavailable)?;
+        let qualifies = matches!(
+            (node.action, node.kind),
+            (EntryAction::Browse, SftpBrowserEntryKind::Directory)
+                | (EntryAction::Preview, SftpBrowserEntryKind::File)
+        );
+        if !qualifies {
+            return Err(SftpBrowserApiError::EntryUnavailable);
+        }
         Ok(node.path.clone())
     }
 
@@ -2521,6 +2571,82 @@ mod tests {
         ));
         assert!(matches!(
             registry.directory_for_terminal(&owner, &browser_handle, &root, now + BROWSER_TTL),
+            Err(SftpBrowserApiError::BrowserStale)
+        ));
+    }
+
+    #[test]
+    fn a_fetch_resolves_only_listed_files_and_directories_of_the_same_target() {
+        let now = Instant::now();
+        let owner = scope("binding-one", "target-one", 0);
+        let (browser, dto) = BrowserSnapshot::from_root(
+            owner.clone(),
+            vec![
+                entry("/", "etc", SftpFileKind::Directory),
+                entry("/", "notes.txt", SftpFileKind::File),
+                entry("/", "link", SftpFileKind::Symlink),
+                entry("/", "fifo", SftpFileKind::Other),
+            ],
+            now,
+        )
+        .unwrap();
+        let browser_handle = browser.browser_handle.clone();
+        let root = browser.root_handle.clone();
+        let handle_of = |name: &str| {
+            dto.entries
+                .iter()
+                .find(|entry| entry.name == name)
+                .unwrap()
+                .entry_handle
+                .clone()
+        };
+        let mut registry = SftpBrowserRegistry::default();
+        registry.replace(browser).unwrap();
+
+        // A directory offered to open and a regular file offered to preview
+        // both qualify, as does the browser's current directory itself.
+        assert_eq!(
+            registry
+                .path_for_fetch(&owner, &browser_handle, &handle_of("etc"), now)
+                .unwrap()
+                .as_str(),
+            "/etc"
+        );
+        assert_eq!(
+            registry
+                .path_for_fetch(&owner, &browser_handle, &handle_of("notes.txt"), now)
+                .unwrap()
+                .as_str(),
+            "/notes.txt"
+        );
+        assert_eq!(
+            registry
+                .path_for_fetch(&owner, &browser_handle, &root, now)
+                .unwrap()
+                .as_str(),
+            "/"
+        );
+        // Anything that cannot be packed is refused here, not on the target.
+        for refused in [handle_of("link"), handle_of("fifo"), "unknown".to_owned()] {
+            assert!(matches!(
+                registry.path_for_fetch(&owner, &browser_handle, &refused, now),
+                Err(SftpBrowserApiError::EntryUnavailable)
+            ));
+        }
+        // Another target's scope, another session of the same binding, and an
+        // expired browser all resolve to nothing.
+        let other_target = scope("binding-one", "target-two", 0);
+        assert!(matches!(
+            registry.path_for_fetch(&other_target, &browser_handle, &root, now),
+            Err(SftpBrowserApiError::BrowserStale)
+        ));
+        let reconnected = scope("binding-one", "target-one", 1);
+        assert!(matches!(
+            registry.path_for_fetch(&reconnected, &browser_handle, &root, now),
+            Err(SftpBrowserApiError::BrowserStale)
+        ));
+        assert!(matches!(
+            registry.path_for_fetch(&owner, &browser_handle, &root, now + BROWSER_TTL),
             Err(SftpBrowserApiError::BrowserStale)
         ));
     }

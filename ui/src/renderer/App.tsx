@@ -743,6 +743,7 @@ export function App() {
             <EmergencyCommandsPage
               bindingHandle={activeTarget?.bindingHandle ?? null}
               api={window.lovelyhawk}
+              writeClipboard={window.lovelyhawk.writeClipboard}
               rerun={historyRerun}
               runIn={investigateTarget}
             />

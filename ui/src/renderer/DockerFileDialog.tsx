@@ -16,7 +16,10 @@ import {
   MAX_DOCKER_FILE_BYTES,
 } from "../shared/docker-write-contract";
 import type { ContainerFilesApi } from "../shared/exec-files-contract";
+import type { LocalScanApi } from "../shared/local-scan-contract";
 import { DialogHost } from "./DialogHost";
+import { LocalScanDialog } from "./LocalScanDialog";
+import { containerScanTransport } from "./local-scan-controller";
 import { errorText } from "./error-text";
 import { ExecFileBrowser } from "./ExecFileBrowser";
 import { useModalScrim } from "./modal-scrim";
@@ -42,7 +45,7 @@ const MODE_LABEL: Record<Mode, string> = {
 };
 
 export interface DockerFileDialogProps {
-  api: DockerFileApi;
+  api: DockerFileApi & Partial<LocalScanApi>;
   bindingHandle: string;
   snapshotHandle: string;
   containerHandle: string;
@@ -90,6 +93,8 @@ export function DockerFileDialog({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  // The open 取回本机扫描 dialog; while it is up this dialog is inert.
+  const [scan, setScan] = useState<{ path: string; entryKind: "file" | "directory"; returnFocus: HTMLElement | null } | null>(null);
   // A click landing before `busy` renders would send the same remote call twice.
   const busyRef = useRef(false);
   const planRef = useRef<DockerActionPlan | null>(null);
@@ -241,7 +246,7 @@ export function DockerFileDialog({
 
   useEffect(() => {
     function keydown(event: KeyboardEvent) {
-      if (event.key !== "Escape" || discard.dialog !== null) return;
+      if (event.key !== "Escape" || discard.dialog !== null || scan !== null) return;
       event.preventDefault();
       if (planRef.current !== null) cancelPlan();
       else void requestClose();
@@ -249,6 +254,13 @@ export function DockerFileDialog({
     document.addEventListener("keydown", keydown);
     return () => document.removeEventListener("keydown", keydown);
   });
+
+  /** 取回扫描 on a container path: the dialog labels it, the handles carry the identity. */
+  function openScan(path: string, entryKind: "file" | "directory"): void {
+    if (api.localScan === undefined) return;
+    const returnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    setScan({ path, entryKind, returnFocus });
+  }
 
   const choice = DIRECTIONS.find((entry) => entry.value === direction) ?? DIRECTIONS[0]!;
   return (
@@ -260,7 +272,7 @@ export function DockerFileDialog({
         aria-modal="true"
         aria-label={`${containerName} 的文件`}
         data-testid="docker-file-dialog"
-        inert={discard.dialog !== null ? true : undefined}
+        inert={discard.dialog !== null || scan !== null ? true : undefined}
       >
         <header>
           <h2>容器文件</h2>
@@ -295,7 +307,24 @@ export function DockerFileDialog({
                 describe: (name) => `把 ${name} 复制到连接的主机上`,
                 run: (next, entry) => copyFromBrowser(next, entry.name),
               },
+              ...(api.localScan === undefined ? [] : [{
+                label: "取回扫描",
+                testId: "docker-browser-scan",
+                describe: (name: string) => `把 ${name} 取回本机隔离目录扫描`,
+                run: (next: string) => openScan(next, "file"),
+              }]),
             ]}
+            directoryActions={api.localScan === undefined ? [] : [{
+              label: "取回扫描",
+              testId: "docker-browser-scan-directory",
+              describe: (name: string) => `把 ${name} 目录取回本机隔离目录扫描`,
+              run: (next: string) => openScan(next, "directory"),
+            }]}
+            currentDirectoryAction={api.localScan === undefined ? undefined : {
+              label: "取回此目录扫描",
+              testId: "docker-browser-scan-current",
+              run: (next: string) => openScan(next, "directory"),
+            }}
           />
         </div>
 
@@ -388,6 +417,15 @@ export function DockerFileDialog({
         </footer>
       </section>
       {discard.dialog !== null ? <DialogHost dialog={discard.dialog} onResolve={discard.resolve} /> : null}
+      {scan === null || api.localScan === undefined ? null : (
+        <LocalScanDialog
+          key={scan.path}
+          transport={containerScanTransport(api as LocalScanApi, bindingHandle, snapshotHandle, containerHandle, scan.path)}
+          subject={{ path: scan.path, originLabel: `容器：${containerName}`, entryKind: scan.entryKind }}
+          returnFocus={scan.returnFocus}
+          onClose={() => setScan(null)}
+        />
+      )}
     </div>
   );
 }

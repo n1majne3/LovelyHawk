@@ -47,6 +47,7 @@ import { useEmergencyPathActions } from "./emergency-path-actions";
 import { FileEvidenceDialog } from "./FileEvidenceDialog";
 import type { FileEvidenceApi } from "../shared/file-evidence-contract";
 import { LocalScanDialog } from "./LocalScanDialog";
+import { pathOfferScanTransport } from "./local-scan-controller";
 import type { LocalScanApi } from "../shared/local-scan-contract";
 import { useListExpiry } from "./use-list-expiry";
 import "./emergency-commands.css";
@@ -54,6 +55,8 @@ import "./emergency-commands.css";
 export interface EmergencyCommandsPageProps {
   bindingHandle: string | null;
   api: EmergencyCommandApi & FileEvidenceApi & LocalScanApi;
+  /** Clipboard bridge; the result view's 复制 buttons are hidden without it. */
+  writeClipboard?: ((text: string) => Promise<void>) | undefined;
   /**
    * A command-history record whose check should be put in front of the
    * operator again. A new key is a new request; nothing runs by itself.
@@ -76,7 +79,7 @@ const RERUN_MISSING: Record<Exclude<EmergencyHistoryLocationStatus, "found">, st
   "not-in-catalog": "当前目标的命令清单里没有这一项检查（这台机器给的可能是另一套命令）。可以重新加载清单后再从命令历史打开。",
 };
 
-export function EmergencyCommandsPage({ bindingHandle, api, rerun = null, runIn = null }: EmergencyCommandsPageProps) {
+export function EmergencyCommandsPage({ bindingHandle, api, writeClipboard, rerun = null, runIn = null }: EmergencyCommandsPageProps) {
   const [evidence, setEvidence] = useState<{ offer: EmergencyCommandPathOffer; binding: string; api: FileEvidenceApi; returnFocus: HTMLElement | null } | null>(null);
   const [localScan, setLocalScan] = useState<{ offer: EmergencyCommandPathOffer; binding: string; api: LocalScanApi; returnFocus: HTMLElement | null } | null>(null);
   useEffect(() => { setEvidence(null); setLocalScan(null); }, [api, bindingHandle]);
@@ -468,6 +471,7 @@ export function EmergencyCommandsPage({ bindingHandle, api, rerun = null, runIn 
             dispatch({ type: "group-run-stop-requested", scope, runId: state.groupRun.id });
           }}
           onPathMenu={pathActions.openMenu}
+          writeClipboard={writeClipboard}
         />
       )}
       {pathActions.menu !== null && <EmergencyPathMenu
@@ -496,8 +500,10 @@ export function EmergencyCommandsPage({ bindingHandle, api, rerun = null, runIn 
         key={`${evidence.binding}:${evidence.offer.pathHandle}`} api={api} binding={evidence.binding}
         offer={evidence.offer} returnFocus={evidence.returnFocus} onClose={() => setEvidence(null)} /> : null}
       {localScan !== null && localScan.binding === bindingHandle && localScan.api === api ? <LocalScanDialog
-        key={`${localScan.binding}:${localScan.offer.pathHandle}`} api={api} binding={localScan.binding}
-        offer={localScan.offer} returnFocus={localScan.returnFocus} onClose={() => setLocalScan(null)} /> : null}
+        key={`${localScan.binding}:${localScan.offer.pathHandle}`}
+        transport={pathOfferScanTransport(api, localScan.binding, localScan.offer)}
+        subject={{ path: localScan.offer.path, entryKind: "file" }}
+        returnFocus={localScan.returnFocus} onClose={() => setLocalScan(null)} /> : null}
       {acting !== null && (acting.action === null ? <EmergencyPathProperties
         path={acting.offer.path}
         detail={acting.detail}
@@ -521,7 +527,8 @@ export function EmergencyCommandsPage({ bindingHandle, api, rerun = null, runIn 
 
 export function EmergencyCommandWorkbench({ groups, commands = [], collapsed = [], selected, selectedHandle,
   runStatus, result, runError, search, elapsedMs = null, groupRun = null, busy = false, blockedReason = null,
-  onToggleCategory = () => undefined, onSelect, onRun, onRunGroup = () => undefined, onStopGroup, onPathMenu }: {
+  onToggleCategory = () => undefined, onSelect, onRun, onRunGroup = () => undefined, onStopGroup, onPathMenu,
+  writeClipboard }: {
   groups: EmergencyCommandGroup[];
   commands?: readonly EmergencyCommandCatalogItem[];
   collapsed?: readonly EmergencyCommandCategory[];
@@ -542,6 +549,7 @@ export function EmergencyCommandWorkbench({ groups, commands = [], collapsed = [
   onRunGroup?: (category: EmergencyCommandCategory) => void;
   onStopGroup?: (() => void) | undefined;
   onPathMenu?: ((event: MouseEvent, offer: EmergencyCommandPathOffer) => void) | undefined;
+  writeClipboard?: ((text: string) => Promise<void>) | undefined;
 }) {
   return (
     <div className="emergency-commands-workbench">
@@ -557,7 +565,7 @@ export function EmergencyCommandWorkbench({ groups, commands = [], collapsed = [
       </aside>
       <section className="emergency-command-detail">
         {groupRun !== null ? <EmergencyCommandGroupView run={groupRun} commands={commands}
-          onStop={onStopGroup} onPathMenu={onPathMenu} /> :
+          onStop={onStopGroup} onPathMenu={onPathMenu} writeClipboard={writeClipboard} /> :
           selected === null ? <EmergencyCommandEmpty title="未选择调查项" detail="从左侧选择一项内置命令。" /> : (
           <>
             <header>
@@ -589,7 +597,7 @@ export function EmergencyCommandWorkbench({ groups, commands = [], collapsed = [
               runStatus === "error" ? <EmergencyCommandError message={runError ?? "命令执行失败。"} compact /> :
                 result === null ? <EmergencyCommandEmpty title="尚未执行" detail="结果将在这里以纯文本显示。" compact /> :
                   <EmergencyCommandResultView result={result} elapsedMs={elapsedMs}
-                    onPathMenu={onPathMenu} />}
+                    onPathMenu={onPathMenu} writeClipboard={writeClipboard} />}
           </>) }
       </section>
     </div>
@@ -645,11 +653,12 @@ function EmergencyCommandBranch({ group, collapsed, selectedHandle, busy, blocke
 }
 
 /** Sequential group run: one result block per finished step. */
-export function EmergencyCommandGroupView({ run, commands, onStop, onPathMenu }: {
+export function EmergencyCommandGroupView({ run, commands, onStop, onPathMenu, writeClipboard }: {
   run: EmergencyCommandGroupRun;
   commands: readonly EmergencyCommandCatalogItem[];
   onStop?: (() => void) | undefined;
   onPathMenu?: ((event: MouseEvent, offer: EmergencyCommandPathOffer) => void) | undefined;
+  writeClipboard?: ((text: string) => Promise<void>) | undefined;
 }) {
   const total = run.commandHandles.length;
   const done = run.entries.length;
@@ -702,7 +711,7 @@ export function EmergencyCommandGroupView({ run, commands, onStop, onPathMenu }:
             {entry.error !== null ? <EmergencyCommandError message={entry.error} compact /> :
               entry.result === null ? null :
                 <EmergencyCommandResultView result={entry.result} elapsedMs={entry.elapsedMs}
-                  onPathMenu={onPathMenu} />}
+                  onPathMenu={onPathMenu} writeClipboard={writeClipboard} />}
           </details>
         </li>)}
         {pending !== null && <li>
@@ -714,13 +723,20 @@ export function EmergencyCommandGroupView({ run, commands, onStop, onPathMenu }:
   );
 }
 
-export function EmergencyCommandResultView({ result, elapsedMs = null, onPathMenu }: {
+type ResultViewTab = "all" | "findings" | "raw" | "command";
+
+/** The clipboard bridge refuses anything over this, so longer text hides the button instead. */
+const CLIPBOARD_LIMIT_BYTES = 128 * 1_024;
+
+export function EmergencyCommandResultView({ result, elapsedMs = null, onPathMenu, writeClipboard }: {
   result: EmergencyCommandResult;
   elapsedMs?: number | null;
   onPathMenu?: ((event: MouseEvent, offer: EmergencyCommandPathOffer) => void) | undefined;
+  writeClipboard?: ((text: string) => Promise<void>) | undefined;
 }) {
   const successful = result.resultKind === "success" || result.resultKind === "empty";
-  const [focusFindings, setFocusFindings] = useState(false);
+  const [tab, setTab] = useState<ResultViewTab>("all");
+  const focusFindings = tab === "findings";
   const hasFindings = result.findingLines.length > 0;
   return (
     <div className={`emergency-command-result ${successful ? hasFindings ? "is-attention" : "is-success" : "is-failure"}`}>
@@ -745,16 +761,25 @@ export function EmergencyCommandResultView({ result, elapsedMs = null, onPathMen
       {result.truncated && <p className="emergency-command-warning" role="status">输出已按行数或大小上限截断。</p>}
       <div className="emergency-command-result-tools">
         <div className="view-tabs view-tabs-underline" role="group" aria-label="结果显示范围">
-          <button type="button" aria-pressed={!focusFindings} onClick={() => setFocusFindings(false)}>全部输出</button>
-          <button type="button" aria-pressed={focusFindings} disabled={!hasFindings}
-            onClick={() => setFocusFindings(true)}>关注与缺口</button>
+          <button type="button" aria-pressed={tab === "all"} onClick={() => setTab("all")}>全部输出</button>
+          <button type="button" aria-pressed={tab === "findings"} disabled={!hasFindings}
+            onClick={() => setTab("findings")}>关注与缺口</button>
+          <button type="button" aria-pressed={tab === "raw"} onClick={() => setTab("raw")}>原始输出</button>
+          <button type="button" aria-pressed={tab === "command"} onClick={() => setTab("command")}>执行的命令</button>
         </div>
-        <span>{focusFindings ? "保留原始行号，完整上下文见全部输出" : "标记用于辅助核查，不代表入侵结论"}</span>
+        <span>{tab === "findings" ? "保留原始行号，完整上下文见全部输出" :
+          tab === "all" ? "标记用于辅助核查，不代表入侵结论" : null}</span>
       </div>
-      {result.output.length === 0 ? <EmergencyCommandEmpty title="命令没有输出"
-        detail="没有可显示的内容；请结合执行状态、权限和工具情况判断，不能据此确认没有风险。" compact /> :
-        <EmergencyCommandOutput output={result.output} findingLines={result.findingLines}
-          focusFindings={focusFindings} paths={result.paths} onPathMenu={onPathMenu} />}
+      {tab === "raw" ? <EmergencyCommandVerbatim text={result.rawOutput} writeClipboard={writeClipboard}
+        note="目标返回的标准输出，标准错误附在其后（不是按时间交错）；不可见控制字符显示为 \xNN，非 UTF-8 字节显示为 �"
+        truncated={result.rawOutputTruncated} truncatedNote="原始输出超过 1 MiB，只显示前 1 MiB" /> :
+        tab === "command" ? <EmergencyCommandVerbatim text={result.command} writeClipboard={writeClipboard}
+          note="这是在目标上实际执行的完整命令（含容器包装和工具检查前置）"
+          truncated={result.commandTruncated} truncatedNote="命令超过 128 KiB，只显示前 128 KiB" /> :
+        result.output.length === 0 ? <EmergencyCommandEmpty title="命令没有输出"
+          detail="没有可显示的内容；请结合执行状态、权限和工具情况判断，不能据此确认没有风险。" compact /> :
+          <EmergencyCommandOutput output={result.output} findingLines={result.findingLines}
+            focusFindings={focusFindings} paths={result.paths} onPathMenu={onPathMenu} />}
     </div>
   );
 }
@@ -799,6 +824,39 @@ export function EmergencyCommandOutput({ output, findingLines = [], paths = [], 
               type="button" className="emergency-path-open" data-path-handle={offer.pathHandle}
               aria-label={`文件操作：${offer.path}`} onClick={(event) => onPathMenu(event.nativeEvent, offer)}>文件操作</button> : null}{"\n"}</span>;
       })}</pre>
+    </div>
+  );
+}
+
+/**
+ * The unprojected command or output, drawn exactly as the backend escaped it:
+ * what the operator reads is what the target sent, control characters and all.
+ * The 复制 button needs the clipboard bridge and is refused once the text is
+ * longer than the bridge accepts.
+ */
+export function EmergencyCommandVerbatim({ text, note, truncated = false, truncatedNote, writeClipboard }: {
+  text: string;
+  note: string;
+  truncated?: boolean;
+  truncatedNote: string;
+  writeClipboard?: ((text: string) => Promise<void>) | undefined;
+}) {
+  const [copied, setCopied] = useState<null | "ok" | "error">(null);
+  const tooLong = new TextEncoder().encode(text).byteLength > CLIPBOARD_LIMIT_BYTES;
+  return (
+    <div className="emergency-command-verbatim">
+      <div className="emergency-command-verbatim-tools">
+        <p>{note}</p>
+        {truncated && <p className="emergency-command-warning" role="status">{truncatedNote}</p>}
+        {writeClipboard !== undefined && <button type="button" disabled={tooLong}
+          title={tooLong ? "内容超过 128 KiB，无法复制" : undefined}
+          onClick={() => void writeClipboard(text).then(() => setCopied("ok"), () => setCopied("error"))}>复制</button>}
+        {copied === "ok" && <span role="status">已复制</span>}
+        {copied === "error" && <span role="alert">复制失败</span>}
+      </div>
+      <div className="emergency-command-output emergency-command-verbatim-scroll">
+        <pre>{text}</pre>
+      </div>
     </div>
   );
 }

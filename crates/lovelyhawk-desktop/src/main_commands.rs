@@ -415,7 +415,7 @@ pub async fn local_scan<R: Runtime>(
     let action = request.get("action").and_then(Value::as_str);
     let fields_ok = request.as_object().is_some_and(|fields| {
         if fields.is_empty()
-            || fields.len() > 4
+            || fields.len() > 6
             || !fields.contains_key("action")
             || fields.contains_key("program")
         {
@@ -429,6 +429,20 @@ pub async fn local_scan<R: Runtime>(
             Some("engines") => fields.len() == 1,
             Some("fetch") => {
                 fields.len() == 4 && strings(&["bindingHandle", "pathHandle", "scope"])
+            }
+            Some("fetch-container") => {
+                fields.len() == 6
+                    && strings(&[
+                        "bindingHandle",
+                        "snapshotHandle",
+                        "containerHandle",
+                        "path",
+                        "scope",
+                    ])
+                    && fields
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .is_some_and(|path| path.len() <= 4096)
             }
             Some("inspect") | Some("reveal") | Some("discard") => {
                 fields.len() == 3 && strings(&["bindingHandle", "fetchId"])

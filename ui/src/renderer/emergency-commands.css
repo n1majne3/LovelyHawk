@@ -913,3 +913,36 @@
   background: var(--danger-soft);
   text-decoration-color: var(--danger);
 }
+
+/* The command/raw-output tabs: the same scrollable console surface with an
+   explanatory toolbar above it. */
+.emergency-command-verbatim {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.emergency-command-verbatim-tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  color: var(--text-muted);
+  font-size: var(--font-small);
+}
+
+.emergency-command-verbatim-tools > p {
+  margin: 0;
+  flex: 1 1 320px;
+}
+
+.emergency-command-verbatim-tools > button {
+  flex: none;
+}
+
+.emergency-command-verbatim-scroll pre {
+  margin: 0;
+  padding: 14px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

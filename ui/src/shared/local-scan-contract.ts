@@ -3,8 +3,24 @@ export type LocalScanRequest =
   | { action: "configure"; name: string; kind: "gui" | "cli"; arguments: string[] }
   | { action: "remove-engine"; engineId: string }
   | { action: "fetch"; bindingHandle: string; pathHandle: string; scope: "file" | "directory" }
+  | { action: "fetch-container"; bindingHandle: string; snapshotHandle: string; containerHandle: string;
+      path: string; scope: "file" | "directory" }
   | { action: "inspect" | "reveal" | "discard"; bindingHandle: string; fetchId: string }
   | { action: "run"; bindingHandle: string; fetchId: string; engineId: string };
+
+/**
+ * What a child window (the SSH terminal window's file manager) may ask for.
+ * The host injects the binding itself, so the page never sends one — and the
+ * sources that only exist on the main window (a path offer, a container
+ * snapshot) stay unreachable here.
+ */
+export type LocalScanChildRequest =
+  | { action: "engines" }
+  | { action: "configure"; name: string; kind: "gui" | "cli"; arguments: string[] }
+  | { action: "remove-engine"; engineId: string }
+  | { action: "fetch-browser"; browserHandle: string; entryHandle: string; scope: "file" | "directory" }
+  | { action: "inspect" | "reveal" | "discard"; fetchId: string }
+  | { action: "run"; fetchId: string; engineId: string };
 
 export interface LocalScanEngineDto {
   id: string;
@@ -30,6 +46,10 @@ export interface LocalScanFetchDto {
   entries: string[];
   fetchedAt: string;
   expiresInSeconds: number;
+  /** `host` for the target's own filesystem, `container` for a container path. */
+  origin: "host" | "container";
+  /** Who the content came from when it was not the host; empty for `host`. */
+  originLabel: string;
 }
 export type LocalScanResult =
   | { kind: "engines"; engines: LocalScanEngineDto[] }
@@ -38,6 +58,10 @@ export type LocalScanResult =
   | { kind: "done"; detail: string };
 export interface LocalScanApi {
   localScan(request: LocalScanRequest): Promise<LocalScanResult | null>;
+}
+/** The child-window variant: same results, the narrower request set. */
+export interface LocalScanChildApi {
+  localScan(request: LocalScanChildRequest): Promise<LocalScanResult | null>;
 }
 const encoder = new TextEncoder();
 function record(value: unknown): value is Record<string, unknown> {
@@ -62,6 +86,10 @@ export function isLocalScanRequest(value: unknown): value is LocalScanRequest {
     case "fetch":
       return keys.length === 4 && text(value.bindingHandle, 128) && text(value.pathHandle, 128) &&
         (value.scope === "file" || value.scope === "directory");
+    case "fetch-container":
+      return keys.length === 6 && text(value.bindingHandle, 128) && text(value.snapshotHandle, 128) &&
+        text(value.containerHandle, 128) && text(value.path, 4096) && value.path.startsWith("/") &&
+        (value.scope === "file" || value.scope === "directory");
     case "inspect": case "reveal": case "discard":
       return keys.length === 3 && text(value.bindingHandle, 128) && text(value.fetchId, 128);
     case "run":
@@ -77,7 +105,9 @@ function isEngine(value: unknown): value is LocalScanEngineDto {
     (value.kind === "gui" || value.kind === "cli") && text(value.programName, 1024);
 }
 function isFetch(value: unknown): value is LocalScanFetchDto {
-  return record(value) && Object.keys(value).length === 17 &&
+  return record(value) && Object.keys(value).length === 19 &&
+    (value.origin === "host" || value.origin === "container") &&
+    (value.origin === "container" ? bounded(value.originLabel, 256) : value.originLabel === "") &&
     text(value.fetchId, 128) && text(value.path, 4096) && value.path.startsWith("/") &&
     (value.sourceKind === "file" || value.sourceKind === "directory" || value.sourceKind === "other") &&
     (value.scope === "file" || value.scope === "directory") &&
@@ -89,6 +119,26 @@ function isFetch(value: unknown): value is LocalScanFetchDto {
     Array.isArray(value.skippedReasons) && value.skippedReasons.length <= 32 && value.skippedReasons.every((r) => bounded(r, 512)) &&
     Array.isArray(value.entries) && value.entries.length <= 512 && value.entries.every((e) => bounded(e, 1024));
 }
+export function isLocalScanChildRequest(value: unknown): value is LocalScanChildRequest {
+  if (!record(value) || typeof value.action !== "string") return false;
+  const keys = Object.keys(value);
+  switch (value.action) {
+    case "engines": return keys.length === 1;
+    case "configure":
+      return keys.length === 4 && text(value.name, 64) && (value.kind === "gui" || value.kind === "cli") &&
+        Array.isArray(value.arguments) && value.arguments.length <= 16 && value.arguments.every((arg) => bounded(arg, 512));
+    case "remove-engine": return keys.length === 2 && text(value.engineId, 64);
+    case "fetch-browser":
+      return keys.length === 4 && text(value.browserHandle, 128) && text(value.entryHandle, 128) &&
+        (value.scope === "file" || value.scope === "directory");
+    case "inspect": case "reveal": case "discard":
+      return keys.length === 2 && text(value.fetchId, 128);
+    case "run":
+      return keys.length === 3 && text(value.fetchId, 128) && text(value.engineId, 64);
+    default: return false;
+  }
+}
+
 export function isLocalScanResult(value: unknown): value is LocalScanResult {
   if (!record(value) || typeof value.kind !== "string") return false;
   switch (value.kind) {
@@ -106,13 +156,13 @@ export function isLocalScanResult(value: unknown): value is LocalScanResult {
     default: return false;
   }
 }
-export function matchesLocalScanResult(request: LocalScanRequest, result: unknown): result is LocalScanResult | null {
+export function matchesLocalScanResult(request: LocalScanRequest | LocalScanChildRequest, result: unknown): result is LocalScanResult | null {
   if (result === null) return request.action === "configure";
   if (!isLocalScanResult(result)) return false;
   switch (request.action) {
     case "engines": case "configure": case "remove-engine":
       return result.kind === "engines";
-    case "fetch": case "inspect":
+    case "fetch": case "fetch-browser": case "fetch-container": case "inspect":
       return result.kind === "fetch" && (request.action === "inspect" ? result.fetch.fetchId === request.fetchId : true);
     case "run":
       return result.kind === "run";

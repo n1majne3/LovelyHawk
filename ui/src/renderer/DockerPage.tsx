@@ -65,6 +65,7 @@ import { DockerActionDialog } from "./DockerActionDialog";
 import { DockerFileDialog } from "./DockerFileDialog";
 import type { ContainerFilesApi } from "../shared/exec-files-contract";
 import type { DockerForensicsApi } from "../shared/docker-forensics-contract";
+import type { LocalScanApi } from "../shared/local-scan-contract";
 import { DockerForensicsPanel } from "./DockerForensicsPanel";
 import {
   availableDockerActions,
@@ -79,7 +80,7 @@ import "./docker-page.css";
 
 export interface DockerPageProps {
   bindingHandle: string | null;
-  api: DockerReadApi & DockerWriteApi & ContainerFilesApi & DockerForensicsApi;
+  api: DockerReadApi & DockerWriteApi & ContainerFilesApi & DockerForensicsApi & Partial<LocalScanApi>;
   /**
    * Deterministic standalone/SSR fixture; production leaves this unset.
    *

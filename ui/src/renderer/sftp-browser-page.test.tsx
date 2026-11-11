@@ -19,6 +19,7 @@ import {
   sftpBrowserGone,
   sftpOpenFailureMessage,
 } from "./SftpBrowserPage";
+import { menuItems } from "./SftpContextMenu";
 
 const api: SftpBrowserApi & LocalBrowserApi = {
   openLocalBrowser: async () => { throw new Error(); },
@@ -199,3 +200,34 @@ describe("SftpBrowserPage", () => {
   });
 });
 
+
+describe("取回本机扫描 in the file manager", () => {
+  it("offers 取回本机扫描 on files, directories and the current directory, never on links", () => {
+    const file = entries.find((entry) => entry.action === "preview")!;
+    const directory = entries.find((entry) => entry.action === "browse")!;
+    const link = entries.find((entry) => entry.action === "none")!;
+    expect(menuItems(file, true).map((item) => item.action)).toContain("local-scan");
+    expect(menuItems(directory, true).map((item) => item.action)).toContain("local-scan");
+    // The blank-area menu scans the listed folder itself.
+    expect(menuItems(null, true).map((item) => item.action)).toContain("local-scan");
+    expect(menuItems(link, true).map((item) => item.action)).not.toContain("local-scan");
+    expect(menuItems(null, true).find((item) => item.action === "local-scan")?.label).toBe("取回本机扫描");
+    // A window without the scan bridge never shows the item.
+    expect(menuItems(file).map((item) => item.action)).not.toContain("local-scan");
+    expect(menuItems(null).map((item) => item.action)).not.toContain("local-scan");
+  });
+
+  it("gates the toolbar entry on the child api and the stale list like the download", () => {
+    const source = readFileSync(new URL("./SftpBrowserPage.tsx", import.meta.url), "utf8");
+    expect(source).toContain('data-testid="sftp-local-scan"');
+    // Rendered only where the host wired the scan in; disabled on a stale list.
+    expect(source).toContain("api.localScan === undefined ? null");
+    expect(source).toContain("localScan={api.localScan !== undefined}");
+    // The directory handle stands in for the current folder; the page never
+    // sends a path of its own making.
+    expect(source).toContain("entryHandle: directory.directoryHandle");
+    // A stale listing refuses the action before any dialog opens.
+    expect(source.indexOf('if (action === "local-scan")')).toBeGreaterThan(
+      source.indexOf("目录列表已过期"));
+  });
+});

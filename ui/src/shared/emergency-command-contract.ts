@@ -91,6 +91,12 @@ export interface EmergencyCommandResult {
   /** Why those lines were marked, or null when the command marks nothing. */
   findingReason: string | null;
   truncated: boolean;
+  /** The literal command handed to the target, control characters escaped. */
+  command: string;
+  commandTruncated: boolean;
+  /** What the target returned before projection, control characters escaped. */
+  rawOutput: string;
+  rawOutputTruncated: boolean;
   /** The files this output named, at most one per displayed line. */
   paths: EmergencyCommandPathOffer[];
 }
@@ -249,6 +255,16 @@ function catalogText(value: unknown, maximumBytes: number): value is string {
   return text(value, maximumBytes, false) && !/[\u0000-\u001f\u007f]/u.test(value);
 }
 
+/**
+ * The command and raw-output views arrive with control characters already
+ * escaped into printable text, so a raw control character on the wire — any
+ * except the newline and tab the fields legitimately contain — is a violation.
+ */
+function escapedText(value: unknown, maximumBytes: number): value is string {
+  return text(value, maximumBytes, true) &&
+    !/[ --]/u.test(value);
+}
+
 function catalogItem(value: unknown): value is EmergencyCommandCatalogItem {
   return record(value) && exact(value, [
     "commandHandle", "category", "title", "description", "timeoutSeconds",
@@ -309,7 +325,8 @@ function pathOffer(value: unknown): value is EmergencyCommandPathOffer {
 export function isEmergencyCommandResult(value: unknown): value is EmergencyCommandResult {
   if (!record(value) || !exact(value, [
     "snapshotHandle", "commandHandle", "resultKind", "exitCode", "output", "observedLineCount",
-    "displayedLineCount", "findingLines", "findingReason", "truncated", "paths",
+    "displayedLineCount", "findingLines", "findingReason", "truncated",
+    "command", "commandTruncated", "rawOutput", "rawOutputTruncated", "paths",
   ]) || !isEmergencyCommandOpaqueHandle(value.snapshotHandle) ||
     !isEmergencyCommandOpaqueHandle(value.commandHandle) || typeof value.resultKind !== "string" ||
     !resultKindSet.has(value.resultKind) || !signedI32OrNull(value.exitCode) || !text(value.output, 256 * 1_024) ||
@@ -317,8 +334,10 @@ export function isEmergencyCommandResult(value: unknown): value is EmergencyComm
     typeof value.truncated !== "boolean" ||
     !Array.isArray(value.findingLines) || value.findingLines.length > 2_000 ||
     !(value.findingReason === null || catalogText(value.findingReason, 512)) ||
+    !escapedText(value.command, 128 * 1_024) || typeof value.commandTruncated !== "boolean" ||
+    !escapedText(value.rawOutput, 1_024 * 1_024) || typeof value.rawOutputTruncated !== "boolean" ||
     !Array.isArray(value.paths) || value.paths.length > 500 || !value.paths.every(pathOffer) ||
-    !serializedWithin(value, 384 * 1_024)) return false;
+    !serializedWithin(value, 1_536 * 1_024)) return false;
   const lines = outputLines(value.output);
   if (lines.length !== value.displayedLineCount || value.displayedLineCount > value.observedLineCount ||
     !lines.every(outputLine) || value.observedLineCount > value.displayedLineCount && !value.truncated) return false;

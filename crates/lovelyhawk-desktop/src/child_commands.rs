@@ -1161,6 +1161,107 @@ pub async fn terminal_ai_assist<R: Runtime>(
     }
 }
 
+/// 取回本机扫描 for the SSH window's own file manager.
+///
+/// The page never sends a binding: the host injects the binding recorded for
+/// this window, exactly like the SFTP commands. Fetching stays limited to a
+/// file or directory the SFTP browser already offered; `configure` needs the
+/// file dialog and goes through `local_scan_child_configure`, and neither
+/// `program`, `fetch` (a path-offer handle the main window owns) nor
+/// `fetch-container` (a snapshot the main window owns) is accepted here.
+#[tauri::command]
+pub async fn local_scan_child<R: Runtime>(
+    window: WebviewWindow<R>,
+    host: State<'_, Host>,
+    request: Value,
+) -> CommandResult<Value> {
+    let scope = scope(&window, &host)?;
+    if !matches!(scope.kind, ChildKind::Terminal) {
+        return Err(REFUSED_METHOD.to_owned());
+    }
+    let action = request.get("action").and_then(Value::as_str);
+    let fields_ok = request.as_object().is_some_and(|fields| {
+        if fields.is_empty()
+            || fields.len() > 4
+            || !fields.contains_key("action")
+            || fields.contains_key("program")
+            || fields.contains_key("bindingHandle")
+        {
+            return false;
+        }
+        let opaque_field = |key: &str| fields.get(key).and_then(Value::as_str).is_some_and(opaque);
+        match action {
+            Some("engines") => fields.len() == 1,
+            Some("remove-engine") => fields.len() == 2 && opaque_field("engineId"),
+            Some("fetch-browser") => {
+                fields.len() == 4
+                    && opaque_field("browserHandle")
+                    && opaque_field("entryHandle")
+                    && matches!(
+                        fields.get("scope").and_then(Value::as_str),
+                        Some("file" | "directory")
+                    )
+            }
+            Some("inspect") | Some("reveal") | Some("discard") => {
+                fields.len() == 2 && opaque_field("fetchId")
+            }
+            Some("run") => fields.len() == 3 && opaque_field("fetchId") && opaque_field("engineId"),
+            _ => false,
+        }
+    });
+    if !fields_ok {
+        return Err("本机扫描请求无效。".to_owned());
+    }
+    let mut params = request;
+    params["bindingHandle"] = Value::String(scope.binding_handle);
+    host.bridge.call("local.scan", params).await
+}
+
+/// Configuring a scan engine from the SSH window: the program path comes from
+/// the system file dialog on that window, never from the page.
+#[tauri::command]
+pub async fn local_scan_child_configure<R: Runtime>(
+    window: WebviewWindow<R>,
+    host: State<'_, Host>,
+    request: Value,
+) -> CommandResult<Value> {
+    let scope = scope(&window, &host)?;
+    if !matches!(scope.kind, ChildKind::Terminal) {
+        return Err(REFUSED_METHOD.to_owned());
+    }
+    let valid = request.as_object().is_some_and(|fields| {
+        fields.len() == 4
+            && request.get("action").and_then(Value::as_str) == Some("configure")
+            && ["name", "kind"]
+                .iter()
+                .all(|key| fields.get(*key).and_then(Value::as_str).is_some())
+            && fields.get("arguments").is_some_and(Value::is_array)
+            && matches!(
+                fields.get("kind").and_then(Value::as_str),
+                Some("gui" | "cli")
+            )
+    });
+    if !valid {
+        return Err("引擎配置请求无效。".to_owned());
+    }
+    let Some(path) = local_files::choose(
+        &window,
+        "选择本机扫描引擎程序",
+        DialogKind::OpenFile,
+        Some(local_files::Filter {
+            name: "可执行程序",
+            extensions: &["exe", "bat", "cmd", "com"],
+        }),
+    )
+    .await
+    else {
+        return Ok(Value::Null);
+    };
+    let mut params = request;
+    params["program"] = Value::String(path.to_string_lossy().into_owned());
+    host.bridge.call("local.scan", params).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -3,6 +3,11 @@ import { listen } from "@tauri-apps/api/event";
 import { isAiAssistRequest, matchesAiAssistResponse } from "../shared/ai-assist-contract.js";
 import { isLocalBrowserOpaqueHandle, isLocalDirectorySnapshot } from "../shared/local-browser-contract.js";
 import {
+  isLocalScanChildRequest,
+  matchesLocalScanResult,
+  type LocalScanChildRequest,
+} from "../shared/local-scan-contract.js";
+import {
   isSftpBrowserOpaqueHandle,
   isSftpDirectorySnapshot,
   isSftpOperationInput,
@@ -252,6 +257,18 @@ export function createTerminalApi(): TerminalApi {
       if (!isLocalBrowserOpaqueHandle(values[0])) refuse("Invalid local directory request.");
       return checked("local_list", { directoryHandle: values[0] }, TERMINAL_TIMEOUT_MS, isLocalDirectorySnapshot,
         "Invalid local directory listing.");
+    },
+    localScan: async (...values: unknown[]) => {
+      requireArity(values, 1, "Invalid local scan request.");
+      if (!isLocalScanChildRequest(values[0])) refuse("Invalid local scan request.");
+      const request = values[0] as LocalScanChildRequest;
+      const command = request.action === "configure" ? "local_scan_child_configure" : "local_scan_child";
+      const timeoutMs = request.action === "configure" ||
+        request.action === "fetch-browser" ? DIALOG_TIMEOUT_MS : TERMINAL_TIMEOUT_MS;
+      const value = await invokeHost(command, request, timeoutMs);
+      // Null means the system program dialog was cancelled.
+      if (!matchesLocalScanResult(request, value)) refuse("The local scan result is invalid.");
+      return value;
     },
     openFileEditor: async (...values: unknown[]) => {
       requireArity(values, 4, "Invalid file editor launch request.");
