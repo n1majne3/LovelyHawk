@@ -74,6 +74,7 @@ mod postgresql_wire;
 pub mod process_restart;
 pub mod redis_config;
 pub mod report;
+pub(crate) mod scp;
 pub mod services;
 pub mod settings;
 pub mod sftp;

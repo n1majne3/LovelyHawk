@@ -17,6 +17,11 @@ use crate::{CoreError, CoreResult};
 
 pub const FILE_EVIDENCE_LIMITATIONS: &str = "通过 SFTP 两次读取远端文件，并回读本地副本核对 SHA-256；检查采集前后的路径、大小、权限、属主和修改时间。读取可能改变访问时间并增加磁盘与网络负载。SFTP 不提供原子快照、可信 inode 或持续不变证明；不能据此排除两次观测之间的变化或不可信服务器伪造。";
 
+/// Same guarantees as [`FILE_EVIDENCE_LIMITATIONS`], phrased for the classic
+/// scp protocol used when the target exposes no `Subsystem sftp`. The
+/// transport changes, the double-read verification does not.
+pub const FILE_EVIDENCE_LIMITATIONS_SCP: &str = "远端无 SFTP 子系统，经 exec 通道上的经典 SCP 协议两次读取远端文件，并回读本地副本核对 SHA-256；检查采集前后的路径、大小、权限、属主和修改时间。读取可能改变访问时间并增加磁盘与网络负载。exec/SCP 不提供原子快照、可信 inode 或持续不变证明；不能据此排除两次观测之间的变化或不可信服务器伪造。";
+
 /// Directory selected through a native dialog, with fresh names and no overwrite
 /// or recursive cleanup. Cancelled captures deliberately retain labelled partial
 /// bytes: absence of manifest.json means they have not passed collection checks.
@@ -192,8 +197,11 @@ impl FileEvidenceBundle {
             sample_file: self.sample_file.to_owned(),
             case_id: case_id.to_owned(),
             source,
+            limitations: match proof.transport.as_str() {
+                "scp" => FILE_EVIDENCE_LIMITATIONS_SCP.to_owned(),
+                _ => FILE_EVIDENCE_LIMITATIONS.to_owned(),
+            },
             observation: proof,
-            limitations: FILE_EVIDENCE_LIMITATIONS.to_owned(),
             capture,
             pod,
         };
@@ -301,8 +309,37 @@ impl FileEvidenceMetadata {
         })
     }
 
+    fn from_scp_stat(stat: &crate::scp::ScpRemoteStat) -> CoreResult<Self> {
+        if stat.mode & 0o170000 != 0o100000 {
+            return Err(invalid(
+                "source must be a regular file, not a symbolic link or device",
+            ));
+        }
+        if stat.size > MAX_FILE_EVIDENCE_BYTES {
+            return Err(invalid("source exceeds the 512 MiB collection limit"));
+        }
+        Ok(Self {
+            bytes: stat.size,
+            mode: stat.mode,
+            uid: Some(stat.uid),
+            gid: Some(stat.gid),
+            modified_unix_seconds: Some(stat.mtime),
+            accessed_unix_seconds: Some(stat.atime),
+        })
+    }
+
     fn require_same(&self, current: &Metadata) -> CoreResult<()> {
-        let mut current = Self::from_remote(current)?;
+        let current = Self::from_remote(current)?;
+        self.require_same_metadata(&current)
+    }
+
+    fn require_same_scp(&self, current: &crate::scp::ScpRemoteStat) -> CoreResult<()> {
+        let current = Self::from_scp_stat(current)?;
+        self.require_same_metadata(&current)
+    }
+
+    fn require_same_metadata(&self, current: &Self) -> CoreResult<()> {
+        let mut current = current.to_owned();
         // Reading the source may legitimately change atime. Preserve its original
         // observation separately instead of changing it back on the target.
         current.accessed_unix_seconds = self.accessed_unix_seconds;
@@ -321,8 +358,16 @@ pub struct FileEvidenceReadProof {
     pub final_accessed_unix_seconds: Option<u32>,
     pub sha256: String,
     pub bytes: u64,
+    /// How the bytes left the target: "sftp" normally, "scp" when the host
+    /// had no SFTP subsystem and the classic protocol carried the file.
+    #[serde(default = "default_evidence_transport")]
+    pub transport: String,
     pub started_at: chrono::DateTime<chrono::Utc>,
     pub completed_at: chrono::DateTime<chrono::Utc>,
+}
+
+fn default_evidence_transport() -> String {
+    "sftp".to_owned()
 }
 
 pub(crate) async fn collect_sftp_file(
@@ -392,9 +437,142 @@ pub(crate) async fn collect_sftp_file(
         final_accessed_unix_seconds: after.atime,
         sha256,
         bytes,
+        transport: "sftp".to_owned(),
         started_at,
         completed_at: chrono::Utc::now(),
     })
+}
+
+/// Collect over the classic scp protocol instead of SFTP: the target has no
+/// `Subsystem sftp`, so metadata comes from a bounded `stat`/`readlink` probe
+/// and each of the two reads is its own `scp -f` exec channel. The checks are
+/// the same as [`collect_sftp_file`] — canonical path equality, stat equality
+/// around both reads, and byte equality across them.
+pub(crate) async fn collect_scp_file<E, EF, O, OF, I>(
+    exec: &E,
+    open_io: &O,
+    path: &str,
+    destination: std::fs::File,
+    progress: FileEvidenceProgress,
+) -> CoreResult<FileEvidenceReadProof>
+where
+    E: Fn(String) -> EF,
+    EF: std::future::Future<Output = CoreResult<String>>,
+    O: Fn() -> OF,
+    OF: std::future::Future<Output = CoreResult<I>>,
+    I: crate::scp::ScpIo,
+{
+    let started_at = chrono::Utc::now();
+    let stat = scp_remote_stat(exec, path).await?;
+    if stat.canonical_path.is_empty() {
+        return Err(invalid("source canonical path is unavailable"));
+    }
+    if stat.canonical_path != path {
+        return Err(invalid(
+            "source path must be canonical without symbolic links",
+        ));
+    }
+    let metadata = FileEvidenceMetadata::from_scp_stat(&stat)?;
+    progress.total.store(metadata.bytes, Ordering::SeqCst);
+
+    let mut local = tokio::fs::File::from_std(destination);
+    let mut first_io = open_io().await?;
+    let mut first = EvidenceScpSink::new(Some(&mut local), &progress.copied);
+    let header =
+        crate::scp::run_scp_download(&mut first_io, &mut first, metadata.bytes, &|| false).await?;
+    if header.bytes != metadata.bytes {
+        return Err(invalid("source size changed between stat and collection"));
+    }
+    let sha256 = first.digest();
+    local.sync_all().await.map_err(remote_error)?;
+
+    metadata.require_same_scp(&scp_remote_stat(exec, path).await?)?;
+    let mut second_io = open_io().await?;
+    let mut second = EvidenceScpSink::new(None, &progress.verified);
+    crate::scp::run_scp_download(&mut second_io, &mut second, metadata.bytes, &|| false).await?;
+    let second_sha256 = second.digest();
+    let after = scp_remote_stat(exec, path).await?;
+    metadata.require_same_scp(&after)?;
+    if after.canonical_path != stat.canonical_path {
+        return Err(invalid("source canonical path changed during collection"));
+    }
+    if sha256 != second_sha256 {
+        return Err(invalid("source content changed between the two reads"));
+    }
+    local.rewind().await.map_err(remote_error)?;
+    let (_, local_sha256) = copy_and_hash(
+        &mut local,
+        &mut tokio::io::sink(),
+        metadata.bytes,
+        &AtomicU64::new(0),
+    )
+    .await?;
+    if local_sha256 != sha256 {
+        return Err(invalid("saved bytes did not match the collected content"));
+    }
+    Ok(FileEvidenceReadProof {
+        remote_path: path.to_owned(),
+        canonical_path: stat.canonical_path,
+        metadata,
+        final_accessed_unix_seconds: Some(after.atime),
+        sha256,
+        bytes: header.bytes,
+        transport: "scp".to_owned(),
+        started_at,
+        completed_at: chrono::Utc::now(),
+    })
+}
+
+async fn scp_remote_stat<E, EF>(exec: &E, path: &str) -> CoreResult<crate::scp::ScpRemoteStat>
+where
+    E: Fn(String) -> EF,
+    EF: std::future::Future<Output = CoreResult<String>>,
+{
+    let output = exec(crate::scp::scp_stat_command(path)).await?;
+    crate::scp::parse_scp_stat(&output, path)
+}
+
+/// Streams scp payload bytes into the evidence file and/or just the digest,
+/// reporting progress exactly like the SFTP copies do.
+struct EvidenceScpSink<'a> {
+    file: Option<&'a mut tokio::fs::File>,
+    digest: Sha256,
+    progress: &'a AtomicU64,
+    written: u64,
+}
+
+impl<'a> EvidenceScpSink<'a> {
+    fn new(file: Option<&'a mut tokio::fs::File>, progress: &'a AtomicU64) -> Self {
+        Self {
+            file,
+            digest: Sha256::new(),
+            progress,
+            written: 0,
+        }
+    }
+
+    fn digest(self) -> String {
+        format!("{:x}", self.digest.finalize())
+    }
+}
+
+impl crate::scp::ScpSink for EvidenceScpSink<'_> {
+    async fn write(&mut self, bytes: &[u8]) -> CoreResult<()> {
+        if let Some(file) = self.file.as_deref_mut() {
+            file.write_all(bytes).await.map_err(remote_error)?;
+        }
+        self.digest.update(bytes);
+        self.written += bytes.len() as u64;
+        self.progress.store(self.written, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn finish(&mut self) -> CoreResult<()> {
+        if let Some(file) = self.file.as_deref_mut() {
+            file.flush().await.map_err(remote_error)?;
+        }
+        Ok(())
+    }
 }
 
 async fn copy_and_hash(
@@ -563,6 +741,7 @@ mod tests {
             final_accessed_unix_seconds: None,
             sha256: "ab".repeat(32),
             bytes: 3,
+            transport: "sftp".to_owned(),
             started_at: now,
             completed_at: now,
         };
@@ -659,6 +838,7 @@ mod tests {
             final_accessed_unix_seconds: None,
             sha256: "ab".repeat(32),
             bytes: 3,
+            transport: "sftp".to_owned(),
             started_at: now,
             completed_at: now,
         }

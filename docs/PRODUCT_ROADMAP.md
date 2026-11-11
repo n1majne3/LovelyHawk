@@ -86,7 +86,7 @@
   - 批量多文件传输队列（逐项进度、部分失败可见、重试）。
   - 双主机中转传输（失陷机 → 本地 → 分析机，两条连接分别授权，凭据不交叉）。
   - 大文件断点续传与分段限速（文件证据单文件上限 512 MiB，`file_evidence.rs` 现为非递归单文件；超大文件目前只能放弃）。
-- SCP 协议回退：部分目标没有 SFTP 子系统（运维2 的 sshd_config 只有 7 行、没有 Subsystem；现有代码能识别并说明原因，`ssh.rs:47`，但文件功能全部不可用；关闭 `Subsystem sftp` 的 sshd、精简或嵌入式 SSH 服务、只提供 exec 通道的跳板），现有文件管理、文件证据与上传下载在这些机器上全部不可用。需在连接预检探测 SFTP 可用性，不可用时经 exec 通道回退到经典 SCP 协议（`scp -f`/`scp -t` 的 T/C/U 行握手）覆盖上传与下载，界面明确降级说明（rename、chmod 语义与目录递归差异，列表继续用 exec 命令实现）。实现走 core 内嵌协议解析，不调用本机 ssh/scp 二进制；注意 OpenSSH 9+ 的 scp 命令行默认改走 SFTP，需显式经典协议语义。拖放路径按安全要求保持关闭。
+- ~~SCP 协议回退~~：已实现第一版并经真实 Dropbear 靶机（无 `Subsystem sftp`、无 sftp-server）验证。core 内嵌经典 SCP 协议（`scp.rs`，T/C 行握手与 ACK，不调用本机 ssh/scp 二进制）；`sftp_on_handle` 在子系统请求/握手失败且判定为"子系统缺失"时对 `DownloadNew`/`UploadNew`/`CollectFileEvidence` 回退，其余变体保留原始错误。回退侧远端 `scp` 存在性探测走白名单解析；`collect_scp_file` 复刻 SFTP 留证的双读+stat 一致性+SHA-256 核对，canonical 路径经 `readlink` 标记核对；上传要求绝对路径、父目录存在且拒绝覆盖既有路径（对齐 SFTP `EXCLUDE` 语义），失败清理远端半成品。证据 manifest 记 `transport: "scp"` 并附 SCP 版限制说明；无 SFTP 时报错明确告知浏览/修改不可用、留证仍可走 SCP。验证：`tools/lab/probe-scp-fallback.mjs` 8/8（连接、SFTP 面如实失败、路径句柄、留证字节与摘要一致、manifest 标记）。已知缺口：交互式文件浏览器仍需 SFTP 列表无法在此类目标打开（exec 版降级列表未做，rename/chmod/目录递归无对应语义），DownloadNew/UploadNew 传输层已就绪但目前仅有 Java 热更新等少数调用方可达，连接预检的 SFTP 可用性探测与界面降级说明未做。
 
 ### 流量分析
 

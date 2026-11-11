@@ -3157,7 +3157,12 @@ async fn sftp_on_handle(
                 .take();
             let sftp = match cached {
                 Some(sftp) => sftp,
-                None => open_sftp(&handle).await?,
+                None => match open_sftp(&handle).await {
+                    Ok(sftp) => sftp,
+                    Err(error) => {
+                        return scp_fallback_on_handle(&handle, error, Box::new(request)).await;
+                    }
+                },
             };
             let result = sftp_request(&sftp, request).await;
             if result.is_ok()
@@ -4155,6 +4160,341 @@ async fn open_sftp(handle: &Handle<ClientHandler>) -> CoreResult<SftpSession> {
     SftpSession::new(channel.into_stream())
         .await
         .map_err(|error| CoreError::ssh(SFTP_HANDSHAKE_OPERATION, error.to_string()))
+}
+
+// --- Classic SCP fallback ---------------------------------------------------
+//
+// A host with no `Subsystem sftp` loses every file feature the workbench
+// has. Pure-transfer requests degrade to the wire protocol a remote
+// `scp -f`/`scp -t` still speaks (crate::scp); requests that need SFTP
+// semantics keep their original error.
+
+/// Whether the failed subsystem open is the absence-of-SFTP shape that the
+/// fallback answers, as opposed to a dead session or a refused channel.
+fn sftp_subsystem_missing(error: &CoreError) -> bool {
+    matches!(
+        error,
+        CoreError::Ssh { operation, .. }
+            if *operation == "request SFTP subsystem" || *operation == SFTP_HANDSHAKE_OPERATION
+    )
+}
+
+/// An exec channel carrying the scp wire protocol, owned so it closes with
+/// the transfer instead of leaking a detached remote process.
+struct ChannelScpIo {
+    channel: russh::Channel<Msg>,
+    exit_status: Option<u32>,
+}
+
+impl crate::scp::ScpIo for ChannelScpIo {
+    async fn next(&mut self) -> CoreResult<crate::scp::ScpIoEvent> {
+        loop {
+            match self.channel.wait().await {
+                Some(ChannelMsg::Data { data }) => {
+                    return Ok(crate::scp::ScpIoEvent::Data(data.to_vec()));
+                }
+                Some(ChannelMsg::ExtendedData { data, .. }) => {
+                    return Ok(crate::scp::ScpIoEvent::Stderr(data.to_vec()));
+                }
+                Some(ChannelMsg::ExitStatus { exit_status }) => {
+                    self.exit_status = Some(exit_status);
+                }
+                Some(_) => {}
+                None => return Ok(crate::scp::ScpIoEvent::Eof),
+            }
+        }
+    }
+
+    async fn write(&mut self, bytes: &[u8]) -> CoreResult<()> {
+        self.channel
+            .data(bytes)
+            .await
+            .map_err(|error| CoreError::ssh(crate::scp::SCP_TRANSFER_OPERATION, error.to_string()))
+    }
+
+    async fn send_eof(&mut self) -> CoreResult<()> {
+        self.channel
+            .eof()
+            .await
+            .map_err(|error| CoreError::ssh(crate::scp::SCP_TRANSFER_OPERATION, error.to_string()))
+    }
+
+    fn exit_status(&self) -> Option<u32> {
+        self.exit_status
+    }
+}
+
+async fn open_scp_channel(
+    handle: &Handle<ClientHandler>,
+    command: String,
+) -> CoreResult<ChannelScpIo> {
+    let channel = handle
+        .channel_open_session()
+        .await
+        .map_err(|error| CoreError::ssh("open SCP channel", error.to_string()))?;
+    channel
+        .exec(true, command.as_str())
+        .await
+        .map_err(|error| CoreError::ssh(crate::scp::SCP_TRANSFER_OPERATION, error.to_string()))?;
+    Ok(ChannelScpIo {
+        channel,
+        exit_status: None,
+    })
+}
+
+/// A short exec the SCP fallback leans on for stat/probe work. Plain output
+/// is what the protocol parsers consume; nothing here is trusted structure.
+async fn scp_exec(handle: &Handle<ClientHandler>, command: String) -> CoreResult<String> {
+    execute_command(handle, command, Duration::from_secs(30))
+        .await
+        .map(|output| output.output)
+}
+
+/// The remote `scp` binary, or a clear gap when the host has neither the
+/// SFTP subsystem nor a reachable scp.
+async fn scp_ensure_remote(handle: &Handle<ClientHandler>) -> CoreResult<String> {
+    let output = scp_exec(handle, crate::scp::scp_probe_command().to_owned()).await?;
+    crate::scp::parse_scp_probe(&output).ok_or_else(|| {
+        CoreError::ssh(
+            crate::scp::SCP_TRANSFER_OPERATION,
+            "目标没有 SFTP 子系统，也找不到可用的 scp 命令，此主机暂不支持文件传输",
+        )
+    })
+}
+
+async fn scp_remote_stat(
+    handle: &Handle<ClientHandler>,
+    path: &str,
+) -> CoreResult<crate::scp::ScpRemoteStat> {
+    let output = scp_exec(handle, crate::scp::scp_stat_command(path)).await?;
+    crate::scp::parse_scp_stat(&output, path)
+}
+
+/// Writes transfer bytes into the freshly created local file.
+struct ScpLocalFileSink<'a> {
+    file: &'a mut tokio::fs::File,
+}
+
+impl crate::scp::ScpSink for ScpLocalFileSink<'_> {
+    async fn write(&mut self, bytes: &[u8]) -> CoreResult<()> {
+        self.file
+            .write_all(bytes)
+            .await
+            .map_err(|error| CoreError::ssh(crate::scp::SCP_TRANSFER_OPERATION, error.to_string()))
+    }
+
+    async fn finish(&mut self) -> CoreResult<()> {
+        self.file
+            .flush()
+            .await
+            .map_err(|error| CoreError::ssh(crate::scp::SCP_TRANSFER_OPERATION, error.to_string()))
+    }
+}
+
+async fn scp_download_new(
+    handle: &Handle<ClientHandler>,
+    remote_path: &str,
+    local_path: &Path,
+    maximum_bytes: u64,
+    cancel: &SftpTransferCancel,
+) -> CoreResult<u64> {
+    if cancel.is_cancelled() {
+        return Err(CoreError::validation("SFTP transfer", TRANSFER_CANCELLED));
+    }
+    if tokio::fs::try_exists(local_path)
+        .await
+        .map_err(|source| CoreError::io("inspect download target", local_path, source))?
+    {
+        return Err(CoreError::validation(
+            "download target",
+            "refuses to overwrite an existing local path",
+        ));
+    }
+    let program = scp_ensure_remote(handle).await?;
+    let stat = scp_remote_stat(handle, remote_path).await?;
+    if stat.kind != crate::scp::ScpRemoteKind::Regular || stat.size > maximum_bytes {
+        return Err(CoreError::validation(
+            "download source",
+            format!("must be a regular file no larger than {maximum_bytes} bytes"),
+        ));
+    }
+    let _parent = local_path
+        .parent()
+        .ok_or_else(|| CoreError::validation("download target", "must have a parent directory"))?;
+    let _file_name = local_path
+        .file_name()
+        .ok_or_else(|| CoreError::validation("download target", "must have a file name"))?;
+    let mut io = open_scp_channel(
+        handle,
+        crate::scp::scp_source_command(&program, remote_path),
+    )
+    .await?;
+    let mut options = tokio::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    let mut local = options
+        .open(local_path)
+        .await
+        .map_err(|source| CoreError::io("create download file", local_path, source))?;
+    let mut partial = PartialDownload {
+        path: local_path,
+        finished: false,
+    };
+    let header = {
+        let mut sink = ScpLocalFileSink { file: &mut local };
+        crate::scp::run_scp_download(&mut io, &mut sink, maximum_bytes, &|| cancel.is_cancelled())
+            .await?
+    };
+    if header.bytes != stat.size {
+        return Err(CoreError::ssh(
+            "download file",
+            "remote sent a different size than the stat probe reported",
+        ));
+    }
+    local
+        .sync_all()
+        .await
+        .map_err(|source| CoreError::io("sync downloaded file", local_path, source))?;
+    partial.finished = true;
+    Ok(header.bytes)
+}
+
+async fn scp_upload_new(
+    handle: &Handle<ClientHandler>,
+    local_path: &Path,
+    remote_path: &str,
+    maximum_bytes: u64,
+    cancel: &SftpTransferCancel,
+) -> CoreResult<u64> {
+    if cancel.is_cancelled() {
+        return Err(CoreError::validation("SFTP transfer", TRANSFER_CANCELLED));
+    }
+    let metadata = tokio::fs::metadata(local_path)
+        .await
+        .map_err(|source| CoreError::io("inspect staged upload", local_path, source))?;
+    if !metadata.is_file() || metadata.len() > maximum_bytes {
+        return Err(CoreError::validation(
+            "staged upload",
+            format!("must be a regular file no larger than {maximum_bytes} bytes"),
+        ));
+    }
+    let program = scp_ensure_remote(handle).await?;
+    let (directory, name) = crate::scp::scp_upload_target(remote_path)?;
+    // Same contract the SFTP path gives: refuse to overwrite, insist the
+    // parent is a real directory.
+    let check = format!(
+        "if [ -e {dest} ]; then echo LH_EXISTS; fi; if [ -d {dir} ]; then echo LH_DIR; fi",
+        dest = crate::shell_escape::shq(remote_path),
+        dir = crate::shell_escape::shq(&directory),
+    );
+    let answer = scp_exec(handle, check).await?;
+    if answer.contains("LH_EXISTS") {
+        return Err(CoreError::validation(
+            "upload target",
+            "refuses to overwrite an existing remote path",
+        ));
+    }
+    if !answer.contains("LH_DIR") {
+        return Err(CoreError::validation(
+            "upload target",
+            "parent must be an existing remote directory",
+        ));
+    }
+    let mut io =
+        open_scp_channel(handle, crate::scp::scp_sink_command(&program, &directory)).await?;
+    let header = crate::scp::ScpFileHeader {
+        mode: 0o644,
+        bytes: metadata.len(),
+        name,
+    };
+    let mut local = tokio::fs::File::open(local_path)
+        .await
+        .map_err(|source| CoreError::io("open staged upload", local_path, source))?;
+    if let Err(error) =
+        crate::scp::run_scp_upload(&mut io, &header, &mut local, &|| cancel.is_cancelled()).await
+    {
+        // scp -t writes the final name in place; a partial upload is a
+        // half-written file the target did not ask for.
+        let _ = scp_exec(
+            handle,
+            format!("rm -f -- {}", crate::shell_escape::shq(remote_path)),
+        )
+        .await;
+        return Err(error);
+    }
+    // Independent check: the remote file now exists with the size sent.
+    let stat = scp_remote_stat(handle, remote_path).await?;
+    if stat.size != metadata.len() || stat.kind != crate::scp::ScpRemoteKind::Regular {
+        let _ = scp_exec(
+            handle,
+            format!("rm -f -- {}", crate::shell_escape::shq(remote_path)),
+        )
+        .await;
+        return Err(CoreError::ssh(
+            "upload file",
+            "post-upload stat did not match the staged file",
+        ));
+    }
+    Ok(metadata.len())
+}
+
+async fn scp_collect_evidence(
+    handle: &Handle<ClientHandler>,
+    remote_path: &str,
+    destination: std::fs::File,
+    progress: crate::file_evidence::FileEvidenceProgress,
+) -> CoreResult<crate::file_evidence::FileEvidenceReadProof> {
+    let program = scp_ensure_remote(handle).await?;
+    let exec = |command: String| scp_exec(handle, command);
+    let open_io = || {
+        open_scp_channel(
+            handle,
+            crate::scp::scp_source_command(&program, remote_path),
+        )
+    };
+    crate::file_evidence::collect_scp_file(&exec, &open_io, remote_path, destination, progress)
+        .await
+}
+
+/// Where an SFTP request goes when the subsystem is absent: the requests
+/// that only need bytes move to the classic protocol, the rest keep the
+/// subsystem error so the operator sees the real cause.
+async fn scp_fallback_on_handle(
+    handle: &Handle<ClientHandler>,
+    error: CoreError,
+    request: Box<SftpRequest>,
+) -> CoreResult<SftpResponse> {
+    if !sftp_subsystem_missing(&error) {
+        return Err(error);
+    }
+    match *request {
+        SftpRequest::DownloadNew {
+            remote_path,
+            local_path,
+            maximum_bytes,
+            cancel,
+        } => scp_download_new(handle, &remote_path, &local_path, maximum_bytes, &cancel)
+            .await
+            .map(|bytes| SftpResponse::Transfer { bytes }),
+        SftpRequest::UploadNew {
+            local_path,
+            remote_path,
+            maximum_bytes,
+            cancel,
+        } => scp_upload_new(handle, &local_path, &remote_path, maximum_bytes, &cancel)
+            .await
+            .map(|bytes| SftpResponse::Transfer { bytes }),
+        SftpRequest::CollectFileEvidence {
+            remote_path,
+            destination,
+            progress,
+        } => scp_collect_evidence(handle, &remote_path, destination, progress)
+            .await
+            .map(SftpResponse::FileEvidence),
+        _ => Err(CoreError::ssh(
+            "request SFTP subsystem",
+            "目标没有 SFTP 子系统：目录浏览与文件修改不可用；应急留证采集仍可通过 SCP 通道完成",
+        )),
+    }
 }
 
 async fn sftp_request(sftp: &SftpSession, request: SftpRequest) -> CoreResult<SftpResponse> {
