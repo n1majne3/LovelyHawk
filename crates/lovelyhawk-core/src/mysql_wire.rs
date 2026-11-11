@@ -78,6 +78,11 @@ impl MysqlConnectError {
             error: invalid(reason),
         }
     }
+
+    /// Wrap an already-shaped error under a failure class.
+    pub(crate) fn classified(class: MysqlConnectClass, error: CoreError) -> Self {
+        Self { class, error }
+    }
 }
 
 impl From<MysqlConnectError> for CoreError {
