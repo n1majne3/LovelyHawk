@@ -78,6 +78,20 @@ export function rowActionFailureText(error: unknown): string {
       return "新口令不符合要求：12–1024 字节、不含控制字符、至少包含大写/小写/数字/其他中的三类、不含账号名。";
     case "system-info-account-password-changed":
       return "这个账户的口令记录在计划之后变了，这次没有写入。请刷新账户状态后再操作。";
+    case "system-info-process-restart-session":
+      return "这个进程在本次 SSH 连接自己的进程链上，停掉它会切断连接。请换一条连接或手动处理。";
+    case "system-info-process-restart-init":
+      return "1 号进程和内核线程不能走这个通道，请用系统自带方式处理。";
+    case "system-info-process-restart-managed":
+      return "这个进程由 init 系统托管，请改用对应服务的启动/停止操作，避免与托管状态脱节。";
+    case "system-info-process-restart-privilege":
+      return "需要进程属主、root 或免密 sudo 才能停止并按原用户重新拉起，这次没有改动。";
+    case "system-info-process-restart-tools":
+      return "目标机缺少 setsid，无法安全地脱离会话拉起进程，这次没有改动。";
+    case "system-info-process-restart-cwd":
+      return "读取不到原工作目录（可能已删除），按原样拉起会落空；请手动确认后重启。";
+    case "system-info-process-restart-changed":
+      return "这个进程在计划之后已经退出或被替换，这次没有动它。请刷新进程列表后再操作。";
     case "system-info-firewall-privilege":
       return "修改防火墙规则需要 root 或免密码 sudo。当前账户没有这个权限，这次没有改动。";
     case "system-info-firewall-ufw":

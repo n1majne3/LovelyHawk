@@ -3007,6 +3007,13 @@ impl SystemInfoTable {
         })
     }
 
+    /// Which pid a restart would act on — only the process inventory resolves
+    /// one.
+    pub fn process_restart_request(&self, row_id: &str) -> CoreResult<u32> {
+        let (_, pid) = self.process_row(row_id)?;
+        Ok(pid)
+    }
+
     fn service_row(&self, row_id: &str) -> CoreResult<(&SystemInfoRow, String)> {
         if self.tab != SystemInfoTab::Services {
             return Err(CoreError::validation(

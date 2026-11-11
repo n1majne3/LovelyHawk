@@ -20,7 +20,7 @@ const PROTOCOL = "lovelyhawk-backend/v1";
  * backend in-process, so an open window no longer holds this file.)
  */
 export function backendBinary() {
-  return process.env.LOVELYHAWK_BACKEND_BIN ?? "D:/LovelyRes/target/debug/lovelyhawk-backend.exe";
+  return process.env.LOVELYHAWK_BACKEND_BIN ?? "D:/code/LovelyHawk/target/debug/lovelyhawk-backend.exe";
 }
 
 export class Sidecar {

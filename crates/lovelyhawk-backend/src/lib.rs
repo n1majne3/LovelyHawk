@@ -4838,6 +4838,64 @@ fn system_info_failure(error: SystemInfoApiError) -> RpcFailure {
                         "Blocking that address inbound would cut this SSH session.",
                     )
                 }
+                CoreError::Validation { subject, .. }
+                    if *subject
+                        == lovelyhawk_core::process_restart::RESTART_SESSION_REFUSAL =>
+                {
+                    (
+                        "system-info-process-restart-session",
+                        "That process sits in this SSH connection's own chain.",
+                    )
+                }
+                CoreError::Validation { subject, .. }
+                    if *subject == lovelyhawk_core::process_restart::RESTART_INIT_REFUSAL =>
+                {
+                    (
+                        "system-info-process-restart-init",
+                        "PID 1 and kernel threads are not restartable here.",
+                    )
+                }
+                CoreError::Validation { subject, .. }
+                    if *subject == lovelyhawk_core::process_restart::RESTART_MANAGED_REFUSAL =>
+                {
+                    (
+                        "system-info-process-restart-managed",
+                        "The process is managed by an init system; use its service action.",
+                    )
+                }
+                CoreError::Validation { subject, .. }
+                    if *subject
+                        == lovelyhawk_core::process_restart::RESTART_PRIVILEGE_REFUSAL =>
+                {
+                    (
+                        "system-info-process-restart-privilege",
+                        "The operator cannot stop this process or relaunch as its user.",
+                    )
+                }
+                CoreError::Validation { subject, .. }
+                    if *subject == lovelyhawk_core::process_restart::RESTART_TOOLS_REFUSAL =>
+                {
+                    (
+                        "system-info-process-restart-tools",
+                        "The host lacks the tools needed to detach a relaunched process.",
+                    )
+                }
+                CoreError::Validation { subject, .. }
+                    if *subject == lovelyhawk_core::process_restart::RESTART_CWD_REFUSAL =>
+                {
+                    (
+                        "system-info-process-restart-cwd",
+                        "The process's original working directory cannot be read.",
+                    )
+                }
+                CoreError::Validation { subject, .. }
+                    if *subject == lovelyhawk_core::process_restart::RESTART_CHANGED_REFUSAL =>
+                {
+                    (
+                        "system-info-process-restart-changed",
+                        "The process exited or was replaced after the plan was made.",
+                    )
+                }
                 _ => (
                     "system-info-action-unavailable",
                     "That action does not apply to the selected row any more.",

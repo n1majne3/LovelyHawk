@@ -28,6 +28,7 @@ use lovelyhawk_core::{
         FirewallDirection,
     },
     operations::{DangerousConfirmation, OperationPlan, VerificationResult},
+    process_restart::ProcessRestartPlan,
     system_info::{
         ArtifactInvestigationAction, ArtifactMutationAction, ArtifactMutationPlan,
         BootScriptRuntimePlan, COMMAND_TIMEOUT_MARKER, CronInvestigationAction,
@@ -68,6 +69,9 @@ const EXECUTE_DEADLINE: Duration = Duration::from_secs(120);
 pub(crate) enum RowAction {
     ProcessInspect(ProcessInvestigationAction),
     ProcessSignal(ProcessSignal),
+    /// `process.restart` — stop a hand-started process and relaunch it with
+    /// its captured argv/cwd/user.
+    ProcessRestart,
     ServiceInspect(ServiceInvestigationAction),
     ServiceRuntime(ServiceRuntimeAction),
     UserInspect(UserInvestigationAction),
@@ -89,6 +93,7 @@ impl RowAction {
         match self {
             Self::ProcessInspect(action) => format!("process.{}", kebab(action)),
             Self::ProcessSignal(signal) => format!("process.signal.{}", kebab(signal)),
+            Self::ProcessRestart => "process.restart".to_owned(),
             Self::ServiceInspect(action) => format!("service.{}", kebab(action)),
             Self::ServiceRuntime(action) => format!("service.runtime.{}", kebab(action)),
             Self::UserInspect(action) => format!("user.{}", kebab(action)),
@@ -135,6 +140,7 @@ impl RowAction {
         match family {
             "process" => match rest.strip_prefix("signal.") {
                 Some(signal) => from_kebab(signal).map(Self::ProcessSignal),
+                None if rest == "restart" => Some(Self::ProcessRestart),
                 None => from_kebab(rest).map(Self::ProcessInspect),
             },
             "service" => match rest.strip_prefix("runtime.") {
@@ -215,6 +221,7 @@ impl RowAction {
         match self {
             Self::ProcessInspect(action) => action.label(),
             Self::ProcessSignal(signal) => signal.label(),
+            Self::ProcessRestart => "按原命令行重启",
             Self::ServiceInspect(action) => action.label(),
             Self::ServiceRuntime(action) => action.label(),
             Self::UserInspect(action) => action.label(),
@@ -233,6 +240,7 @@ impl RowAction {
         matches!(
             self,
             Self::ProcessSignal(_)
+                | Self::ProcessRestart
                 | Self::ServiceRuntime(_)
                 | Self::UserAccount(_)
                 | Self::UserPassword
@@ -246,7 +254,10 @@ impl RowAction {
     /// still confirmed through a plan, but is not painted red.
     const fn dangerous(self) -> bool {
         match self {
-            Self::ProcessSignal(_) | Self::NetworkDisconnect | Self::ArtifactMutation(_) => true,
+            Self::ProcessSignal(_)
+            | Self::ProcessRestart
+            | Self::NetworkDisconnect
+            | Self::ArtifactMutation(_) => true,
             Self::ServiceRuntime(action) => matches!(
                 action,
                 ServiceRuntimeAction::Stop
@@ -271,6 +282,7 @@ impl RowAction {
             Self::NetworkInspect(action) => (kebab(action.group()), action.group().label()),
             Self::ArtifactInspect(_) => ("inspect".to_owned(), "排查"),
             Self::ProcessSignal(_)
+            | Self::ProcessRestart
             | Self::ServiceRuntime(_)
             | Self::UserAccount(_)
             | Self::UserPassword
@@ -289,6 +301,7 @@ impl RowAction {
                 actions.extend(
                     [ProcessSignal::Terminate, ProcessSignal::Kill].map(Self::ProcessSignal),
                 );
+                actions.push(Self::ProcessRestart);
             }
             SystemInfoTab::Services => {
                 actions.extend(ServiceInvestigationAction::ALL.map(Self::ServiceInspect));
@@ -424,6 +437,7 @@ fn applies(table: &SystemInfoTable, row_id: &str, action: RowAction) -> bool {
             table.process_investigation_request(row_id, inner).is_ok()
         }
         RowAction::ProcessSignal(inner) => table.process_signal_request(row_id, inner).is_ok(),
+        RowAction::ProcessRestart => table.process_restart_request(row_id).is_ok(),
         RowAction::ServiceInspect(inner) => {
             table.service_investigation_request(row_id, inner).is_ok()
         }
@@ -582,6 +596,7 @@ struct RowScope {
 
 enum RowPlan {
     ProcessSignal(ProcessSignalPlan),
+    ProcessRestart(ProcessRestartPlan),
     ServiceRuntime(ServiceRuntimePlan),
     /// The same request on a host that boots with scripts instead of units.
     BootScriptRuntime(BootScriptRuntimePlan),
@@ -595,6 +610,7 @@ impl RowPlan {
     fn definition(&self) -> &OperationPlan {
         match self {
             Self::ProcessSignal(plan) => plan.definition(),
+            Self::ProcessRestart(plan) => plan.definition(),
             Self::ServiceRuntime(plan) => plan.definition(),
             Self::BootScriptRuntime(plan) => plan.definition(),
             Self::UserAccount(plan) => plan.definition(),
@@ -790,6 +806,7 @@ impl SystemInfoApi {
                     Ok((result.output, result.truncated))
                 }
                 RowAction::ProcessSignal(_)
+                | RowAction::ProcessRestart
                 | RowAction::ServiceRuntime(_)
                 | RowAction::UserAccount(_)
                 | RowAction::UserPassword
@@ -851,6 +868,13 @@ impl SystemInfoApi {
                         .plan_process_signal(&session, &request)
                         .await
                         .map(RowPlan::ProcessSignal)
+                }
+                RowAction::ProcessRestart => {
+                    let pid = table.process_restart_request(row_id)?;
+                    service
+                        .plan_process_restart(&session, row_id, pid)
+                        .await
+                        .map(RowPlan::ProcessRestart)
                 }
                 RowAction::ServiceRuntime(inner) => {
                     // Which of the two this row is was decided by the row
@@ -986,6 +1010,10 @@ impl SystemInfoApi {
                         .execute_process_signal(&session, plan, confirmation, journal)
                         .await
                         .map(|outcome| (outcome.verification, false)),
+                    RowPlan::ProcessRestart(plan) => service
+                        .execute_process_restart(&session, plan, confirmation, journal)
+                        .await
+                        .map(|outcome| (outcome.verification, outcome.relaunched_after_failure)),
                     RowPlan::ServiceRuntime(plan) => service
                         .execute_service_runtime(&session, plan, confirmation, journal)
                         .await
@@ -1698,7 +1726,7 @@ mod tests {
         assert!(actions.iter().any(|(group, key, dangerous)| {
             group == "change" && key == "process.signal.kill" && *dangerous
         }));
-        assert_eq!(actions.len(), ProcessInvestigationAction::ALL.len() + 2);
+        assert_eq!(actions.len(), ProcessInvestigationAction::ALL.len() + 3);
         // The change group comes last, after every read-only group.
         let first_change = actions
             .iter()

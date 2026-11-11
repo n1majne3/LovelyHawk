@@ -67,6 +67,7 @@ pub mod postgresql_observation;
 pub mod postgresql_process;
 pub mod postgresql_role_graph;
 mod postgresql_wire;
+pub mod process_restart;
 pub mod redis_config;
 pub mod report;
 pub mod services;
