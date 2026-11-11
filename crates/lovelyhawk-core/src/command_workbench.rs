@@ -741,6 +741,190 @@ done
 "#
 );
 
+const ACCESS_LOG_TRACE: &str = bounded_observation!(
+    r#"
+printf '# 读取 nginx/apache 访问日志尾部各 256 KiB，统计样本窗口内被请求脚本路径的方法分布。\n'
+printf '# 线索：路径含点号隐藏段、样本内仅 POST、疑似随机命名、含 .. 或 PUT/DELETE/TRACE/CONNECT 的脚本；均需人工核对，不等于 WebShell。\n'
+printf '# URI 按原样拼接常见站点根核对存在性；URL 编码、路径规范化与自定义日志位置可能造成漏判。\n'
+command -v tail >/dev/null 2>&1 || { printf '工具不可用：%s，本项未执行\n' 'tail'; exit 1; }
+lh_logs='' lh_log_count=0
+for lh_log in /var/log/nginx/*access*.log /var/log/nginx/*access*.log.1 /var/log/apache2/*access*.log /var/log/apache2/*access*.log.1 /var/log/httpd/*access* /usr/local/nginx/logs/*access*.log /usr/local/nginx/logs/*access*.log.1 /usr/local/apache2/logs/*access*.log; do
+  [ -e "$lh_log" ] || continue
+  case "$lh_log" in *.gz|*.xz|*.bz2|*.zst) continue;; esac
+  if [ -L "$lh_log" ] || [ ! -f "$lh_log" ]; then lh_gap "$lh_log：跳过链接或非常规文件。"; continue; fi
+  if [ ! -r "$lh_log" ]; then lh_gap "$lh_log：权限不足，未读取。"; continue; fi
+  lh_parents "$lh_log" || continue
+  lh_step
+  lh_log_count=$((lh_log_count + 1))
+  if [ "$lh_log_count" -gt 32 ]; then lh_log_count=32; lh_gap '访问日志超过 32 个，其余未读取。'; break; fi
+  printf '# 日志：%s\n' "$lh_log"
+  lh_logs=$(printf '%s\n%s' "$lh_logs" "$lh_log")
+done
+if [ "$lh_log_count" -eq 0 ]; then printf '# 未发现 nginx/apache 访问日志；自定义日志位置与压缩轮转文件未覆盖。\n'; fi
+lh_webdirs=''
+for lh_root in /var/www/html /var/www /srv/www/htdocs /srv/www /usr/share/nginx/html /usr/local/nginx/html /usr/local/apache2/htdocs /srv/http /home/*/public_html; do
+  for lh_dir in $lh_root; do
+    [ -d "$lh_dir" ] || continue
+    lh_parents "$lh_dir" || continue
+    lh_webdirs=$(printf '%s\n%s' "$lh_webdirs" "$lh_dir")
+  done
+done
+lh_suspect=$(printf '%s\n' "$lh_logs" | while IFS= read -r lh_log; do
+  [ -n "$lh_log" ] || continue
+  tail -c 262144 "$lh_log" 2>/dev/null || printf '缺口：%s：读取期间日志消失或不可读。\n' "$lh_log" >&2
+done | awk '
+{
+  if (split($0, q, "\"") < 3) next
+  if (split(q[2], r, " ") < 2) next
+  method = r[1]; uri = r[2]
+  if (method !~ /^[A-Z]+$/) next
+  sub(/^https?:\/\/[^\/]+/, "", uri)
+  if (uri !~ /^\//) next
+  sub(/[?#].*$/, "", uri)
+  gsub(/\|/, "?", uri)
+  if (uri == "") next
+  low = tolower(uri)
+  if (low !~ /\.(php[0-9]*|phtml|phar|jspx?|aspx?|ashx|asa|cer|cgi|pl|py)$/) next
+  if (method == "GET") gets[uri]++
+  else if (method == "POST") posts[uri]++
+  else if (method == "PUT" || method == "DELETE" || method == "TRACE" || method == "CONNECT") others[uri]++
+  else next
+  if (uri ~ /\/\.[^\/\.]/) hidden[uri] = 1
+  if (uri ~ /\.\./) trav[uri] = 1
+  base = uri; sub(/^.*\//, "", base)
+  stem = base; sub(/\.[^.]*$/, "", stem)
+  mixed = (stem ~ /[0-9]/ && stem ~ /[a-z]/)
+  novowel = (stem ~ /^[a-z0-9]+$/ && stem !~ /[aeiou]/ && length(stem) >= 6)
+  hexish = (stem ~ /^[a-f0-9]+$/ && length(stem) >= 8)
+  if (mixed && length(stem) <= 32 && (novowel || hexish)) random[uri] = 1
+}
+END {
+  for (u in gets) seen[u] = 1
+  for (u in posts) seen[u] = 1
+  for (u in others) seen[u] = 1
+  count = 0
+  for (u in seen) {
+    reason = ""
+    if (u in hidden) reason = "路径含点号隐藏段"
+    if (u in random) reason = reason (reason == "" ? "" : "+") "文件名疑似随机或编码生成"
+    if (u in trav) reason = reason (reason == "" ? "" : "+") "路径穿越特征"
+    if (posts[u] >= 1 && gets[u] == 0) reason = reason (reason == "" ? "" : "+") "样本内仅 POST 访问"
+    if (others[u] >= 1) reason = reason (reason == "" ? "" : "+") "存在 PUT/DELETE/TRACE/CONNECT"
+    if (reason == "") continue
+    count++
+    if (count <= 64) printf "S|%s|%d|%d|%d|%s\n", u, gets[u], posts[u], others[u], reason
+  }
+  if (count > 64) printf "M|%d\n", count
+}')
+lh_mapped=0
+while IFS='|' read -r lh_tag lh_uri lh_g lh_p lh_o lh_reason; do
+  case "$lh_tag" in
+    M) lh_gap "可疑脚本路径共 $lh_uri 条，仅核对前 64 条。"; continue;;
+    S) ;;
+    *) continue;;
+  esac
+  case "$lh_uri" in
+    *..*|*%*)
+      lh_disk='含 .. 或编码字符，未映射到磁盘';;
+    *)
+      if [ "$lh_mapped" -ge 20 ]; then
+        lh_disk='超出 20 条核对上限，未核对'
+      elif [ -z "$lh_webdirs" ]; then
+        lh_disk='无可用站点根目录'
+      else
+        lh_mapped=$((lh_mapped + 1))
+        lh_disk='未在常见站点根命中'
+        for lh_dir in $lh_webdirs; do
+          lh_step
+          if [ -f "$lh_dir$lh_uri" ]; then lh_disk="存在：$lh_dir$lh_uri"; break; fi
+        done
+      fi;;
+  esac
+  lh_hit "$lh_uri | $lh_reason | GET $lh_g/POST $lh_p/其他 $lh_o | 磁盘：$lh_disk | 需人工核对"
+done <<LH_SUSPECT
+$lh_suspect
+LH_SUSPECT
+"#
+);
+
+const WEB_VERSION_FILES: &str = bounded_observation!(
+    r#"
+printf '# 在常见站点根目录内定位 ThinkPHP、phpMyAdmin、Smarty 的版本文件，每文件读取前 64 KiB。\n'
+printf '# 命中历史风险区间的版本只是版本线索，需人工核对；版本无法识别不代表产品不存在。\n'
+lh_components=0 lh_stop=0
+lh_scan_dir() {
+  lh_tree "$1" vcs || return 1
+  while IFS= read -r lh_file; do
+    [ "$lh_stop" = 0 ] || return 0
+    lh_tree_entry "$lh_file" || continue
+    lh_lower=$(printf '%s' "$lh_file" | tr '[:upper:]' '[:lower:]')
+    lh_product=''
+    case "$lh_lower" in
+      */thinkphp/base.php|*/thinkphp/library/think/app.php|*/thinkphp/thinkphp.php|*/topthink/framework/src/think/app.php) lh_product='ThinkPHP';;
+      */phpmyadmin/doc/html/index.html|*/phpmyadmin/readme|*/phpmyadmin/changelog|*/phpmyadmin/libraries/classes/version.php) lh_product='phpMyAdmin';;
+      */smarty.class.php) lh_product='Smarty';;
+      *) continue;;
+    esac
+    if [ "$lh_components" -ge 64 ]; then
+      lh_gap '组件版本文件达到 64 个，其余未检查。'
+      lh_stop=1
+      return 0
+    fi
+    lh_components=$((lh_components + 1))
+    lh_read "$lh_file" text counted || continue
+    lh_parsed=$(printf '%s\n' "$lh_data" | awk -v product="$lh_product" '
+version == "" {
+  low = tolower($0)
+  if (product == "phpMyAdmin") {
+    at = index(low, "phpmyadmin")
+    if (at > 0) {
+      rest = substr($0, at + 10, 60)
+      if (match(rest, /[0-9]+\.[0-9]+(\.[0-9]+)?/)) version = substr(rest, RSTART, RLENGTH)
+    }
+    if (version == "" && index(low, "version") > 0 && match($0, /[0-9]+\.[0-9]+(\.[0-9]+)?/)) version = substr($0, RSTART, RLENGTH)
+    if (version == "" && $0 ~ /^[[:space:]]*[0-9]+\.[0-9]+\.[0-9]+/ && match($0, /[0-9]+\.[0-9]+(\.[0-9]+)?/)) version = substr($0, RSTART, RLENGTH)
+  } else {
+    needle = (product == "Smarty") ? "_version" : "version"
+    if (index(low, needle) > 0 && match($0, /[0-9]+\.[0-9]+(\.[0-9]+)?/)) version = substr($0, RSTART, RLENGTH)
+  }
+}
+END {
+  risk = ""
+  if (version != "") {
+    split(version, seg, ".")
+    major = seg[1] + 0; minor = seg[2] + 0; patch = seg[3] + 0
+    if (product == "ThinkPHP" && major == 5 && minor <= 1) risk = "ThinkPHP 5.0.x/5.1.x 为公开远程代码执行高发版本区间"
+    if (product == "phpMyAdmin" && (major < 4 || major == 4 && minor < 9)) risk = "phpMyAdmin 4.9 之前存在多项公开漏洞"
+    if (product == "Smarty" && (major < 3 || major == 3 && (minor == 0 || minor == 1 && patch < 45))) risk = "Smarty 3.1.45 之前存在模板注入公开漏洞"
+  }
+  printf "%s|%s\n", version, risk
+}')
+    lh_version=${lh_parsed%%|*}
+    lh_risk=${lh_parsed#*|}
+    if [ -z "$lh_version" ]; then
+      printf '组件：%s | %s | 版本无法识别\n' "$lh_product" "$lh_file"
+    elif [ -n "$lh_risk" ]; then
+      lh_hit "$lh_product | $lh_file | 版本 $lh_version | $lh_risk，需人工核对"
+    else
+      printf '组件：%s | %s | 版本 %s\n' "$lh_product" "$lh_file" "$lh_version"
+    fi
+  done <<LH_VERSION_PATHS
+$lh_paths
+LH_VERSION_PATHS
+}
+for lh_root in /var/www /usr/share/nginx /srv/www /usr/local/nginx/html /usr/local/apache2/htdocs /usr/share/phpmyadmin; do
+  [ "$lh_stop" = 0 ] || break
+  lh_scan_dir "$lh_root"
+done
+for lh_dir in /home/*/public_html; do
+  [ "$lh_stop" = 0 ] || break
+  [ -d "$lh_dir" ] || continue
+  lh_scan_dir "$lh_dir"
+done
+if [ "$lh_components" -eq 0 ]; then printf '# 未发现 ThinkPHP、phpMyAdmin、Smarty 的版本文件；自定义站点目录与其他产品未覆盖。\n'; fi
+"#
+);
+
 static CATALOG: &[CommandDefinition] = &[
     portable!(
         "perm-suid",
@@ -1614,6 +1798,16 @@ static CATALOG: &[CommandDefinition] = &[
     .with_timeout(60)
     .flagging(command_findings::any_hit),
     portable!(
+        "log-web-trace",
+        Logs,
+        "访问日志反查脚本",
+        "从 nginx/apache 访问日志尾部提取隐藏、仅 POST、疑似随机命名等可疑脚本路径，并核对常见站点根下是否存在对应文件；命中为需人工核对的线索，不代表确认 WebShell。",
+        ACCESS_LOG_TRACE
+    )
+    .self_checked()
+    .with_timeout(60)
+    .flagging(command_findings::collection_finding),
+    portable!(
         "log-cron-exec",
         Logs,
         "计划任务执行记录",
@@ -1701,6 +1895,16 @@ static CATALOG: &[CommandDefinition] = &[
     )
     .with_timeout(60)
     .flagging(command_findings::any_hit),
+    portable!(
+        "file-web-version",
+        Files,
+        "Web 组件版本识别",
+        "在常见站点目录定位 ThinkPHP、phpMyAdmin、Smarty 的版本文件并解析版本；命中历史风险区间时标记为需人工核对的版本线索。",
+        WEB_VERSION_FILES
+    )
+    .self_checked()
+    .with_timeout(60)
+    .flagging(command_findings::collection_finding),
     portable!(
         "file-symlink",
         Files,
@@ -3002,8 +3206,10 @@ Permission denied"
             ("persistence-pam", CommandCategory::Persistence),
             ("persistence-command-wrapper", CommandCategory::Persistence),
             ("log-shell-history", CommandCategory::Logs),
+            ("log-web-trace", CommandCategory::Logs),
             ("file-webshell-hint", CommandCategory::Files),
             ("file-credential", CommandCategory::Files),
+            ("file-web-version", CommandCategory::Files),
         ] {
             let definition = lookup(id).unwrap();
             assert_eq!(definition.entry.category, category);
@@ -3022,6 +3228,51 @@ Permission denied"
                 assert!(!definition.default_command.contains(forbidden));
             }
         }
+    }
+
+    /// The web forensics entries emit the collector contract: scope and gap
+    /// lines stay neutral, 关注 leads get marked, and nothing claims a proven
+    /// webshell — every lead stays at the manual-review level.
+    #[test]
+    fn web_forensics_checks_mark_leads_and_keep_context_neutral() {
+        let trace = lookup("log-web-trace").unwrap();
+        assert_eq!(trace.entry.category, CommandCategory::Logs);
+        assert_eq!(trace.entry.timeout_seconds, 60);
+        for marker in [
+            "/var/log/nginx",
+            "/var/log/apache2",
+            "/var/log/httpd",
+            "access*.log.1",
+            "tail -c 262144",
+            "lh_parents",
+            "需人工核对",
+        ] {
+            assert!(trace.default_command.contains(marker), "{marker}");
+        }
+        let output = "# 范围：当前账号可读内容\n# 日志：/var/log/apache2/access.log\n关注：/.a.php | 路径含点号隐藏段+样本内仅 POST 访问 | GET 0/POST 3/其他 0 | 磁盘：存在：/var/www/html/.a.php | 需人工核对\n关注：/x7k9z2.php | 文件名疑似随机或编码生成+样本内仅 POST 访问 | GET 0/POST 1/其他 0 | 磁盘：未在常见站点根命中 | 需人工核对\n缺口：/var/log/nginx/access.log：权限不足，未读取。\n# 已检查对象 4；关注线索 2；读取缺口 1。线索不等于入侵结论。";
+        assert_eq!(
+            command_findings::finding_lines(output, trace.abnormal),
+            vec![2, 3]
+        );
+
+        let versions = lookup("file-web-version").unwrap();
+        assert_eq!(versions.entry.category, CommandCategory::Files);
+        assert_eq!(versions.entry.timeout_seconds, 60);
+        for marker in [
+            "thinkphp/base.php",
+            "library/think/app.php",
+            "phpmyadmin",
+            "smarty.class.php",
+            "版本无法识别",
+            "需人工核对",
+        ] {
+            assert!(versions.default_command.contains(marker), "{marker}");
+        }
+        let output = "组件：ThinkPHP | /var/www/html/thinkphp/base.php | 版本 5.0.24\n关注：ThinkPHP | /var/www/html/thinkphp/base.php | 版本 5.0.24 | ThinkPHP 5.0.x/5.1.x 为公开远程代码执行高发版本区间，需人工核对\n组件：phpMyAdmin | /var/www/html/phpmyadmin/README | 版本无法识别\n组件：Smarty | /var/www/html/libs/Smarty.class.php | 版本 3.1.48\n# 已检查对象 40；关注线索 1；读取缺口 0。线索不等于入侵结论。";
+        assert_eq!(
+            command_findings::finding_lines(output, versions.abnormal),
+            vec![1]
+        );
     }
 
     /// Every catalog command decides which of its output lines are abnormal.

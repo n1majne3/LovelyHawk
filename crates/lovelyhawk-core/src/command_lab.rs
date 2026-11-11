@@ -48,6 +48,18 @@ const CASES: &[Case] = &[
         quiet: &["pre-commit.sample"],
     },
     Case {
+        id: "log-web-trace",
+        fixture: "mkdir -p /var/log/nginx /var/www/html; printf '10.0.0.1 - - [01/Jan/2025:00:00:00 +0000] \"POST /.a.php HTTP/1.1\" 200 12 \"-\" \"x\"\\n10.0.0.1 - - [01/Jan/2025:00:00:01 +0000] \"GET /index.php HTTP/1.1\" 200 9 \"-\" \"x\"\\n' > /var/log/nginx/access.log; printf '<?php' > /var/www/html/.a.php",
+        expect: &["/.a.php", "存在：/var/www/html/.a.php"],
+        quiet: &["/index.php"],
+    },
+    Case {
+        id: "file-web-version",
+        fixture: "mkdir -p /var/www/html/thinkphp /var/www/html/pma; printf '<?php define(\"THINK_VERSION\",\"5.0.24\");' > /var/www/html/thinkphp/base.php; printf '<?php class Smarty { const SMARTY_VERSION = \"3.1.48\"; }' > /var/www/html/pma/Smarty.class.php",
+        expect: &["ThinkPHP", "5.0.24", "需人工核对"],
+        quiet: &["3.1.48"],
+    },
+    Case {
         id: "system-modules",
         fixture: "",
         expect: &[],
