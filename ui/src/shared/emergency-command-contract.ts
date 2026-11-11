@@ -5,7 +5,7 @@ export const emergencyCommandResultKinds = [
   "success", "empty", "non-zero", "timeout", "missing-command", "permission-denied", "unknown-exit",
 ] as const;
 
-export const emergencyPathActions = ["disarm", "quarantine", "remove-capabilities"] as const;
+export const emergencyPathActions = ["disarm", "quarantine", "remove-capabilities", "restore-residue"] as const;
 
 export type EmergencyCommandCategory = typeof emergencyCommandCategories[number];
 export type EmergencyCommandResultKind = typeof emergencyCommandResultKinds[number];
@@ -110,6 +110,25 @@ export interface EmergencyPathDetail {
   executable: boolean;
 }
 
+/** A regular file a restore probe saw beside the command. */
+export interface EmergencyPathResidueCandidate {
+  path: string;
+  /** Host-reported digest, bounded to the 64 hex characters a sha256 can be. */
+  sha256: string;
+  /** Byte count as text, because a file can be larger than a safe integer. */
+  size: string;
+  /** `backup` is an explicit backup spelling; `variant` a known `name+d` copy. */
+  kind: "backup" | "variant";
+}
+
+/** The residue a restore plan would write over the command, and the rest it saw. */
+export interface EmergencyPathResiduePlan {
+  source: EmergencyPathResidueCandidate;
+  /** The owning package name, or null when no package manager named one. */
+  package: string | null;
+  candidates: EmergencyPathResidueCandidate[];
+}
+
 /** What an action would do, before any of it is done. */
 export interface EmergencyPathPlan {
   planHandle: string;
@@ -121,6 +140,8 @@ export interface EmergencyPathPlan {
   restoreDescription: string | null;
   state: "planned" | "confirmed" | "spent";
   expiresInSeconds: number;
+  /** What a restore-residue plan found; null for every other action. */
+  residue: EmergencyPathResiduePlan | null;
 }
 
 /** What happened, after the target was checked. */
@@ -332,17 +353,41 @@ export function isEmergencyPathDetail(value: unknown): value is EmergencyPathDet
     typeof value.executable === "boolean";
 }
 
+const residueKindSet = new Set<string>(["backup", "variant"]);
+
+function residueCandidate(value: unknown): value is EmergencyPathResidueCandidate {
+  return record(value) && exact(value, ["path", "sha256", "size", "kind"]) &&
+    offeredPath(value.path) &&
+    typeof value.sha256 === "string" && /^[0-9a-f]{1,64}$/u.test(value.sha256) &&
+    typeof value.size === "string" && /^\d{1,20}$/u.test(value.size) &&
+    typeof value.kind === "string" && residueKindSet.has(value.kind);
+}
+
+function residuePlan(value: unknown): value is EmergencyPathResiduePlan {
+  if (!record(value) || !exact(value, ["source", "package", "candidates"]) ||
+    !residueCandidate(value.source) ||
+    !(value.package === null || catalogText(value.package, 128)) ||
+    !Array.isArray(value.candidates) || value.candidates.length > 9 ||
+    !value.candidates.every(residueCandidate)) return false;
+  // The chosen source has to be one of the candidates the probe saw.
+  const source = value.source as EmergencyPathResidueCandidate;
+  return (value.candidates as EmergencyPathResidueCandidate[]).some(
+    (candidate) => candidate.path === source.path && candidate.sha256 === source.sha256,
+  );
+}
+
 export function isEmergencyPathPlan(value: unknown): value is EmergencyPathPlan {
   return record(value) && exact(value, [
     "planHandle", "pathHandle", "path", "action", "summary", "dangerous", "restoreDescription",
-    "state", "expiresInSeconds",
+    "state", "expiresInSeconds", "residue",
   ]) && isEmergencyCommandOpaqueHandle(value.planHandle) &&
     isEmergencyCommandOpaqueHandle(value.pathHandle) && offeredPath(value.path) &&
     typeof value.action === "string" && pathActionSet.has(value.action) &&
     catalogText(value.summary, 512) && typeof value.dangerous === "boolean" &&
     (value.restoreDescription === null || catalogText(value.restoreDescription, 512)) &&
     typeof value.state === "string" && planStateSet.has(value.state) &&
-    unsigned(value.expiresInSeconds, 300) && value.expiresInSeconds > 0;
+    unsigned(value.expiresInSeconds, 300) && value.expiresInSeconds > 0 &&
+    (value.residue === null || residuePlan(value.residue));
 }
 
 export function isEmergencyPathReceipt(value: unknown): value is EmergencyPathReceipt {

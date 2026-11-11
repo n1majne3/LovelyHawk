@@ -2191,6 +2191,22 @@ const OPERATION_FAILURE_ADVICE: &[(&[&str], &str)] = &[
         "那次操作之后，目标机上的这个位置又有了变化，没有撤销，以免盖掉之后的修改。请先在目标机上看清现状。",
     ),
     (
+        &["could not stage the safety copy; nothing was modified"],
+        "留底写入未能核实，目标命令未被修改。",
+    ),
+    (
+        &["restore write check failed; original bytes were put back"],
+        "写回后核对不一致，原内容已放回；该命令未被恢复。",
+    ),
+    (
+        &["restore write check failed; original bytes could not be verified"],
+        "写回后核对不一致，且原内容放回未核实，请人工检查该命令现状。",
+    ),
+    (
+        &["the quarantine copy needed to put the command back is missing or changed"],
+        "放回所需的留底已缺失或被改动，没有撤销。请在目标机上检查该命令与留底的现状。",
+    ),
+    (
         &["the target was not put back as it was before the operation"],
         "撤销后的核对没有通过，请在目标机上检查这个文件现在的状态。",
     ),
@@ -2230,6 +2246,7 @@ const REFUSED_BEFORE_WRITING: &[&str] = &[
     "file content changed after the operation was planned",
     "permission bits changed after planning",
     "refuses to overwrite an existing path",
+    "could not stage the safety copy; nothing was modified",
 ];
 
 /// Whether a transfer stopped because the operator cancelled it. The copy has
@@ -2246,6 +2263,14 @@ pub fn operation_left_untouched(error: &CoreError) -> bool {
     REFUSED_BEFORE_WRITING
         .iter()
         .any(|needle| evidence.contains(needle))
+}
+
+/// Whether a failed operation put the original bytes back itself and says so.
+/// The planned restore cannot run after an execution error — there is no
+/// receipt for it to act on — so the receipt may say "put back" only from
+/// what the executor itself reported.
+pub fn operation_put_back(error: &CoreError) -> bool {
+    error.to_string().contains("original bytes were put back")
 }
 
 const RESTORE_FROM_BACKUP: &str = "把备份改回原名、移回原来的位置，权限也还原";

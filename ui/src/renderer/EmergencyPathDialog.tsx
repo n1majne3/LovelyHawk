@@ -5,6 +5,8 @@ import type {
   EmergencyPathDetail,
   EmergencyPathPlan,
   EmergencyPathReceipt,
+  EmergencyPathResidueCandidate,
+  EmergencyPathResiduePlan,
   EmergencyPathUndoResult,
 } from "../shared/emergency-command-contract";
 import { useModalScrim } from "./modal-scrim";
@@ -31,6 +33,7 @@ const ACTION_LABELS: Record<EmergencyPathAction, string> = {
   disarm: "去掉执行权限",
   quarantine: "隔离",
   "remove-capabilities": "移除文件能力",
+  "restore-residue": "用残留恢复",
 };
 
 const ACTION_INTENT: Record<EmergencyPathAction, string> = {
@@ -38,12 +41,15 @@ const ACTION_INTENT: Record<EmergencyPathAction, string> = {
   quarantine: "把文件从原位置移进目标机上的备份目录。原路径不再有它，需要时可以取回。",
   "remove-capabilities":
     "清除这个文件的 Linux 能力集（如 cap_setuid）。文件保留，但依赖这些能力提权的用法不再生效；本来需要它的正常程序可能无法工作。",
+  "restore-residue":
+    "把同目录下找到的备份残留内容写回这个命令。当前内容先在同目录留底（仅属主可读），写回后逐字节核对，再做软件包校验并试跑一次；包校验和试跑只是参考，能运行不代表可信，残留与软件包有差异也不一定异常。",
 };
 
 const UNDO_EFFECT: Record<EmergencyPathAction, string> = {
   disarm: "撤销会把权限改回操作前的样子，连同 setuid、setgid。这个文件会重新可以执行。",
   quarantine: "撤销会把文件从备份目录移回原路径。原路径会重新出现这个文件，可以再被运行或加载。",
   "remove-capabilities": "撤销会把移除前记录的能力集写回这个文件，依赖它的提权功能重新生效。",
+  "restore-residue": "撤销会把留底里保存的原内容写回这个命令，并删除该留底。",
 };
 
 /**
@@ -84,7 +90,19 @@ export function EmergencyPathDialog({
         {receipt === null ? (
           <>
             {detail === null ? (
-              <p className="emergency-path-note">正在读取目标机上这个文件的当前状态…</p>
+              // The file read needs SFTP; a restore plan does not, so a
+              // restore plan may arrive with nothing here. While work is in
+              // flight say what is actually running; once a plan exists
+              // without the read, the intent sentence still has to show.
+              busy ? (
+                <p className="emergency-path-note" role="status">
+                  {action === "restore-residue" ? "正在核对残留与命令内容并生成恢复计划…" : "正在读取目标机上这个文件的当前状态…"}
+                </p>
+              ) : plan === null ? null : (
+                <div className="emergency-path-panel">
+                  <p className="emergency-path-summary">{ACTION_INTENT[action]}</p>
+                </div>
+              )
             ) : (
               <div className="emergency-path-panel">
                 <p className="emergency-path-summary">{ACTION_INTENT[action]}</p>
@@ -119,6 +137,28 @@ export function EmergencyPathDialog({
                     <dt>计划有效期</dt>
                     <dd>{planExpiryLabel(plan.expiresInSeconds)}</dd>
                   </div>
+                  {plan.residue === null ? null : (
+                    <>
+                      <div>
+                        <dt>残留来源</dt>
+                        <dd>{plan.residue.source.path}（SHA-256 {digestPrefix(plan.residue.source.sha256)}）</dd>
+                      </div>
+                      <div>
+                        <dt>包归属</dt>
+                        <dd>{plan.residue.package ?? "未识别"}</dd>
+                      </div>
+                      {otherResidues(plan.residue).length === 0 ? null : (
+                        <div>
+                          <dt>同目录其他残留</dt>
+                          <dd>
+                            {otherResidues(plan.residue)
+                              .map((candidate) => `${candidate.path}（SHA-256 ${digestPrefix(candidate.sha256)}）`)
+                              .join("；")}
+                          </dd>
+                        </div>
+                      )}
+                    </>
+                  )}
                 </dl>
               </div>
             )}
@@ -323,6 +363,16 @@ export function EmergencyPathProperties({
       </section>
     </div>
   );
+}
+
+/** The residue candidates beside the chosen source, for the plan panel. */
+function otherResidues(residue: EmergencyPathResiduePlan): EmergencyPathResidueCandidate[] {
+  return residue.candidates.filter((candidate) => candidate.path !== residue.source.path);
+}
+
+/** Enough of a sha256 to compare with one the operator ran by hand. */
+function digestPrefix(sha256: string): string {
+  return sha256.length <= 16 ? sha256 : `${sha256.slice(0, 16)}…`;
 }
 
 export function pathKindLabel(kind: EmergencyPathDetail["kind"]): string {

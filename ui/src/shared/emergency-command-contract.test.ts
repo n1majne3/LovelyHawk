@@ -68,6 +68,23 @@ const plan: EmergencyPathPlan = {
   restoreDescription: "restore the captured permission bits",
   state: "planned",
   expiresInSeconds: 300,
+  residue: null,
+};
+
+const restorePlan: EmergencyPathPlan = {
+  ...plan,
+  action: "restore-residue",
+  summary: "用残留 /bin/ls.bak 的内容写回 /bin/ls；当前内容留底（仅属主可读）。能运行不代表可信。",
+  restoreDescription: "把留底的内容写回 /bin/ls，并删除该留底",
+  path: "/bin/ls",
+  residue: {
+    source: { path: "/bin/ls.bak", sha256: "a".repeat(64), size: "133192", kind: "backup" },
+    package: "coreutils",
+    candidates: [
+      { path: "/bin/ls.bak", sha256: "a".repeat(64), size: "133192", kind: "backup" },
+      { path: "/bin/lsd", sha256: "b".repeat(64), size: "133192", kind: "variant" },
+    ],
+  },
 };
 
 const receipt: EmergencyPathReceipt = {
@@ -296,6 +313,49 @@ describe("emergency command contract", () => {
     expect(isEmergencyPathReceipt({ ...receipt, passed: false, restored: true, undoable: true })).toBe(false);
     const { undoable: _undoable, ...withoutUndoable } = receipt;
     expect(isEmergencyPathReceipt(withoutUndoable)).toBe(false);
+  });
+
+  it("carries restore residue only as bounded candidates with a chosen source", () => {
+    expect(isEmergencyPathPlan(restorePlan)).toBe(true);
+    expect(isEmergencyPathPlan({ ...restorePlan, residue: { ...restorePlan.residue, package: null } })).toBe(true);
+    // The action stays inside the closed set, and the residue key is required.
+    expect(isEmergencyPathPlan({ ...restorePlan, action: "restore" })).toBe(false);
+    const { residue: _residue, ...withoutResidue } = restorePlan;
+    expect(isEmergencyPathPlan(withoutResidue)).toBe(false);
+    const residue = restorePlan.residue as NonNullable<EmergencyPathPlan["residue"]>;
+    // A source the probe never offered cannot be chosen.
+    expect(isEmergencyPathPlan({
+      ...restorePlan,
+      residue: { ...residue, source: { path: "/bin/evil", sha256: "c".repeat(64), size: "1", kind: "backup" } },
+    })).toBe(false);
+    // Digests are hex and bounded; kinds are closed; candidates stay few.
+    expect(isEmergencyPathPlan({
+      ...restorePlan,
+      residue: { ...residue, source: { ...residue.source, sha256: "not-hex" } },
+    })).toBe(false);
+    expect(isEmergencyPathPlan({
+      ...restorePlan,
+      residue: { ...residue, source: { ...residue.source, sha256: "a".repeat(65) } },
+    })).toBe(false);
+    expect(isEmergencyPathPlan({
+      ...restorePlan,
+      residue: {
+        ...residue,
+        source: residue.candidates[1] as NonNullable<EmergencyPathPlan["residue"]>["source"],
+        candidates: residue.candidates.map((c) => ({ ...c, kind: "leftover" })),
+      },
+    })).toBe(false);
+    expect(isEmergencyPathPlan({
+      ...restorePlan,
+      residue: {
+        ...residue,
+        candidates: Array.from({ length: 10 }, (_c, index) => ({ ...residue.candidates[0], path: `/bin/x${index}` })),
+      },
+    })).toBe(false);
+    expect(isEmergencyPathPlan({
+      ...restorePlan,
+      residue: { ...residue, package: "pkg", extra: true },
+    })).toBe(false);
   });
 
   it("finds a history check only as a handle, and says why when it cannot", () => {

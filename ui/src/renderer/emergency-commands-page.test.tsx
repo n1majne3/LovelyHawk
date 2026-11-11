@@ -268,6 +268,8 @@ describe("EmergencyCommandsPage", () => {
     expect(html).toContain("/usr/local/lib/pyshared/.helper");
     expect(html).toContain("查看属性");
     expect(html).toContain("去掉执行权限");
+    expect(html).toContain("移除文件能力");
+    expect(html).toContain("用残留恢复");
     expect(html).toContain("隔离");
     expect(html).toContain('role="menu"');
     expect(html).not.toContain("<em>");
@@ -299,6 +301,7 @@ describe("EmergencyCommandsPage", () => {
       restoreDescription: "restore the captured permission bits",
       state: "planned" as const,
       expiresInSeconds: 300,
+      residue: null,
     };
     const planned = renderToStaticMarkup(
       <EmergencyPathDialog path={offer.path} action="disarm" detail={detail} plan={plan}
@@ -395,6 +398,70 @@ describe("EmergencyCommandsPage", () => {
     expect(properties).toContain("能否运行还取决于账号权限、挂载选项和文件类型");
     expect(properties).toContain("122.7 KB（125688 字节）");
     expect(properties).not.toContain("确认并执行");
+  });
+
+  it("says what a residue restore will write, from what, and why it stays honest", () => {
+    const residue = {
+      source: { path: "/bin/ls.bak", sha256: "a".repeat(64), size: "133192", kind: "backup" as const },
+      package: "coreutils",
+      candidates: [
+        { path: "/bin/ls.bak", sha256: "a".repeat(64), size: "133192", kind: "backup" as const },
+        { path: "/bin/lsd", sha256: "b".repeat(64), size: "133192", kind: "variant" as const },
+      ],
+    };
+    const plan = {
+      planHandle: "opaque-plan",
+      pathHandle: offer.pathHandle,
+      path: "/bin/ls",
+      action: "restore-residue" as const,
+      summary: "用残留 /bin/ls.bak 的内容写回 /bin/ls，包归属 coreutils；当前内容留底为 /bin/ls.lh-replaced-x（仅属主可读）。写回后做软件包校验并试跑一次；能运行不代表可信。",
+      dangerous: true,
+      restoreDescription: "把留底的内容写回 /bin/ls，并删除该留底",
+      state: "planned" as const,
+      expiresInSeconds: 300,
+      residue,
+    };
+    const planned = renderToStaticMarkup(
+      <EmergencyPathDialog path="/bin/ls" action="restore-residue" detail={null} plan={plan}
+        receipt={null} busy={false} error={null}
+        onConfirm={() => undefined} onClose={() => undefined} />,
+    );
+    expect(planned).toContain("用残留恢复");
+    expect(planned).toContain("能运行不代表可信");
+    expect(planned).toContain("残留来源");
+    expect(planned).toContain("/bin/ls.bak");
+    expect(planned).toContain("aaaaaaaaaaaaaaaa…");
+    expect(planned).toContain("包归属");
+    expect(planned).toContain("coreutils");
+    expect(planned).toContain("同目录其他残留");
+    expect(planned).toContain("/bin/lsd");
+    // The file read needs SFTP and may be absent; the plan still speaks.
+    expect(planned).not.toContain("正在读取目标机上这个文件的当前状态");
+
+    const done = renderToStaticMarkup(
+      <EmergencyPathDialog path="/bin/ls" action="restore-residue" detail={null} plan={plan}
+        receipt={{ planHandle: "opaque-plan", path: "/bin/ls", action: "restore-residue",
+          passed: true,
+          detail: "回读：/bin/ls 已与 /bin/ls.bak 的内容一致；原内容留底在 /bin/ls.lh-replaced-x。包校验：该文件未见差异；试跑：退出码 0（ls (GNU coreutils) 9.1）；能运行不代表可信",
+          restored: false, untouched: false, undoable: true }}
+        busy={false} error={null} onConfirm={() => undefined} onClose={() => undefined} />,
+    );
+    expect(done).toContain("已完成，并在目标机上核对过。");
+    expect(done).toContain("包校验：该文件未见差异");
+    expect(done).toContain("试跑：退出码 0");
+    expect(done).toContain("能运行不代表可信");
+    expect(done).toContain("撤销这次操作");
+
+    const asking = renderToStaticMarkup(
+      <EmergencyPathOutcome action="restore-residue"
+        receipt={{ planHandle: "opaque-plan", path: "/bin/ls", action: "restore-residue",
+          passed: true, detail: "d", restored: false, untouched: false, undoable: true }}
+        undo={null} undoSpent={false} askingUndo={true} busy={false} error={null}
+        onAskUndo={() => undefined} onKeep={() => undefined} onUndo={() => undefined}
+        onClose={() => undefined} />,
+    );
+    expect(asking).toContain("把留底里保存的原内容写回这个命令");
+    expect(asking).toContain("如果那次操作之后它又被改过，就不会动它");
   });
 
   it("reads a mode the way a listing on the target does", () => {

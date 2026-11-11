@@ -24,8 +24,14 @@ use lovelyhawk_core::{
         CAPABILITY_TOOLS_REFUSAL, CapabilityStripOperation,
     },
     command_paths::paths_in_output,
+    command_restore::{
+        CommandRestoreOperation, RESTORE_AMBIGUOUS_REFUSAL, RESTORE_EMPTY_REFUSAL,
+        RESTORE_KIND_REFUSAL, RESTORE_LOCATION_REFUSAL, RESTORE_PRIVILEGE_REFUSAL,
+        RESTORE_TOOLS_REFUSAL,
+    },
     operations::{DangerousConfirmation, OperationPlan, OperationState, VerificationResult},
     sftp::{BoundSftpSession, RemotePath, SftpFileKind, SftpMutation, SftpPlannedOperation},
+    ssh::BoundSshSession,
     target::TargetGuard,
 };
 use serde::{Deserialize, Serialize};
@@ -80,6 +86,9 @@ pub(crate) enum EmergencyPathAction {
     /// Remove the file's Linux capability set (the `security.capability`
     /// xattr) via `setcap -r`; the saved set can be written back once.
     RemoveCapabilities,
+    /// Write a backup residue found beside a system command back over the
+    /// command, keeping the replaced bytes for one undo.
+    RestoreResidue,
 }
 
 impl EmergencyPathAction {
@@ -88,6 +97,7 @@ impl EmergencyPathAction {
             Self::Disarm => "disarm",
             Self::Quarantine => "quarantine",
             Self::RemoveCapabilities => "remove-capabilities",
+            Self::RestoreResidue => "restore-residue",
         }
     }
 }
@@ -132,6 +142,32 @@ pub(crate) struct EmergencyPathPlanDto {
     pub(crate) restore_description: Option<String>,
     pub(crate) state: String,
     pub(crate) expires_in_seconds: u32,
+    /// What a restore plan found beside the command; absent for other
+    /// actions. All text is bounded at the boundary like the summary.
+    pub(crate) residue: Option<ResiduePlanDto>,
+}
+
+/// One regular file the restore probe saw beside the command.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ResidueCandidateDto {
+    pub(crate) path: String,
+    /// Enough of the digest to compare with a hash the operator ran by hand.
+    pub(crate) sha256: String,
+    pub(crate) size: String,
+    /// `backup` for an explicit backup spelling, `variant` for a known
+    /// `name+d` planted copy.
+    pub(crate) kind: String,
+}
+
+/// The residue a restore plan would write, and everything else it saw.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ResiduePlanDto {
+    pub(crate) source: ResidueCandidateDto,
+    /// The owning package name, when a package manager could name one.
+    pub(crate) package: Option<String>,
+    pub(crate) candidates: Vec<ResidueCandidateDto>,
 }
 
 #[derive(Serialize)]
@@ -196,12 +232,14 @@ struct PlannedPath {
 }
 
 /// The one lifecycle a stored plan goes through, whichever transport carries
-/// the change: SFTP mutations and SSH-carried xattr edits share the
-/// plan/confirm/execute/verify/restore/undo surface.
+/// the change: SFTP mutations, SSH-carried xattr edits and SSH-carried
+/// command restores share the plan/confirm/execute/verify/restore/undo
+/// surface.
 #[derive(Debug)]
 enum PathOperation {
     Sftp(SftpPlannedOperation),
     CapabilityStrip(CapabilityStripOperation),
+    CommandRestore(CommandRestoreOperation),
 }
 
 impl PathOperation {
@@ -209,6 +247,7 @@ impl PathOperation {
         match self {
             Self::Sftp(operation) => operation.definition(),
             Self::CapabilityStrip(operation) => operation.definition(),
+            Self::CommandRestore(operation) => operation.definition(),
         }
     }
 
@@ -216,6 +255,7 @@ impl PathOperation {
         match self {
             Self::Sftp(operation) => operation.state(),
             Self::CapabilityStrip(operation) => operation.state(),
+            Self::CommandRestore(operation) => operation.state(),
         }
     }
 
@@ -223,6 +263,7 @@ impl PathOperation {
         match self {
             Self::Sftp(operation) => operation.confirm(confirmation),
             Self::CapabilityStrip(operation) => operation.confirm(confirmation),
+            Self::CommandRestore(operation) => operation.confirm(confirmation),
         }
     }
 
@@ -230,6 +271,7 @@ impl PathOperation {
         match self {
             Self::Sftp(operation) => operation.execute_and_verify().await,
             Self::CapabilityStrip(operation) => operation.execute_and_verify().await,
+            Self::CommandRestore(operation) => operation.execute_and_verify().await,
         }
     }
 
@@ -237,6 +279,7 @@ impl PathOperation {
         match self {
             Self::Sftp(operation) => operation.restore().await,
             Self::CapabilityStrip(operation) => operation.restore().await,
+            Self::CommandRestore(operation) => operation.restore().await,
         }
     }
 
@@ -244,6 +287,7 @@ impl PathOperation {
         match self {
             Self::Sftp(operation) => operation.can_undo(),
             Self::CapabilityStrip(operation) => operation.can_undo(),
+            Self::CommandRestore(operation) => operation.can_undo(),
         }
     }
 
@@ -251,7 +295,37 @@ impl PathOperation {
         match self {
             Self::Sftp(operation) => operation.undo().await,
             Self::CapabilityStrip(operation) => operation.undo().await,
+            Self::CommandRestore(operation) => operation.undo().await,
         }
+    }
+
+    /// The residue facts a restore plan gathered; other actions have none.
+    fn residue(&self) -> Option<ResiduePlanDto> {
+        match self {
+            Self::CommandRestore(operation) => Some(ResiduePlanDto {
+                source: residue_candidate_dto(operation.source()),
+                package: operation.package_name().map(bounded_text),
+                candidates: operation
+                    .candidates()
+                    .iter()
+                    .map(residue_candidate_dto)
+                    .collect(),
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// Digests are host-reported text: bounded like every other boundary string,
+/// and no longer than the 64 hex characters a sha256 can be.
+fn residue_candidate_dto(
+    candidate: &lovelyhawk_core::command_restore::ResidueCandidate,
+) -> ResidueCandidateDto {
+    ResidueCandidateDto {
+        path: bounded_text(candidate.path().as_str()),
+        sha256: candidate.sha256().chars().take(64).collect::<String>(),
+        size: candidate.size().to_string(),
+        kind: candidate.kind().as_str().to_owned(),
     }
 }
 
@@ -444,6 +518,12 @@ pub(crate) enum PathRefusal {
     Privilege,
     Kind,
     Empty,
+    RestoreTools,
+    RestorePrivilege,
+    RestoreKind,
+    RestoreLocation,
+    RestoreEmpty,
+    RestoreAmbiguous,
 }
 
 /// Plan-time refusals the page can translate; anything else stays behind the
@@ -455,6 +535,24 @@ fn capability_plan_failure(error: &CoreError) -> EmergencyPathApiError {
             CAPABILITY_PRIVILEGE_REFUSAL => PathRefusal::Privilege,
             CAPABILITY_KIND_REFUSAL => PathRefusal::Kind,
             CAPABILITY_EMPTY_REFUSAL => PathRefusal::Empty,
+            _ => return EmergencyPathApiError::Core,
+        },
+        _ => return EmergencyPathApiError::Core,
+    };
+    EmergencyPathApiError::Refused(refusal)
+}
+
+/// The same bargain for a restore plan: each refusal the core named gets a
+/// code the page can translate, everything else stays generic.
+fn restore_plan_failure(error: &CoreError) -> EmergencyPathApiError {
+    let refusal = match error {
+        CoreError::Validation { subject, .. } => match *subject {
+            RESTORE_TOOLS_REFUSAL => PathRefusal::RestoreTools,
+            RESTORE_PRIVILEGE_REFUSAL => PathRefusal::RestorePrivilege,
+            RESTORE_KIND_REFUSAL => PathRefusal::RestoreKind,
+            RESTORE_LOCATION_REFUSAL => PathRefusal::RestoreLocation,
+            RESTORE_EMPTY_REFUSAL => PathRefusal::RestoreEmpty,
+            RESTORE_AMBIGUOUS_REFUSAL => PathRefusal::RestoreAmbiguous,
             _ => return EmergencyPathApiError::Core,
         },
         _ => return EmergencyPathApiError::Core,
@@ -701,7 +799,12 @@ impl EmergencyPathApi {
                 // to put back, and saying "could not restore" would send the
                 // operator looking for damage that does not exist.
                 let untouched = lovelyhawk_core::sftp::operation_left_untouched(&error);
-                let restored = !untouched && plan.operation.restore().await.is_ok();
+                // An executor error leaves the plan without a receipt, so its
+                // own restore cannot run — a multi-step write that already
+                // put itself back says so through the error instead.
+                let restored = !untouched
+                    && (lovelyhawk_core::sftp::operation_put_back(&error)
+                        || plan.operation.restore().await.is_ok());
                 return Ok(EmergencyPathReceiptDto {
                     plan_handle: plan.plan_handle,
                     path: plan.path,
@@ -795,8 +898,9 @@ impl EmergencyPathApi {
 
     /// Turns a capability and an action into the one planned operation the
     /// core takes. SFTP mutations go through the file service; capability
-    /// removal plans over the bound SSH channel instead, because extended
-    /// attributes are outside the SFTP protocol.
+    /// removal and command restore plan over the bound SSH channel instead —
+    /// extended attributes are outside the SFTP protocol, and a restore must
+    /// work on a host whose SFTP never came up.
     async fn build_operation(
         &self,
         scope: &PathScope,
@@ -805,15 +909,7 @@ impl EmergencyPathApi {
     ) -> Result<PathOperation, EmergencyPathApiError> {
         match action {
             EmergencyPathAction::RemoveCapabilities => {
-                let session = self
-                    .ssh_api
-                    .binding_session_clone(&scope.binding_handle)
-                    .map_err(|_| EmergencyPathApiError::BindingUnavailable)?;
-                if session.session_id() != scope.session_id
-                    || session.connection_id() != scope.connection_id
-                {
-                    return Err(EmergencyPathApiError::BindingUnavailable);
-                }
+                let session = self.bound_ssh(scope)?;
                 let operation = timeout(
                     INSPECT_DEADLINE,
                     self.services.system_info().plan_capability_strip(
@@ -826,6 +922,21 @@ impl EmergencyPathApi {
                 .map_err(|_| EmergencyPathApiError::Deadline)?
                 .map_err(|error| capability_plan_failure(&error))?;
                 Ok(PathOperation::CapabilityStrip(operation))
+            }
+            EmergencyPathAction::RestoreResidue => {
+                let session = self.bound_ssh(scope)?;
+                let operation = timeout(
+                    INSPECT_DEADLINE,
+                    self.services.system_info().plan_command_restore(
+                        &session,
+                        path,
+                        self.services.operation_journal().clone(),
+                    ),
+                )
+                .await
+                .map_err(|_| EmergencyPathApiError::Deadline)?
+                .map_err(|error| restore_plan_failure(&error))?;
+                Ok(PathOperation::CommandRestore(operation))
             }
             _ => {
                 let session = self.bind_sftp(scope).await?;
@@ -856,7 +967,11 @@ impl EmergencyPathApi {
                         }
                     }
                     EmergencyPathAction::Quarantine => SftpMutation::Remove { path: path.clone() },
-                    EmergencyPathAction::RemoveCapabilities => unreachable!(),
+                    // SSH-carried actions are matched above the SFTP arm; a
+                    // new variant must pick a transport there, not fall into
+                    // this match silently.
+                    EmergencyPathAction::RemoveCapabilities
+                    | EmergencyPathAction::RestoreResidue => unreachable!(),
                 };
                 self.validate_binding(scope)?;
                 let operation = self
@@ -867,6 +982,22 @@ impl EmergencyPathApi {
                 Ok(PathOperation::Sftp(operation))
             }
         }
+    }
+
+    /// The SSH session behind the stored scope, checked against the session
+    /// and connection it was captured under. Restore and capability plans
+    /// both run through it; neither needs SFTP.
+    fn bound_ssh(&self, scope: &PathScope) -> Result<BoundSshSession, EmergencyPathApiError> {
+        let session = self
+            .ssh_api
+            .binding_session_clone(&scope.binding_handle)
+            .map_err(|_| EmergencyPathApiError::BindingUnavailable)?;
+        if session.session_id() != scope.session_id
+            || session.connection_id() != scope.connection_id
+        {
+            return Err(EmergencyPathApiError::BindingUnavailable);
+        }
+        Ok(session)
     }
 
     pub(crate) fn resolve_evidence_path(
@@ -961,6 +1092,7 @@ fn plan_dto(
         },
         expires_in_seconds: u32::try_from(remaining.max(1))
             .map_err(|_| EmergencyPathApiError::Core)?,
+        residue: plan.operation.residue(),
     })
 }
 
@@ -1345,6 +1477,14 @@ mod tests {
     }
 
     #[test]
+    fn the_restore_action_round_trips_kebab_case_and_label() {
+        let action: EmergencyPathAction = serde_json::from_str("\"restore-residue\"").unwrap();
+        assert!(matches!(action, EmergencyPathAction::RestoreResidue));
+        assert_eq!(action.label(), "restore-residue");
+        assert!(serde_json::from_str::<EmergencyPathAction>("\"restoreResidue\"").is_err());
+    }
+
+    #[test]
     fn plan_refusals_map_to_their_own_codes_and_nothing_else() {
         for (subject, expected) in [
             (CAPABILITY_TOOLS_REFUSAL, PathRefusal::Tools),
@@ -1379,6 +1519,47 @@ mod tests {
         };
         assert!(matches!(
             capability_plan_failure(&io),
+            EmergencyPathApiError::Core
+        ));
+    }
+
+    #[test]
+    fn restore_refusals_map_to_their_own_codes_and_nothing_else() {
+        for (subject, expected) in [
+            (RESTORE_TOOLS_REFUSAL, PathRefusal::RestoreTools),
+            (RESTORE_PRIVILEGE_REFUSAL, PathRefusal::RestorePrivilege),
+            (RESTORE_KIND_REFUSAL, PathRefusal::RestoreKind),
+            (RESTORE_LOCATION_REFUSAL, PathRefusal::RestoreLocation),
+            (RESTORE_EMPTY_REFUSAL, PathRefusal::RestoreEmpty),
+            (RESTORE_AMBIGUOUS_REFUSAL, PathRefusal::RestoreAmbiguous),
+        ] {
+            let error = CoreError::Validation {
+                subject,
+                message: "m".to_owned(),
+            };
+            match restore_plan_failure(&error) {
+                EmergencyPathApiError::Refused(found) => {
+                    assert!(std::mem::discriminant(&found) == std::mem::discriminant(&expected));
+                }
+                _ => panic!("{subject} should be a named refusal"),
+            }
+        }
+        // A capability subject does not leak into restore codes, and an
+        // unrelated failure keeps the generic message.
+        let other = CoreError::Validation {
+            subject: CAPABILITY_TOOLS_REFUSAL,
+            message: "m".to_owned(),
+        };
+        assert!(matches!(
+            restore_plan_failure(&other),
+            EmergencyPathApiError::Core
+        ));
+        let io = CoreError::InvalidOperationState {
+            state: "planned",
+            action: "confirm",
+        };
+        assert!(matches!(
+            restore_plan_failure(&io),
             EmergencyPathApiError::Core
         ));
     }

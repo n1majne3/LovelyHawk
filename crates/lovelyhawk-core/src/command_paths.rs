@@ -71,6 +71,20 @@ fn subject(line: &str) -> LineSubject<'_> {
             None => LineSubject::None,
         };
     }
+    // A residue finding names the backup first and, glued inside full-width
+    // brackets, the command it shadows. The brackets are punctuation, not
+    // part of either path, so the command inside them is what an action may
+    // point at; the last bracket marker is ours even if a hostile backup
+    // name planted an earlier one.
+    if let Some(rest) = line.strip_prefix("命令备份残留：") {
+        let Some((_, target)) = rest.rsplit_once("（对应 ") else {
+            return LineSubject::None;
+        };
+        let end = target.find(['；', '）']).unwrap_or(target.len());
+        return accept(&target[..end])
+            .map(LineSubject::Absolute)
+            .unwrap_or(LineSubject::None);
+    }
     // `ls` heads each directory of a multi-directory listing with its path.
     if let Some(heading) = line.strip_suffix(':')
         && !heading.contains(' ')
@@ -236,6 +250,29 @@ mod tests {
         ] {
             assert_eq!(path_in_line(line), None, "{line}");
         }
+    }
+
+    #[test]
+    fn a_residue_finding_offers_the_shadowed_command_not_the_backup() {
+        assert_eq!(
+            path_in_line("命令备份残留：/bin/ls.bak（对应 /bin/ls）"),
+            Some("/bin/ls")
+        );
+        assert_eq!(
+            path_in_line(
+                "命令备份残留：/usr/bin/lsd（对应 /usr/bin/ls；需核实，lsd 也可能是正常安装的工具）"
+            ),
+            Some("/usr/bin/ls")
+        );
+        // A backup name carrying the marker cannot redirect the action: the
+        // last bracket is the one the fixed format prints.
+        assert_eq!(
+            path_in_line("命令备份残留：/bin/x（对应 /tmp/evil（对应 /bin/ps）"),
+            Some("/bin/ps")
+        );
+        // A malformed finding offers nothing rather than a glued token.
+        assert_eq!(path_in_line("命令备份残留：/bin/ls.bak"), None);
+        assert_eq!(path_in_line("命令备份残留："), None);
     }
 
     #[test]

@@ -6148,6 +6148,42 @@ fn emergency_path_failure(error: EmergencyPathApiError) -> RpcFailure {
                 public_message: "That file currently has no capabilities to remove.",
                 source: None,
             },
+            PathRefusal::RestoreTools => RpcFailure {
+                operation: "plan a command restore",
+                code: "emergency-path-restore-tools",
+                public_message: "The target lacks the hashing tool needed to verify a restore.",
+                source: None,
+            },
+            PathRefusal::RestorePrivilege => RpcFailure {
+                operation: "plan a command restore",
+                code: "emergency-path-restore-privilege",
+                public_message: "Restoring a system command needs root or passwordless sudo on the target.",
+                source: None,
+            },
+            PathRefusal::RestoreKind => RpcFailure {
+                operation: "plan a command restore",
+                code: "emergency-path-restore-kind",
+                public_message: "Only a plain regular file inside a system command directory can be restored this way.",
+                source: None,
+            },
+            PathRefusal::RestoreLocation => RpcFailure {
+                operation: "plan a command restore",
+                code: "emergency-path-restore-location",
+                public_message: "Only a command inside a system binary directory can be restored this way.",
+                source: None,
+            },
+            PathRefusal::RestoreEmpty => RpcFailure {
+                operation: "plan a command restore",
+                code: "emergency-path-restore-empty",
+                public_message: "No backup residue was found beside that command.",
+                source: None,
+            },
+            PathRefusal::RestoreAmbiguous => RpcFailure {
+                operation: "plan a command restore",
+                code: "emergency-path-restore-ambiguous",
+                public_message: "Several backup residues sit beside that command; the source must be chosen by hand.",
+                source: None,
+            },
         },
     }
 }

@@ -71,7 +71,7 @@ const detail: EmergencyPathDetail = {
 const plan: EmergencyPathPlan = {
   planHandle: "plan-one", pathHandle: offer.pathHandle, path: offer.path, action: "disarm",
   summary: "移除文件的执行权限", dangerous: true, restoreDescription: "恢复原权限",
-  state: "planned", expiresInSeconds: 300,
+  state: "planned", expiresInSeconds: 300, residue: null,
 };
 const confirmed: EmergencyPathPlan = { ...plan, state: "confirmed", expiresInSeconds: 290 };
 const receipt: EmergencyPathReceipt = {
@@ -357,5 +357,42 @@ describe("emergency file action lifecycle", () => {
     // An unknown code and another action's code both stay untouched.
     expect(reason("x (emergency-path-capability-empty)", "disarm")).toBe("x (emergency-path-capability-empty)");
     expect(reason("x (emergency-path-other)", "remove-capabilities")).toBe("x (emergency-path-other)");
+  });
+
+  it("translates each restore refusal into its own next step", () => {
+    expect(reason("x (emergency-path-restore-tools)", "restore-residue")).toContain("sha256sum");
+    expect(reason("x (emergency-path-restore-privilege)", "restore-residue")).toContain("sudo");
+    expect(reason("x (emergency-path-restore-kind)", "restore-residue")).toContain("普通文件");
+    expect(reason("x (emergency-path-restore-location)", "restore-residue")).toContain("系统命令目录");
+    expect(reason("x (emergency-path-restore-empty)", "restore-residue")).toContain("没有找到");
+    expect(reason("x (emergency-path-restore-ambiguous)", "restore-residue")).toContain("多个备份残留");
+    // A capability refusal does not bleed into the restore action, and an
+    // unknown code stays untouched.
+    expect(reason("x (emergency-path-capability-empty)", "restore-residue"))
+      .toBe("x (emergency-path-capability-empty)");
+    expect(reason("x (emergency-path-restore-other)", "restore-residue"))
+      .toBe("x (emergency-path-restore-other)");
+  });
+
+  it("still plans a restore when the file property read cannot reach SFTP", async () => {
+    const restorePlan: EmergencyPathPlan = {
+      ...plan, action: "restore-residue", path: "/bin/ls", residue: {
+        source: { path: "/bin/ls.bak", sha256: "a".repeat(64), size: "10", kind: "backup" },
+        package: "coreutils",
+        candidates: [{ path: "/bin/ls.bak", sha256: "a".repeat(64), size: "10", kind: "backup" }],
+      },
+    };
+    api.inspectEmergencyPath.mockRejectedValueOnce(new Error("SFTP 不可用"));
+    api.planEmergencyPathAction.mockResolvedValueOnce(restorePlan);
+    await view().start("restore-residue", { ...offer, path: "/bin/ls" });
+    expect(view().state?.plan).toEqual(restorePlan);
+    expect(view().state?.detail).toBeNull();
+    // The same failed read still stops an action whose operation rides SFTP.
+    view().close();
+    api.inspectEmergencyPath.mockRejectedValueOnce(new Error("SFTP 不可用"));
+    await view().start("disarm", offer);
+    expect(view().state?.plan).toBeNull();
+    expect(view().state?.error).toContain("SFTP 不可用");
+    expect(api.planEmergencyPathAction).toHaveBeenCalledOnce();
   });
 });

@@ -3,7 +3,7 @@ import { Fragment, useEffect, useLayoutEffect, useRef, useState, type ReactEleme
 import { menuMaxHeight, placeMenu } from "./menu-placement";
 
 import type { EmergencyCommandPathOffer } from "../shared/emergency-command-contract";
-import { InfoIcon, PermissionIcon, TrashIcon } from "./file-icons";
+import { InfoIcon, PermissionIcon, RefreshIcon, TrashIcon } from "./file-icons";
 import "./emergency-path.css";
 
 export type EmergencyPathMenuAction =
@@ -11,6 +11,7 @@ export type EmergencyPathMenuAction =
   | "evidence"
   | "disarm"
   | "remove-capabilities"
+  | "restore-residue"
   | "quarantine";
 
 export interface EmergencyPathMenuProps {
@@ -45,6 +46,12 @@ const ITEMS: MenuItem[] = [
     action: "remove-capabilities",
     label: "移除文件能力",
     icon: <PermissionIcon />,
+  },
+  {
+    action: "restore-residue",
+    label: "用残留恢复",
+    icon: <RefreshIcon />,
+    dangerous: true,
   },
   {
     action: "quarantine",

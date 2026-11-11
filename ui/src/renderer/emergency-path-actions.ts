@@ -126,10 +126,24 @@ export function useEmergencyPathActions(api: EmergencyCommandApi, bindingHandle:
     operationRef.current = operation;
     setState({ offer, action, detail: null, plan: null, receipt: null, undo: null, undoSpent: false, busy: true, error: null });
     try {
-      const detail = await api.inspectEmergencyPath(bindingHandle, offer.pathHandle);
+      // The property read rides SFTP; a restore plan reads everything over
+      // SSH, so on a host without SFTP that read may legitimately fail while
+      // the plan would succeed. Every other action's operation rides SFTP
+      // too, so for them a failed read stays a stop.
+      let inspected: unknown = null;
+      try {
+        inspected = await api.inspectEmergencyPath(bindingHandle, offer.pathHandle);
+      } catch (inspectError) {
+        if (menuAction !== "restore-residue") throw inspectError;
+      }
       if (!isCurrent(operation)) return;
-      if (!isEmergencyPathDetail(detail) || detail.pathHandle !== offer.pathHandle || detail.path !== offer.path) {
-        throw new Error("文件信息与本次选择不一致，请关闭后重新检查。");
+      let detail: EmergencyPathDetail | null = null;
+      if (inspected !== null) {
+        if (!isEmergencyPathDetail(inspected) || inspected.pathHandle !== offer.pathHandle ||
+          inspected.path !== offer.path) {
+          throw new Error("文件信息与本次选择不一致，请关闭后重新检查。");
+        }
+        detail = inspected;
       }
       if (action === null) {
         setState({ offer, action, detail, plan: null, receipt: null, undo: null, undoSpent: false, busy: false, error: null });
@@ -173,6 +187,7 @@ export function useEmergencyPathActions(api: EmergencyCommandApi, bindingHandle:
         confirmed.pathHandle !== plan.pathHandle || confirmed.path !== plan.path ||
         confirmed.action !== plan.action || confirmed.summary !== plan.summary ||
         confirmed.dangerous !== plan.dangerous || confirmed.restoreDescription !== plan.restoreDescription ||
+        JSON.stringify(confirmed.residue) !== JSON.stringify(plan.residue) ||
         confirmed.state !== "confirmed") {
         throw new Error("确认结果与所查看的计划不一致，请关闭后重新检查。");
       }
@@ -266,6 +281,26 @@ export function reason(text: string, action: EmergencyPathAction | null): string
     }
     if (/\(emergency-path-capability-empty\)$/u.test(text)) {
       return "这个文件当前没有文件能力，无需移除。";
+    }
+  }
+  if (action === "restore-residue") {
+    if (/\(emergency-path-restore-tools\)$/u.test(text)) {
+      return "目标机缺少 sha256sum 等校验工具，无法安全核对写回的内容。";
+    }
+    if (/\(emergency-path-restore-privilege\)$/u.test(text)) {
+      return "需要 root 或免密码 sudo 才能写回系统命令，当前账号权限不足。";
+    }
+    if (/\(emergency-path-restore-kind\)$/u.test(text)) {
+      return "只能恢复普通文件；符号链接、目录与其他类型不支持。";
+    }
+    if (/\(emergency-path-restore-location\)$/u.test(text)) {
+      return "只能恢复 /bin、/sbin、/usr/bin 等系统命令目录里的命令，这个位置不在范围内。";
+    }
+    if (/\(emergency-path-restore-empty\)$/u.test(text)) {
+      return "同目录下没有找到可用于恢复的备份残留。";
+    }
+    if (/\(emergency-path-restore-ambiguous\)$/u.test(text)) {
+      return "同目录下有多个备份残留，无法自动判断来源。请先人工核实该用哪一个，再决定是否恢复。";
     }
   }
   return text;

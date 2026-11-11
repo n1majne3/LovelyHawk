@@ -27,7 +27,7 @@
 
 - 封禁 IP 的防火墙写入：现有 iptables/nft/firewalld 能力全部只读（`detection.rs:956`、`system_info.rs:9039` 的规则枚举与按 IP 检索），处置 C2 地址与爆破来源是所有 writeup 的固定动作，需按计划、确认、回读、可恢复链路补规则写入。
 - capability 修复（`setcap`）：`perm-capabilities` 已按 `DANGEROUS_CAPABILITIES`（`command_findings.rs:118`）判定高危能力，但没有写入能力；被替换命令还原后（如 ping）需补 `setcap cap_net_raw+ep`，否则普通用户不可用（`cp` 不带 `--preserve=xattr` 会丢失 capability）。
-- 系统命令还原一条龙：留证 → 按备份残留还原 → 包校验复核 → 功能验证。备份命名需覆盖 `.bak`/`psd`/`lsd`/`dpkgbak` 及同目录点号副本（运维2 的 `/usr/sbin/.userdel`），代码中均无探测。现有包校验（`file-package-verify`）与文件隔离零件可复用，缺面向“命令被替换”场景的引导。
+- 系统命令还原一条龙：留证 → 按备份残留还原 → 包校验复核 → 功能验证。还原链路已接通：紧急命令路径操作新增“按残留还原”（core `command_restore.rs`、后端 `restore-residue`、页面确认对话框），经绑定 SSH 探测 `.bak`/`.orig`/`.old`/`~`/点号副本/`.dpkg-old`/`.dpkg-new`/`.dpkg-bak`/`*dpkgbak` 及 `psd`/`lsd` 等已知变体，唯一安全来源才放行，先留证再就地写回并复核摘要与功能，结果记操作日志、可撤销；包校验与功能检查只作观察，不宣称主机干净。检测脚本（`command_workbench.rs` `file-binary-changed`）已补 `.dpkg-*`/`*dpkgbak` 残留发现。仍缺：`ping` 等命令恢复后丢 `security.capability` 需上一行的 `setcap` 配套；真实环境证据待实验室跑批，本轮未经真实容器验证。
 - 包校验在 Debian/Ubuntu 上的回退：`file-package-verify` 的 Debian 分支只用 debsums，未安装即只输出“debsums 未安装”（`command_workbench.rs:1943`），不回退系统自带的 `dpkg --verify`（writeup 正是用 `dpkg -V`；主机全景行操作里已有单包 `dpkg --verify`，`system_info.rs:6638`）。dpkg 自身被替换时（运维1.5 第 5 题）需不经 dpkg 二进制、直接比对 `/var/lib/dpkg/info/*.md5sums`。
 - ~~账号口令修改~~（已完成，见上方进度区）。仍缺的配套：只检查用户录入的连接口令强度，不对目标做字典尝试（锁定风险且越过只读默认）。删除账号依赖目标 `userdel`，被替换时（运维2）复核能报告失败，但不提示命令可能被替换、也不提供替代路径。
 - ~~普通业务进程按原样重启~~（已完成，见上方进度区）。环境变量与已打开文件/网络连接不还原，systemd 托管进程仍走服务操作。

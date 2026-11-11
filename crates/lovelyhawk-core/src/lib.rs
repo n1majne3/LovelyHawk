@@ -15,6 +15,7 @@ pub mod baseline;
 pub mod capability_strip;
 pub mod command_findings;
 pub mod command_paths;
+pub mod command_restore;
 pub mod command_workbench;
 pub mod compliance;
 pub mod configuration_goal;
