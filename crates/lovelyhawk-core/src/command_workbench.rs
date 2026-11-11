@@ -689,58 +689,6 @@ done
 "#
 );
 
-const WEB_CODE_OBSERVATIONS: &str = bounded_observation!(
-    r#"
-printf '# 检查常见站点目录内 PHP/JSP/ASP 类文件，每目录最多 6 层、每文件前 64 KiB；读取可能更新访问时间。\n'
-printf '# 只返回行号与代码特征；忽略常见注释和字符串展示，不执行代码。跨行调用、变量传递与混淆可能漏检，命中不等于 WebShell。\n'
-for lh_root in /var/www /usr/share/nginx /srv/www /home/*/public_html; do
-  lh_tree "$lh_root" || continue
-  while IFS= read -r lh_file; do
-    lh_tree_entry "$lh_file" || continue
-    lh_name=$(printf '%s' "${lh_file##*/}" | tr '[:upper:]' '[:lower:]')
-    case "$lh_name" in *.php|*.php5|*.phtml|*.jsp|*.jspx|*.asp|*.aspx) ;; *) continue;; esac
-    lh_read "$lh_file" text counted || continue
-    lh_matches=$(printf '%s\n' "$lh_data" | awk '
-      # Remove common comments and quoted values before matching code shapes.
-      function code(s,    i,c,nextc,out) {
-        out=""
-        for (i=1; i<=length(s); i++) {
-          c=substr(s,i,1); nextc=substr(s,i+1,1)
-          if (block) {if (c == "*" && nextc == "/") {block=0; i++}; continue}
-          if (quote != "") {
-            if (escape) escape=0
-            else if (c == "\\") escape=1
-            else if (c == quote) quote=""
-            continue
-          }
-          if (c == "/" && nextc == "*") {block=1; i++; out=out " "; continue}
-          if ((c == "/" && nextc == "/") || c == hash) break
-          if (c == sq || c == "\"" || c == "`") {quote=c; out=out "?"; continue}
-          out=out c
-        }
-        return tolower(out)
-      }
-      BEGIN {sq=sprintf("%c",39); hash=sprintf("%c",35)}
-      {
-        s=code($0); feature=""
-        if (s ~ /(^|[^[:alnum:]_])(eval|assert|system|shell_exec|passthru|popen|exec)[[:space:]]*\([[:space:]]*\$_(post|get|request|cookie)[[:space:]]*\[/) feature="请求参数直接进入代码或命令执行函数"
-        else if (s ~ /(^|[^[:alnum:]_])(eval|assert)[[:space:]]*\([[:space:]]*(base64_decode|gzinflate|gzuncompress|str_rot13)[[:space:]]*\(/) feature="解码或解压结果进入代码执行函数"
-        else if (s ~ /(\.exec|new[[:space:]]+processbuilder|execute|eval)[[:space:]]*\([[:space:]]*(request\.getparameter[[:space:]]*\(|request[[:space:]]*[\[(])/) feature="Web 请求输入直接进入执行调用"
-        if (feature != "") print NR " " feature
-      }') || { lh_gap "$lh_ref：代码特征分析失败。"; continue; }
-    while IFS=' ' read -r lh_line lh_feature; do
-      [ -n "$lh_line" ] || continue
-      lh_hit "$lh_ref | 第 $lh_line 行：$lh_feature；需人工核对代码用途与来源。"
-    done <<LH_WEB_MATCHES
-$lh_matches
-LH_WEB_MATCHES
-  done <<LH_WEB_PATHS
-$lh_paths
-LH_WEB_PATHS
-done
-"#
-);
-
 const ACCESS_LOG_TRACE: &str = bounded_observation!(
     r#"
 printf '# 读取 nginx/apache 访问日志尾部各 256 KiB，统计样本窗口内被请求脚本路径的方法分布。\n'
@@ -1879,9 +1827,9 @@ static CATALOG: &[CommandDefinition] = &[
     portable!(
         "file-webshell-hint",
         Files,
-        "站点可疑代码特征",
-        "检查请求输入或解码结果进入执行函数的单行特征；返回位置供人工核查，不执行代码。",
-        WEB_CODE_OBSERVATIONS
+        "站点目录可疑文件扫描",
+        "发现站点目录并扫描 PHP/JSP/ASP 类脚本、伪装图片、站点配置与隐藏脚本中的可疑特征；命中行提供文件操作入口，均需人工核查，不执行代码。",
+        crate::detection::WEBSHELL_SCAN_COMMAND
     )
     .self_checked()
     .with_timeout(60)
@@ -2921,10 +2869,19 @@ mod tests {
                     // anything; their AWK and shell functions are not programs.
                     // The WSL fixture also removes each tool in turn and checks
                     // the actual nonzero refusal, rather than just this wiring.
-                    assert!(wrapped.contains("for lh_tool in head tr wc awk readlink ls; do"));
-                    assert!(wrapped.contains("command -v \"$lh_tool\" >/dev/null 2>&1 ||"));
-                    assert!(wrapped.contains("工具不可用：%s，本项未执行\\n"));
-                    assert!(wrapped.contains("exit 1; }"));
+                    if entry.entry.id == "file-webshell-hint" {
+                        // The webshell scanner shares the detection module's
+                        // program and refuses inside it instead of the
+                        // bounded-observation preamble.
+                        assert!(wrapped.contains("command -v find"));
+                        assert!(wrapped.contains("command -v awk"));
+                        assert!(wrapped.contains("扫描未执行"));
+                    } else {
+                        assert!(wrapped.contains("for lh_tool in head tr wc awk readlink ls; do"));
+                        assert!(wrapped.contains("command -v \"$lh_tool\" >/dev/null 2>&1 ||"));
+                        assert!(wrapped.contains("工具不可用：%s，本项未执行\\n"));
+                        assert!(wrapped.contains("exit 1; }"));
+                    }
                     continue;
                 }
                 for program in container_programs_used(raw) {

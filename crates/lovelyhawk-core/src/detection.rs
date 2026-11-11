@@ -938,17 +938,22 @@ fn bounded_remote_output(text: String) -> CoreResult<RemoteDetectionOutput> {
     Ok(RemoteDetectionOutput { text })
 }
 
-/// Remote program for the webshell module. It emits a tagged record stream so
-/// the parser can separate hits from coverage and gaps:
-/// `ROOT\t<dir>` marks each discovered web root, `SCAN\t<root>\t<listed>\t<scanned>`
-/// records per-root coverage, `HIT\t<kind>\t<path>\t<line>\t<excerpt>` is one
-/// match (kind is signature, image, config or hidden), `NOTE\t<text>` marks a
-/// partial gap, and `FATAL\t<text>` means the scan could not run at all.
+/// Remote program for the webshell module. It emits the collector contract so
+/// the output is directly displayable in the command workbench, where each
+/// `关注：<path> | …` line names exactly one file and is offered as a path
+/// action, while the parser can still separate hits from coverage and gaps:
+/// `# 站点根：<dir>` marks each discovered web root,
+/// `# 站点 <root>：候选 <listed>，已检查 <scanned>` records per-root coverage,
+/// `关注：<path> | <kindzh>，第 <line> 行：<excerpt>` is one match (kindzh is
+/// 代码特征, 图片标记 or 配置指令; `关注：<path> | 隐藏脚本` marks a hidden
+/// script by name alone), `缺口：<text>` marks a partial gap, and
+/// `# 扫描未执行：<text>` means the scan could not run at all. A `|` inside an
+/// excerpt is rewritten so the ` | ` delimiter stays unique per line.
 /// Everything else in the stream is untrusted and ignored.
-const WEBSHELL_SCAN_COMMAND: &str = r#"LC_ALL=C; export LC_ALL
+pub(crate) const WEBSHELL_SCAN_COMMAND: &str = r#"LC_ALL=C; export LC_ALL
 PATH=/usr/sbin:/usr/bin:/sbin:/bin:$PATH; export PATH
 printf 'LOVELYRES_WEBSHELL_V2\n'
-if ! command -v find >/dev/null 2>&1 || ! command -v awk >/dev/null 2>&1; then printf 'FATAL\tfind 或 awk 不可用，Webshell 扫描未执行\nLOVELYRES_WEBSHELL_END_V2\n'; exit 0; fi
+if ! command -v find >/dev/null 2>&1 || ! command -v awk >/dev/null 2>&1; then printf '# 扫描未执行：find 或 awk 不可用\nLOVELYRES_WEBSHELL_END_V2\n'; exit 0; fi
 lh_roots=''
 lh_add_root() {
   case "$1" in /*) ;; *) return 0;; esac
@@ -958,7 +963,7 @@ lh_add_root() {
     case "$1" in "$lh_p"/*) return 0;; esac
   done
   lh_roots="$lh_roots $1"
-  printf 'ROOT\t%s\n' "$1"
+  printf '# 站点根：%s\n' "$1"
 }
 lh_roots_from_conf() {
   awk '{
@@ -982,13 +987,13 @@ if command -v nginx >/dev/null 2>&1; then
   lh_conf=1
   for lh_p in $(nginx -T 2>&1 | lh_roots_from_conf 2>/dev/null); do lh_add_root "$lh_p"; done
 fi
-[ "$lh_conf" = 1 ] && printf 'NOTE\t已结合 Web 服务配置文件推导站点目录\n'
-if [ -z "$lh_roots" ]; then printf 'LOVELYRES_WEB_ROOT_NOT_APPLICABLE_V1\nLOVELYRES_WEBSHELL_END_V2\n'; exit 0; fi
+[ "$lh_conf" = 1 ] && printf '# 已结合 Web 服务配置文件推导站点目录\n'
+if [ -z "$lh_roots" ]; then printf '# 未发现站点目录，未执行扫描\nLOVELYRES_WEB_ROOT_NOT_APPLICABLE_V1\nLOVELYRES_WEBSHELL_END_V2\n'; exit 0; fi
 lh_n=0
 for lh_root in $lh_roots; do
   lh_n=$((lh_n + 1))
-  if [ "$lh_n" -gt 12 ]; then printf 'NOTE\t站点目录超过 12 个，其余未扫描\n'; break; fi
-  if [ ! -r "$lh_root" ] || [ ! -x "$lh_root" ]; then printf 'NOTE\t站点目录不可读，未扫描：%s\n' "$lh_root"; continue; fi
+  if [ "$lh_n" -gt 12 ]; then printf '缺口：站点目录超过 12 个，其余未扫描\n'; break; fi
+  if [ ! -r "$lh_root" ] || [ ! -x "$lh_root" ]; then printf '缺口：站点目录不可读，未扫描：%s\n' "$lh_root"; continue; fi
   find "$lh_root" -xdev -type f -size -2M \( -name '*.php' -o -name '*.php[0-9]' -o -name '*.phtml' -o -name '*.pht' -o -name '*.phar' -o -name '*.jsp' -o -name '*.jspx' -o -name '*.asp' -o -name '*.aspx' -o -name '*.asa' -o -name '*.cer' -o -name '*.ashx' -o -name '*.jpg' -o -name '*.jpeg' -o -name '*.png' -o -name '*.gif' -o -name '.htaccess' -o -name '.user.ini' \) -print0 2>/dev/null | awk -v root="$lh_root" '
 BEGIN {
   gsub(/[[:cntrl:]]/, "?", root)
@@ -1014,10 +1019,10 @@ BEGIN {
     if (hid < 40) {
       p = path
       gsub(/[[:cntrl:]]/, "?", p)
-      printf "HIT\thidden\t%s\t-\t-\n", p
+      printf "关注：%s | 隐藏脚本\n", p
     }
     hid++
-    if (hid == 41) printf "NOTE\t%s：隐藏脚本记录超过 40 条，其余未列出\n", root
+    if (hid == 41) printf "缺口：%s：隐藏脚本记录超过 40 条，其余未列出\n", root
   }
   if (kind == "") next
   if (scanned >= 6000) { capped = 1; next }
@@ -1045,14 +1050,16 @@ BEGIN {
       nhits++
       s = substr(line, (rst > 40 ? rst - 20 : 1), 140)
       gsub(/[[:cntrl:]]/, "?", s)
+      gsub(/\|/, "/", s)
       p = path
       gsub(/[[:cntrl:]]/, "?", p)
+      kz = (kind == "image" ? "图片标记" : (kind == "config" ? "配置指令" : "代码特征"))
       if (emitted < 300) {
         emitted++
-        printf "HIT\t%s\t%s\t%d\t%s\n", kind, p, ln, s
+        printf "关注：%s | %s，第 %d 行：%s\n", p, kz, ln, s
       } else if (emitted == 300) {
         emitted++
-        printf "NOTE\t%s：命中记录超过 300 条，其余未列出\n", root
+        printf "缺口：%s：命中记录超过 300 条，其余未列出\n", root
       }
     }
   }
@@ -1062,13 +1069,13 @@ BEGIN {
     unread++
     p = path
     gsub(/[[:cntrl:]]/, "?", p)
-    printf "NOTE\t文件不可读，未检查：%s\n", p
+    printf "缺口：文件不可读，未检查：%s\n", p
   }
 }
 END {
-  printf "SCAN\t%s\t%d\t%d\n", root, listed, scanned
-  if (capped) printf "NOTE\t%s：候选文件超过 6000 个，其余未检查\n", root
-  if (unread >= 40) printf "NOTE\t%s：不可读文件超过 40 个，其余未列出\n", root
+  printf "%s %s：候选 %d，已检查 %d\n", sprintf("%c 站点", 35), root, listed, scanned
+  if (capped) printf "缺口：%s：候选文件超过 6000 个，其余未检查\n", root
+  if (unread >= 40) printf "缺口：%s：不可读文件超过 40 个，其余未列出\n", root
 }'
 done
 printf 'LOVELYRES_WEBSHELL_END_V2\n'
@@ -1819,26 +1826,42 @@ fn classify_webshell_hit(
 }
 
 fn parse_webshell_hit(
-    record: &str,
+    line: &str,
     files: &mut BTreeMap<String, Vec<WebshellEvidence>>,
 ) -> Result<(), ()> {
-    let mut fields = record.splitn(4, '\t');
-    let kind = match fields.next() {
-        Some("signature") => WebshellHitKind::Signature,
-        Some("image") => WebshellHitKind::Image,
-        Some("config") => WebshellHitKind::Config,
-        Some("hidden") => WebshellHitKind::Hidden,
-        _ => return Err(()),
-    };
-    let (Some(path), Some(line_field), Some(excerpt)) =
-        (fields.next(), fields.next(), fields.next())
-    else {
+    // `关注：<path> | <kindzh>，第 <line> 行：<excerpt>` or the hidden-script
+    // variant `关注：<path> | 隐藏脚本`. The ` | ` split takes the last
+    // delimiter, matching how the path offer reads the same displayed line.
+    let Some(record) = line.strip_prefix("关注：") else {
         return Err(());
     };
-    let path = bounded_line(path, 1_024);
+    let Some((raw_path, detail)) = record.rsplit_once(" | ") else {
+        return Err(());
+    };
+    let path = bounded_line(raw_path, 1_024);
     if path.is_empty() {
         return Err(());
     }
+    let (kind, line_field, excerpt) = if detail == "隐藏脚本" {
+        (WebshellHitKind::Hidden, "", "")
+    } else {
+        let Some((kind_zh, rest)) = detail.split_once('，') else {
+            return Err(());
+        };
+        let kind = match kind_zh {
+            "代码特征" => WebshellHitKind::Signature,
+            "图片标记" => WebshellHitKind::Image,
+            "配置指令" => WebshellHitKind::Config,
+            _ => return Err(()),
+        };
+        let Some(rest) = rest.strip_prefix("第 ") else {
+            return Err(());
+        };
+        let Some((number, excerpt)) = rest.split_once(" 行：") else {
+            return Err(());
+        };
+        (kind, number, excerpt)
+    };
     let (feature, level, severity) = classify_webshell_hit(kind, excerpt);
     let evidence = WebshellEvidence {
         kind,
@@ -1868,7 +1891,10 @@ fn parse_webshell(output: &str, limit: usize) -> CoreResult<WebshellScanResult> 
     let mut malformed = 0usize;
     for raw_line in output.lines().take(200_000) {
         let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
-        if line.is_empty() || line.starts_with("LOVELYRES_") {
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with("LOVELYRES_") {
             if line == WEBSHELL_NOT_APPLICABLE {
                 result.not_applicable = true;
             }
@@ -1877,37 +1903,43 @@ fn parse_webshell(output: &str, limit: usize) -> CoreResult<WebshellScanResult> 
             }
             continue;
         }
-        if let Some(record) = line.strip_prefix("ROOT\t") {
+        if let Some(record) = line.strip_prefix("# 站点根：") {
             if result.roots.len() < limit {
                 result.roots.push(bounded_line(record, 1_024));
             }
             continue;
         }
-        if let Some(record) = line.strip_prefix("NOTE\t") {
-            if result.notes.len() < limit {
-                result.notes.push(bounded_line(record, 512));
+        if let Some(record) = line.strip_prefix("# 站点 ") {
+            if let Some((root, counts)) = record.split_once("：候选 ")
+                && let Some((listed, scanned)) = counts.split_once("，已检查 ")
+            {
+                let _ = root;
+                result.listed_candidates = result
+                    .listed_candidates
+                    .saturating_add(listed.parse::<usize>().unwrap_or(0).min(1_000_000));
+                result.scanned_files = result
+                    .scanned_files
+                    .saturating_add(scanned.parse::<usize>().unwrap_or(0).min(1_000_000));
             }
             continue;
         }
-        if let Some(record) = line.strip_prefix("FATAL\t") {
+        if let Some(record) = line.strip_prefix("# 扫描未执行：") {
             return Err(CoreError::validation(
                 "webshell scan output",
                 bounded_line(record, 256),
             ));
         }
-        if let Some(record) = line.strip_prefix("SCAN\t") {
-            let mut fields = record.split('\t');
-            fields.next();
-            for counter in [&mut result.listed_candidates, &mut result.scanned_files] {
-                if let Some(field) = fields.next() {
-                    *counter =
-                        counter.saturating_add(field.parse::<usize>().unwrap_or(0).min(1_000_000));
-                }
+        if line.starts_with("# ") {
+            continue;
+        }
+        if let Some(record) = line.strip_prefix("缺口：") {
+            if result.notes.len() < limit {
+                result.notes.push(bounded_line(record, 512));
             }
             continue;
         }
-        if let Some(record) = line.strip_prefix("HIT\t") {
-            if parse_webshell_hit(record, &mut by_path).is_err() {
+        if line.starts_with("关注：") {
+            if parse_webshell_hit(line, &mut by_path).is_err() {
                 malformed += 1;
             }
             continue;
@@ -2964,12 +2996,12 @@ mod tests {
     fn webshell_confirmed_signatures_grade_as_confirmed() {
         let runner = StubRunner::new(&[concat!(
             "LOVELYRES_WEBSHELL_V2\n",
-            "ROOT\t/var/www\n",
-            "HIT\tsignature\t/var/www/a.php\t2\t<?php eval($_POST['x']);?>\n",
-            "HIT\tsignature\t/var/www/b.php\t4\t<?php $_POST['x']($_GET['a']);\n",
-            "HIT\tsignature\t/var/www/c.php\t6\t<?php eval(gzinflate(base64_decode($c)));\n",
-            "HIT\tsignature\t/var/www/d.php\t8\tsystem($_GET['c']);\n",
-            "SCAN\t/var/www\t4\t4\n",
+            "# 站点根：/var/www\n",
+            "关注：/var/www/a.php | 代码特征，第 2 行：<?php eval($_POST['x']);?>\n",
+            "关注：/var/www/b.php | 代码特征，第 4 行：<?php $_POST['x']($_GET['a']);\n",
+            "关注：/var/www/c.php | 代码特征，第 6 行：<?php eval(gzinflate(base64_decode($c)));\n",
+            "关注：/var/www/d.php | 代码特征，第 8 行：system($_GET['c']);\n",
+            "# 站点 /var/www：候选 4，已检查 4\n",
             "LOVELYRES_WEBSHELL_END_V2\n",
         )]);
         let report = run_with_command_runner(&runner, DetectionKind::WebshellScan, 10).unwrap();
@@ -2989,14 +3021,14 @@ mod tests {
     fn webshell_variant_patterns_stay_suspect_for_manual_review() {
         let runner = StubRunner::new(&[concat!(
             "LOVELYRES_WEBSHELL_V2\n",
-            "ROOT\t/var/www\n",
-            "HIT\tsignature\t/var/www/u.php\t1\tcall_user_func($_GET['fn'], 'x');\n",
-            "HIT\tsignature\t/var/www/v.php\t2\tpreg_replace('/.+/e', 'phpinfo()', $x);\n",
-            "HIT\tsignature\t/var/www/w.php\t3\tcreate_function('$a', 'return $a;');\n",
-            "HIT\tsignature\t/var/www/x.php\t4\techo str_rot13(gzinflate($x));\n",
-            "HIT\tsignature\t/var/www/y.php\t5\t$blob = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';\n",
-            "HIT\tsignature\t/var/www/z.php\t6\tassert($x);\n",
-            "SCAN\t/var/www\t6\t6\n",
+            "# 站点根：/var/www\n",
+            "关注：/var/www/u.php | 代码特征，第 1 行：call_user_func($_GET['fn'], 'x');\n",
+            "关注：/var/www/v.php | 代码特征，第 2 行：preg_replace('/.+/e', 'phpinfo()', $x);\n",
+            "关注：/var/www/w.php | 代码特征，第 3 行：create_function('$a', 'return $a;');\n",
+            "关注：/var/www/x.php | 代码特征，第 4 行：echo str_rot13(gzinflate($x));\n",
+            "关注：/var/www/y.php | 代码特征，第 5 行：$blob = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';\n",
+            "关注：/var/www/z.php | 代码特征，第 6 行：assert($x);\n",
+            "# 站点 /var/www：候选 6，已检查 6\n",
             "LOVELYRES_WEBSHELL_END_V2\n",
         )]);
         let report = run_with_command_runner(&runner, DetectionKind::WebshellScan, 10).unwrap();
@@ -3027,13 +3059,13 @@ mod tests {
     fn webshell_image_config_and_hidden_kinds_report_their_features() {
         let runner = StubRunner::new(&[concat!(
             "LOVELYRES_WEBSHELL_V2\n",
-            "ROOT\t/var/www\n",
-            "HIT\timage\t/var/www/u/photo.jpg\t1\tbinary<?php phpinfo();\n",
-            "HIT\tconfig\t/var/www/.htaccess\t5\tAddType application/x-httpd-php .jpg\n",
-            "HIT\tconfig\t/var/www/.user.ini\t1\tauto_prepend_file = /tmp/evil.php\n",
-            "HIT\thidden\t/var/www/.a.php\t-\t-\n",
-            "HIT\tconfig\t/var/www/.htaccess\t9\tAddType text/plain .php\n",
-            "SCAN\t/var/www\t5\t5\n",
+            "# 站点根：/var/www\n",
+            "关注：/var/www/u/photo.jpg | 图片标记，第 1 行：binary<?php phpinfo();\n",
+            "关注：/var/www/.htaccess | 配置指令，第 5 行：AddType application/x-httpd-php .jpg\n",
+            "关注：/var/www/.user.ini | 配置指令，第 1 行：auto_prepend_file = /tmp/evil.php\n",
+            "关注：/var/www/.a.php | 隐藏脚本\n",
+            "关注：/var/www/.htaccess | 配置指令，第 9 行：AddType text/plain .php\n",
+            "# 站点 /var/www：候选 5，已检查 5\n",
             "LOVELYRES_WEBSHELL_END_V2\n",
         )]);
         let report = run_with_command_runner(&runner, DetectionKind::WebshellScan, 10).unwrap();
@@ -3072,10 +3104,10 @@ mod tests {
     fn webshell_same_path_merges_kinds_and_strongest_level_wins() {
         let runner = StubRunner::new(&[concat!(
             "LOVELYRES_WEBSHELL_V2\n",
-            "ROOT\t/var/www\n",
-            "HIT\thidden\t/var/www/.x.php\t-\t-\n",
-            "HIT\tsignature\t/var/www/.x.php\t1\t<?php eval($_GET['c']);\n",
-            "SCAN\t/var/www\t1\t1\n",
+            "# 站点根：/var/www\n",
+            "关注：/var/www/.x.php | 隐藏脚本\n",
+            "关注：/var/www/.x.php | 代码特征，第 1 行：<?php eval($_GET['c']);\n",
+            "# 站点 /var/www：候选 1，已检查 1\n",
             "LOVELYRES_WEBSHELL_END_V2\n",
         )]);
         let report = run_with_command_runner(&runner, DetectionKind::WebshellScan, 10).unwrap();
@@ -3091,10 +3123,10 @@ mod tests {
     fn webshell_gaps_and_unfinished_output_are_visible_not_silent() {
         let runner = StubRunner::new(&[concat!(
             "LOVELYRES_WEBSHELL_V2\n",
-            "ROOT\t/var/www\n",
-            "NOTE\t站点目录不可读，未扫描：/var/www/private\n",
+            "# 站点根：/var/www\n",
+            "缺口：站点目录不可读，未扫描：/var/www/private\n",
             "garbage line that is not a record\n",
-            "SCAN\t/var/www\t3\t3\n",
+            "# 站点 /var/www：候选 3，已检查 3\n",
         )]);
         let report = run_with_command_runner(&runner, DetectionKind::WebshellScan, 10).unwrap();
         assert!(report.findings.iter().any(
@@ -3115,7 +3147,7 @@ mod tests {
 
         let fatal = StubRunner::new(&[concat!(
             "LOVELYRES_WEBSHELL_V2\n",
-            "FATAL\tfind 或 awk 不可用，Webshell 扫描未执行\n",
+            "# 扫描未执行：find 或 awk 不可用\n",
             "LOVELYRES_WEBSHELL_END_V2\n",
         )]);
         assert!(run_with_command_runner(&fatal, DetectionKind::WebshellScan, 10).is_err());
@@ -3125,10 +3157,10 @@ mod tests {
     fn webshell_clean_scan_reports_coverage_not_absence_of_risk() {
         let runner = StubRunner::new(&[concat!(
             "LOVELYRES_WEBSHELL_V2\n",
-            "ROOT\t/var/www\n",
-            "ROOT\t/srv/www\n",
-            "SCAN\t/var/www\t30\t30\n",
-            "SCAN\t/srv/www\t12\t12\n",
+            "# 站点根：/var/www\n",
+            "# 站点根：/srv/www\n",
+            "# 站点 /var/www：候选 30，已检查 30\n",
+            "# 站点 /srv/www：候选 12，已检查 12\n",
             "LOVELYRES_WEBSHELL_END_V2\n",
         )]);
         let report = run_with_command_runner(&runner, DetectionKind::WebshellScan, 10).unwrap();
@@ -3144,6 +3176,42 @@ mod tests {
                 .as_deref()
                 .is_some_and(|text| text.contains("未命中不等于"))
         );
+    }
+
+    /// The collector contract doubles as the workbench display format: every
+    /// `关注：` line names exactly one file, so the path-offer mechanism can
+    /// attach evidence, disarm and quarantine actions without a second pass.
+    #[test]
+    fn webshell_hit_lines_name_their_file_for_path_offers() {
+        let output = concat!(
+            "LOVELYRES_WEBSHELL_V2\n",
+            "# 站点根：/var/www\n",
+            "关注：/var/www/a.php | 代码特征，第 2 行：<?php eval($_POST['x']);?>\n",
+            "关注：/var/www/.a.php | 隐藏脚本\n",
+            "关注：/var/www/bak | pipe.php | 代码特征，第 1 行：eval($x)\n",
+            "缺口：文件不可读，未检查：/var/www/private/x.php\n",
+            "# 站点 /var/www：候选 4，已检查 4\n",
+            "LOVELYRES_WEBSHELL_END_V2\n",
+        );
+        assert_eq!(
+            crate::command_paths::paths_in_output(output),
+            vec![
+                (2, "/var/www/a.php".to_owned()),
+                (3, "/var/www/.a.php".to_owned()),
+            ],
+            "only lines naming one complete safe path may be offered"
+        );
+        // The ambiguous `|` path still parses as a displayed hit, but the
+        // offer extractor refuses it rather than acting on a guessed file.
+        let mut by_path = BTreeMap::new();
+        assert!(
+            parse_webshell_hit(
+                "关注：/var/www/bak | pipe.php | 代码特征，第 9 行：eval($x)",
+                &mut by_path
+            )
+            .is_ok()
+        );
+        assert!(by_path.contains_key("/var/www/bak | pipe.php"));
     }
 
     #[test]

@@ -66,12 +66,10 @@
 
 ### Web 应急：一键 Webshell 扫描与 Web 日志规则
 
-- 一键 Webshell 扫描（“D 盾扫 www”式工作流）：现有 `WebshellScan`（`detection.rs:962`）固定 3 个根目录、仅近 30 天文件、仅 php/jsp/asp/aspx 四种后缀、5 条单行特征、输出文件名列表。缺：
-  - Web 根自动发现：从 nginx/apache 配置指令、运行中 Web 进程、`docker inspect` 挂载反推；Tomcat webapps、`/home/*/public_html` 与非标准安装现在会漏。
-  - 扫描范围：不限修改时间；扩展后缀（phtml/pht/php3-7/phar/jspx/asa/cer/ashx）；图片马（图片二进制内嵌 `<?php`）；配置型后门 `.htaccess`（`AddType x-httpd-php`）与 `.user.ini`（`auto_prepend_file`）——经 grep 核对 core 均无对应检查。
-  - 特征分级：一句话、变形（`call_user_func`+`$_`、`preg_replace /e`、`create_function`）、加密马疑似（单行长 base64、`gzinflate`/`str_rot13`/`openssl_decrypt` 链）；疑似项标明需人工确认，不冒充确证。
-  - 结果处置闭环：文件+行号+特征+风险级+纯文本预览，接现有“下载留证”（file_evidence）与“隔离/去执行位”（emergency_path 计划链路），批量处置带范围预览。
+- 一键 Webshell 扫描（“D 盾扫 www”式工作流）：`WEBSHELL_SCAN_COMMAND`（`detection.rs`）已覆盖 Web 根自动发现（nginx/apache/tomcat 配置指令 + `nginx -T` + 常见目录）、扩展后缀集（php/php3-7/phtml/pht/phar/jspx/asp/aspx/asa/cer/ashx）、图片马（图片内嵌 `<?php`）、配置型后门（`.htaccess`/`AddType`、`./user.ini`/`auto_prepend_file`）、隐藏脚本与特征分级（确证/疑似，单行 base64 长串与解码链标为需人工核对）。扫描器已统一为收集器契约：命中行 `关注：<path> | <类别>，第 N 行：<摘录>` 使工作台 `file-webshell-hint` 直接展示同一结果，命中行经 `command_paths` 提供路径句柄，接通既有“下载留证”（file_evidence）与“隔离/去执行位”（emergency_path 计划-确认-执行-复核-恢复链路）；不可解析/歧义路径仅展示不提供操作。单测 9 项 + 真实 Debian 容器实跑验证。剩余缺口：
+  - 批量处置带范围预览（现为逐命中行操作）。
   - 容器 Web 根一键扫描：选中容器后发现 Web 根，容器内直接扫或整目录拉出扫后回定位容器文件。
+  - `detection.rs` 结构化 `WebshellScan`/`DetectionService` 尚未接 RPC（工作台为桌面可见入口）。
   - 外部扫描器编排：支持配置本机已安装扫描器（如 D 盾）的可执行路径，一键把目标 Web 目录整目录拉回本机临时目录，自动调用扫描、解析并回显结果，与留证/案件记录关联；依赖“传输能力”节的整目录下载。涉及本机路径与本机进程调用，按仓库规范走宿主专用命令而非主窗口白名单，扫描器输出按不可信纯文本处理，任务可取消、临时目录用后清理。
   - 边界：D 盾为闭源 Windows 工具，不能嵌入或再分发；内置特征库与“用户自备路径的外部扫描器编排”是两条互补路线，内置路线仍需写明误报边界。
 - Web 日志攻击特征内置规则：`union.*select`、`../`、`${jndi:`、thinkphp 特征路径与攻击源 IP 统计；现有 `log_analysis.rs` 只是自定义规则框架。
