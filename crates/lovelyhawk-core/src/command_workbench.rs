@@ -1827,7 +1827,7 @@ static CATALOG: &[CommandDefinition] = &[
     portable!(
         "file-webshell-hint",
         Files,
-        "站点目录可疑文件扫描",
+        "WebShell 扫描",
         "发现站点目录并扫描 PHP/JSP/ASP 类脚本、伪装图片、站点配置与隐藏脚本中的可疑特征；命中行提供文件操作入口，均需人工核查，不执行代码。",
         crate::detection::WEBSHELL_SCAN_COMMAND
     )
