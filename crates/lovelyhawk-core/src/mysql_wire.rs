@@ -94,7 +94,9 @@ impl From<MysqlConnectError> for CoreError {
 /// What the server advertised in its HandshakeV10 greeting.
 #[derive(Debug, Clone)]
 pub(crate) struct ServerGreeting {
+    #[allow(dead_code)]
     pub(crate) server_version: String,
+    #[allow(dead_code)]
     pub(crate) connection_id: u32,
     pub(crate) capabilities: u32,
     salt: Vec<u8>,
@@ -195,7 +197,10 @@ impl fmt::Debug for MysqlConnection {
 #[derive(Debug)]
 pub(crate) enum QueryResult {
     Rows(Vec<Vec<Option<Vec<u8>>>>),
-    Ok { affected_rows: u64 },
+    Ok {
+        #[allow(dead_code)]
+        affected_rows: u64,
+    },
 }
 
 impl MysqlConnection {
@@ -423,11 +428,11 @@ fn parse_greeting(packet: &[u8]) -> Result<ServerGreeting, MysqlConnectError> {
         let auth_len = if capabilities & CLIENT_PLUGIN_AUTH != 0 {
             take(&mut cursor, 1)?[0] as usize
         } else {
-            take(&mut cursor, 1)?[0];
+            take(&mut cursor, 1)?;
             21
         };
         take(&mut cursor, 10)?; // reserved
-        let part2_len = auth_len.saturating_sub(8).max(13).min(MAX_SALT_BYTES);
+        let part2_len = auth_len.saturating_sub(8).clamp(13, MAX_SALT_BYTES);
         if let Some(part2) = packet.get(cursor..cursor + part2_len) {
             let usable = part2
                 .iter()

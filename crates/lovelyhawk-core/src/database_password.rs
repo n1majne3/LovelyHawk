@@ -459,7 +459,7 @@ fn one_row(rows: Vec<Row>) -> CoreResult<Row> {
     Ok(rows.into_iter().next().expect("one row"))
 }
 
-fn validate_new_password(password: &SecretValue) -> CoreResult<()> {
+pub(crate) fn validate_new_password(password: &SecretValue) -> CoreResult<()> {
     let value = password.expose();
     if value.is_empty() {
         return Err(invalid("请填写新口令"));
@@ -486,7 +486,10 @@ fn validate_new_password(password: &SecretValue) -> CoreResult<()> {
     Ok(())
 }
 
-fn validate_password_against_role(password: &SecretValue, role_name: &str) -> CoreResult<()> {
+pub(crate) fn validate_password_against_role(
+    password: &SecretValue,
+    role_name: &str,
+) -> CoreResult<()> {
     if !role_name.is_empty()
         && password
             .expose()

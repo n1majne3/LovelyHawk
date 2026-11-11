@@ -17,16 +17,32 @@
 //! `mysql.user`/`SHOW CREATE USER` for the target).
 
 use std::fmt;
+use std::sync::{
+    Mutex,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
+use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncWrite};
 use zeroize::Zeroizing;
 
 use crate::{
     CoreError, CoreResult,
     crypto::SecretValue,
-    mysql_native::{MySqlRuntimeRequest, MySqlSession, connect},
+    database::{
+        DatabaseEngine, DatabaseProfileChanges, DatabaseProfileSnapshot, DatabaseSecretChange,
+        DatabaseService, validate_profile_session,
+    },
+    mysql_native::{MySqlRuntimeRequest, MySqlSession, MySqlTlsMode, connect},
     mysql_wire::{MysqlConnectClass, QueryResult},
+    operations::{
+        DangerousConfirmation, ExecutionReceipt, OperationExecutor, OperationJournal,
+        OperationPlan, OperationState, PlannedOperation, VerificationResult,
+    },
     shell_escape::escape_sql_literal,
+    ssh::BoundSshSession,
 };
 
 fn invalid(reason: &'static str) -> CoreError {
@@ -164,6 +180,7 @@ pub(crate) enum MySqlPasswordResult {
     Applied,
     VerifiedLogin(MySqlPasswordVerification),
     Captured {
+        #[allow(dead_code)]
         plugin: Option<String>,
         verifier: Option<Zeroizing<String>>,
     },
@@ -213,12 +230,12 @@ fn supported_version(product: MySqlProduct, version: &str) -> bool {
     let minor = parts
         .find(|p| !p.is_empty())
         .and_then(|p| p.parse::<u32>().ok());
-    match (product, major, minor) {
-        (MySqlProduct::MySql, Some(8), Some(0 | 4)) => true,
-        (MySqlProduct::MariaDb, Some(10), Some(11)) => true,
-        (MySqlProduct::MariaDb, Some(11), _) => true,
-        _ => false,
-    }
+    matches!(
+        (product, major, minor),
+        (MySqlProduct::MySql, Some(8), Some(0 | 4))
+            | (MySqlProduct::MariaDb, Some(10), Some(11))
+            | (MySqlProduct::MariaDb, Some(11), _)
+    )
 }
 
 /// Parse `CURRENT_USER()` into user + host. The server always returns the
@@ -559,28 +576,33 @@ pub fn verifier_form(plugin: &str) -> Option<String> {
 
 /// Whether `IDENTIFIED BY` plaintext may be sent on this session: TLS, or
 /// the SSH-loopback mode where the tunnel is the documented protection.
-pub fn plaintext_allowed(tls_mode: crate::mysql_native::MySqlTlsMode) -> bool {
+pub fn plaintext_allowed(tls_mode: MySqlTlsMode) -> bool {
     // Both modes are acceptable per the design: TLS protects the wire itself,
     // loopback places the plaintext inside the SSH channel only.
     matches!(
         tls_mode,
-        crate::mysql_native::MySqlTlsMode::VerifyFull
-            | crate::mysql_native::MySqlTlsMode::SshLoopback
+        MySqlTlsMode::VerifyFull | MySqlTlsMode::SshLoopback
     )
+}
+
+/// The authentication form captured from `SHOW CREATE USER` before the
+/// change; restoring replays it verbatim.
+pub(crate) struct CapturedForm<'a> {
+    pub(crate) plugin: Option<&'a str>,
+    pub(crate) verifier: Option<&'a str>,
 }
 
 /// Build the apply/restore statements for a plan. Returns
 /// `(apply, Option<restore>)`; `new_password` is required when the plugin
 /// has no verifier form.
-pub fn build_statements(
+pub(crate) fn build_statements(
     product: MySqlProduct,
     account: &MySqlAccount,
     plugin: &str,
     new_password: &SecretValue,
     log_raw: bool,
     tls_mode: crate::mysql_native::MySqlTlsMode,
-    captured_plugin: Option<&str>,
-    captured_verifier: Option<&str>,
+    captured: CapturedForm<'_>,
 ) -> CoreResult<(Zeroizing<String>, Option<Zeroizing<String>>)> {
     let apply = match plugin {
         PLUGIN_NATIVE => Zeroizing::new(alter_with_verifier(
@@ -614,7 +636,7 @@ pub fn build_statements(
             }));
         }
     };
-    let restore = match (captured_plugin, captured_verifier) {
+    let restore = match (captured.plugin, captured.verifier) {
         (Some(captured_plugin), Some(verifier)) => Some(Zeroizing::new(alter_with_verifier(
             product,
             account,
@@ -712,8 +734,10 @@ mod tests {
             &secret,
             false,
             crate::mysql_native::MySqlTlsMode::VerifyFull,
-            None,
-            None,
+            CapturedForm {
+                plugin: None,
+                verifier: None,
+            },
         )
         .unwrap();
         assert!(apply.contains("ALTER USER 'svc''x'@'%'"));
@@ -726,8 +750,10 @@ mod tests {
             &secret,
             false,
             crate::mysql_native::MySqlTlsMode::VerifyFull,
-            None,
-            None,
+            CapturedForm {
+                plugin: None,
+                verifier: None,
+            },
         )
         .unwrap();
         assert!(apply.contains("IDENTIFIED VIA mysql_native_password USING '*"));
@@ -740,8 +766,10 @@ mod tests {
                 &secret,
                 true,
                 crate::mysql_native::MySqlTlsMode::VerifyFull,
-                None,
-                None,
+                CapturedForm {
+                    plugin: None,
+                    verifier: None,
+                },
             )
             .is_err()
         );
@@ -752,8 +780,10 @@ mod tests {
             &secret,
             false,
             crate::mysql_native::MySqlTlsMode::VerifyFull,
-            None,
-            None,
+            CapturedForm {
+                plugin: None,
+                verifier: None,
+            },
         )
         .unwrap();
         assert!(apply.contains("IDENTIFIED BY 'N3w-Passw0rd!'"));
@@ -765,8 +795,10 @@ mod tests {
                 &secret,
                 false,
                 crate::mysql_native::MySqlTlsMode::VerifyFull,
-                None,
-                None,
+                CapturedForm {
+                    plugin: None,
+                    verifier: None,
+                },
             )
             .is_err()
         );
@@ -783,12 +815,855 @@ mod tests {
             &secret,
             false,
             crate::mysql_native::MySqlTlsMode::VerifyFull,
-            Some("mysql_native_password"),
-            Some("*2470C0C06DEE42FD1618BB99005ADCA2EC9D1E19"),
+            CapturedForm {
+                plugin: Some("mysql_native_password"),
+                verifier: Some("*2470C0C06DEE42FD1618BB99005ADCA2EC9D1E19"),
+            },
         )
         .unwrap();
         let restore = restore.expect("restorable");
         assert!(restore.contains("AS '*2470C0C06DEE42FD1618BB99005ADCA2EC9D1E19'"),);
         assert!(!restore.contains("N3w-Passw0rd!"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DatabaseService orchestration: plan, confirm, execute, verify, restore.
+// ---------------------------------------------------------------------------
+
+/// Plans and restore tokens live only in backend memory.
+const PLAN_TTL: Duration = Duration::from_secs(120);
+const RESTORE_TOKEN_TTL: Duration = Duration::from_secs(600);
+
+/// TLS settings for a resolved MySQL connection: a literal loopback
+/// destination is protected by the SSH channel itself (`SshLoopback`), any
+/// other destination must carry database TLS.
+fn tls_settings_for(
+    connection: &crate::database::DatabaseConnection,
+) -> crate::mysql_native::MySqlTlsSettings {
+    let host = connection
+        .host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(connection.host.as_str());
+    let mode = if host
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+    {
+        MySqlTlsMode::SshLoopback
+    } else {
+        MySqlTlsMode::VerifyFull
+    };
+    crate::mysql_native::MySqlTlsSettings {
+        mode,
+        ca_certificate_pem: None,
+    }
+}
+
+/// What the caller sees before confirming: everything the plan binds.
+#[derive(Debug, Clone, Serialize)]
+pub struct MySqlPasswordPlanView {
+    pub account: String,
+    pub plugin: String,
+    pub product: String,
+    pub is_connection_account: bool,
+    pub restorable: bool,
+    pub update_saved_password: bool,
+    pub warnings: Vec<String>,
+}
+
+/// Immutable plan; consumed once, expires after [`PLAN_TTL`].
+#[derive(Debug)]
+pub struct MySqlPasswordPlan {
+    pub view: MySqlPasswordPlanView,
+    pub operation: OperationPlan,
+    profile_id: String,
+    profile_digest: String,
+    snapshot: DatabaseProfileSnapshot,
+    account: MySqlAccount,
+    apply: Zeroizing<String>,
+    restore: Option<Zeroizing<String>>,
+    captured_verifier: Zeroizing<String>,
+    new_password: SecretValue,
+    is_connection_account: bool,
+    update_saved_password: bool,
+    created: Instant,
+}
+
+/// Verification + bookkeeping reported after a reviewed execution.
+#[derive(Debug)]
+pub struct MySqlPasswordOutcome {
+    pub operation_id: String,
+    pub verification: MySqlPasswordVerification,
+    pub saved_password: crate::database_password::SavedPasswordUpdate,
+    pub restorable: bool,
+    pub journal_recorded: bool,
+}
+
+#[derive(Debug)]
+pub struct MySqlPasswordExecution {
+    pub outcome: MySqlPasswordOutcome,
+    pub restore_token: Option<MySqlPasswordRestoreToken>,
+}
+
+/// One-use token carrying the captured authentication form needed to put the
+/// old password back. Expires after ten minutes.
+#[derive(Debug)]
+pub struct MySqlPasswordRestoreToken {
+    account: MySqlAccount,
+    statement: Zeroizing<String>,
+    expected_verifier: Zeroizing<String>,
+    profile_id: String,
+    target: crate::target::TargetGuard,
+    saved_password_updated: bool,
+    /// When the connection account's own password changed but the saved
+    /// profile was not updated, only the new password can connect to restore.
+    connect_password: Option<SecretValue>,
+    previous_saved_password: Option<SecretValue>,
+    created: Instant,
+    claimed: AtomicBool,
+}
+
+impl MySqlPasswordRestoreToken {
+    pub fn expired(&self) -> bool {
+        self.created.elapsed() > RESTORE_TOKEN_TTL
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MySqlPasswordRestorePlanView {
+    pub account: String,
+    pub saved_password_was_updated: bool,
+}
+
+#[derive(Debug)]
+pub struct MySqlPasswordRestorePlan {
+    pub view: MySqlPasswordRestorePlanView,
+    pub operation: OperationPlan,
+    profile_id: String,
+    profile_digest: String,
+    snapshot: DatabaseProfileSnapshot,
+    account: MySqlAccount,
+    statement: Zeroizing<String>,
+    expected_verifier: Zeroizing<String>,
+    connect_password: Option<SecretValue>,
+    previous_saved_password: Option<SecretValue>,
+    saved_password_updated: bool,
+}
+
+#[derive(Debug)]
+pub struct MySqlPasswordRestoreOutcome {
+    pub operation_id: String,
+    pub verified: bool,
+    pub saved_password_restored: bool,
+    pub journal_recorded: bool,
+}
+
+impl DatabaseService {
+    /// Plans changing `account`'s password on the bound target. Runs the
+    /// Inspect step on its own channel, then freezes the vendor-specific
+    /// statements into the plan.
+    pub async fn plan_mysql_password(
+        &self,
+        session: &BoundSshSession,
+        expected: &DatabaseProfileSnapshot,
+        account: MySqlAccount,
+        new_password: SecretValue,
+        update_saved_password: bool,
+    ) -> CoreResult<MySqlPasswordPlan> {
+        self.target.validate(session.target())?;
+        crate::database_password::validate_new_password(&new_password)?;
+        crate::database_password::validate_password_against_role(&new_password, &account.user)?;
+        let profile_id = expected.view().config.id.clone();
+        let (profile, digest) = self.profiles.resolve_with_digest(&profile_id)?;
+        if digest != expected.digest() {
+            return Err(CoreError::validation(
+                "database profile conflict",
+                "profile changed before planning",
+            ));
+        }
+        if profile.connection.engine != DatabaseEngine::Mysql {
+            return Err(invalid("连接配置不是 MySQL/MariaDB"));
+        }
+        validate_profile_session(&profile, session)?;
+        let request = MySqlRuntimeRequest::new(
+            profile.connection.clone(),
+            tls_settings_for(&profile.connection),
+            profile.password(),
+        )?;
+        let result = self
+            .mysql_password_step(
+                session,
+                &profile_id,
+                expected.digest(),
+                MySqlPasswordStep::Inspect {
+                    request: request_for(&request)?,
+                    account: account.clone(),
+                },
+            )
+            .await?;
+        let MySqlPasswordResult::Inspected(inspect) = result else {
+            return Err(invalid("数据库账号检查返回了不符合约定的结果"));
+        };
+        let inspect = *inspect;
+        if inspect.account_locked {
+            return Err(invalid("该账号已被锁定，不能通过此流程修改口令"));
+        }
+        if !supported_version(inspect.product, &inspect.server_version) {
+            return Err(invalid("该数据库版本尚未评审通过"));
+        }
+        let is_connection_account = inspect.connecting_account.user == account.user
+            && inspect.connecting_account.host == account.host;
+        let restorable = inspect.captured_verifier.is_some() && inspect.captured_plugin.is_some();
+        let (apply, restore) = build_statements(
+            inspect.product,
+            &account,
+            &inspect.plugin,
+            &new_password,
+            inspect.log_raw,
+            request.tls.mode,
+            CapturedForm {
+                plugin: inspect.captured_plugin.as_deref(),
+                verifier: inspect.captured_verifier.as_deref().map(|v| v.as_str()),
+            },
+        )?;
+        let mut warnings = Vec::new();
+        if is_connection_account && !update_saved_password {
+            warnings.push("这是当前连接使用的账号；修改后旧口令将不能再建立连接。".to_owned());
+        }
+        if !restorable {
+            warnings
+                .push("当前连接无法读取该账号的认证串，执行后将不能自动恢复旧口令。".to_owned());
+        }
+        if verifier_form(&inspect.plugin).is_none() {
+            warnings
+                .push("该认证插件没有校验值形式，语句将携带口令明文（连接已加密）。".to_owned());
+        }
+        let product_name = match inspect.product {
+            MySqlProduct::MySql => "MySQL",
+            MySqlProduct::MariaDb => "MariaDB",
+        };
+        let mut operation = OperationPlan::new(
+            session.target().clone(),
+            format!(
+                "将 {product_name} 账号 {} 的口令修改为新值。{}{}",
+                account.quoted(),
+                if is_connection_account && update_saved_password {
+                    "执行后回读复核通过会自动更新已保存的连接口令。"
+                } else {
+                    ""
+                },
+                if restorable {
+                    "执行后可恢复修改前的口令。"
+                } else {
+                    ""
+                }
+            ),
+            true,
+            None,
+        )?;
+        operation
+            .metadata
+            .insert("source".to_owned(), "database-password".to_owned());
+        operation
+            .metadata
+            .insert("database-engine".to_owned(), "mysql".to_owned());
+        Ok(MySqlPasswordPlan {
+            view: MySqlPasswordPlanView {
+                account: account.quoted(),
+                plugin: inspect.plugin.clone(),
+                product: product_name.to_owned(),
+                is_connection_account,
+                restorable,
+                update_saved_password,
+                warnings,
+            },
+            operation,
+            profile_id,
+            profile_digest: digest,
+            snapshot: expected.clone(),
+            account,
+            apply,
+            restore,
+            captured_verifier: inspect
+                .captured_verifier
+                .unwrap_or_else(|| Zeroizing::new(String::new())),
+            new_password,
+            is_connection_account,
+            update_saved_password,
+            created: Instant::now(),
+        })
+    }
+
+    /// Executes a reviewed plan: applies the frozen statement, then
+    /// independently logs in with the new password on a fresh session.
+    pub async fn execute_mysql_password(
+        &self,
+        session: &BoundSshSession,
+        plan: MySqlPasswordPlan,
+        confirmation: DangerousConfirmation,
+        journal: &dyn OperationJournal,
+    ) -> CoreResult<MySqlPasswordExecution> {
+        self.target.validate(session.target())?;
+        if plan.created.elapsed() > PLAN_TTL {
+            return Err(invalid("口令修改计划已过期，请重新修改"));
+        }
+        let (profile, digest) = self.profiles.resolve_with_digest(&plan.profile_id)?;
+        if digest != plan.profile_digest {
+            return Err(CoreError::validation(
+                "database profile conflict",
+                "profile changed before executing",
+            ));
+        }
+        validate_profile_session(&profile, session)?;
+        let request = MySqlRuntimeRequest::new(
+            profile.connection.clone(),
+            tls_settings_for(&profile.connection),
+            profile.password(),
+        )?;
+        let mut operation = PlannedOperation::plan(plan.operation.clone());
+        operation.confirm(confirmation)?;
+        let executor = MySqlPasswordExecutor {
+            service: self.clone(),
+            session: session.clone(),
+            profile_id: plan.profile_id.clone(),
+            profile_digest: plan.profile_digest.clone(),
+            snapshot: plan.snapshot.clone(),
+            request,
+            account: plan.account.clone(),
+            apply: plan.apply.clone(),
+            new_password: SecretValue::new(plan.new_password.expose()),
+            is_connection_account: plan.is_connection_account,
+            update_saved_password: plan.update_saved_password,
+            plan: plan.operation.clone(),
+            outcome: Mutex::new(None),
+        };
+        if let Err(error) = operation.execute(&self.target, &executor).await {
+            if operation.state() == OperationState::StaleAfterExecution {
+                let _ = operation.journal(journal);
+            }
+            return Err(error);
+        }
+        let journal_recorded = operation.journal(journal).is_ok();
+        let skipped_saved = if plan.update_saved_password {
+            crate::database_password::SavedPasswordUpdate::SkippedVerificationNotPassed
+        } else {
+            crate::database_password::SavedPasswordUpdate::NotRequested
+        };
+        let parts = |executor: &MySqlPasswordExecutor| {
+            executor
+                .outcome
+                .lock()
+                .expect("executor state")
+                .take()
+                .unwrap_or((MySqlPasswordVerification::Unverifiable, skipped_saved))
+        };
+        let (verification, saved_password) = if journal_recorded {
+            match operation.verify(&self.target, &executor, journal).await {
+                Ok(_) => parts(&executor),
+                Err(_) => (MySqlPasswordVerification::Unverifiable, skipped_saved),
+            }
+        } else {
+            match operation.execution_receipt() {
+                Ok(receipt) => match executor.verify(operation.definition(), receipt).await {
+                    Ok(_) => parts(&executor),
+                    Err(_) => (MySqlPasswordVerification::Unverifiable, skipped_saved),
+                },
+                Err(_) => (MySqlPasswordVerification::Unverifiable, skipped_saved),
+            }
+        };
+        let saved_updated =
+            saved_password == crate::database_password::SavedPasswordUpdate::Updated;
+        let restore_token = plan
+            .restore
+            .clone()
+            .map(|statement| MySqlPasswordRestoreToken {
+                account: plan.account.clone(),
+                statement,
+                expected_verifier: plan.captured_verifier.clone(),
+                profile_id: plan.profile_id.clone(),
+                target: session.target().clone(),
+                saved_password_updated: saved_updated,
+                connect_password: (plan.is_connection_account && !saved_updated)
+                    .then(|| SecretValue::new(plan.new_password.expose())),
+                previous_saved_password: saved_updated.then(|| profile.password()).flatten(),
+                created: Instant::now(),
+                claimed: AtomicBool::new(false),
+            });
+        Ok(MySqlPasswordExecution {
+            outcome: MySqlPasswordOutcome {
+                operation_id: plan.operation.id.clone(),
+                verification,
+                saved_password,
+                restorable: restore_token.is_some(),
+                journal_recorded,
+            },
+            restore_token,
+        })
+    }
+
+    /// Plans putting back the captured authentication string. The token is
+    /// consumed by value: it expires and can only plan once.
+    pub async fn plan_mysql_password_restore(
+        &self,
+        session: &BoundSshSession,
+        expected: &DatabaseProfileSnapshot,
+        token: MySqlPasswordRestoreToken,
+    ) -> CoreResult<MySqlPasswordRestorePlan> {
+        self.target.validate(session.target())?;
+        if token.claimed.swap(true, Ordering::SeqCst) {
+            return Err(invalid("恢复令牌只能使用一次"));
+        }
+        if token.expired() {
+            return Err(invalid("恢复令牌已过期"));
+        }
+        if token.target != *session.target() || token.profile_id != expected.view().config.id {
+            return Err(invalid("恢复令牌不属于当前目标或连接配置"));
+        }
+        let profile_id = expected.view().config.id.clone();
+        let (_profile, digest) = self.profiles.resolve_with_digest(&profile_id)?;
+        if digest != expected.digest() {
+            return Err(CoreError::validation(
+                "database profile conflict",
+                "profile changed before planning restore",
+            ));
+        }
+        let mut operation = OperationPlan::new(
+            session.target().clone(),
+            format!(
+                "将 MySQL/MariaDB 账号 {} 的口令恢复为修改前保存的认证形式。{}",
+                token.account.quoted(),
+                if token.saved_password_updated {
+                    "已保存的连接口令已改为新口令，回读复核通过后会自动改回修改前的已存口令。"
+                } else {
+                    ""
+                }
+            ),
+            true,
+            None,
+        )?;
+        operation
+            .metadata
+            .insert("source".to_owned(), "database-password".to_owned());
+        operation
+            .metadata
+            .insert("database-engine".to_owned(), "mysql".to_owned());
+        Ok(MySqlPasswordRestorePlan {
+            view: MySqlPasswordRestorePlanView {
+                account: token.account.quoted(),
+                saved_password_was_updated: token.saved_password_updated,
+            },
+            operation,
+            profile_id,
+            profile_digest: digest,
+            snapshot: expected.clone(),
+            account: token.account,
+            statement: token.statement,
+            expected_verifier: token.expected_verifier,
+            connect_password: token.connect_password,
+            previous_saved_password: token.previous_saved_password,
+            saved_password_updated: token.saved_password_updated,
+        })
+    }
+
+    /// Executes a reviewed restore: replays the captured authentication
+    /// statement, then re-captures and compares the verifier constant-time.
+    pub async fn execute_mysql_password_restore(
+        &self,
+        session: &BoundSshSession,
+        plan: MySqlPasswordRestorePlan,
+        confirmation: DangerousConfirmation,
+        journal: &dyn OperationJournal,
+    ) -> CoreResult<MySqlPasswordRestoreOutcome> {
+        self.target.validate(session.target())?;
+        let (profile, digest) = self.profiles.resolve_with_digest(&plan.profile_id)?;
+        if digest != plan.profile_digest {
+            return Err(CoreError::validation(
+                "database profile conflict",
+                "profile changed before executing restore",
+            ));
+        }
+        validate_profile_session(&profile, session)?;
+        let request = MySqlRuntimeRequest::new(
+            profile.connection.clone(),
+            tls_settings_for(&profile.connection),
+            plan.connect_password
+                .map(|value| SecretValue::new(value.expose()))
+                .or_else(|| profile.password()),
+        )?;
+        let mut operation = PlannedOperation::plan(plan.operation.clone());
+        operation.confirm(confirmation)?;
+        let executor = MySqlPasswordRestoreExecutor {
+            service: self.clone(),
+            session: session.clone(),
+            profile_id: plan.profile_id.clone(),
+            profile_digest: plan.profile_digest.clone(),
+            snapshot: plan.snapshot.clone(),
+            request,
+            account: plan.account.clone(),
+            statement: plan.statement.clone(),
+            expected_verifier: plan.expected_verifier.clone(),
+            previous_saved_password: plan
+                .previous_saved_password
+                .map(|value| SecretValue::new(value.expose())),
+            saved_password_updated: plan.saved_password_updated,
+            plan: plan.operation.clone(),
+            outcome: Mutex::new(None),
+        };
+        if let Err(error) = operation.execute(&self.target, &executor).await {
+            if operation.state() == OperationState::StaleAfterExecution {
+                let _ = operation.journal(journal);
+            }
+            return Err(error);
+        }
+        let journal_recorded = operation.journal(journal).is_ok();
+        let take = |executor: &MySqlPasswordRestoreExecutor| {
+            executor
+                .outcome
+                .lock()
+                .expect("executor state")
+                .take()
+                .unwrap_or((false, false))
+        };
+        let (verified, saved_restored) = if journal_recorded {
+            match operation.verify(&self.target, &executor, journal).await {
+                Ok(_) => take(&executor),
+                Err(_) => (false, false),
+            }
+        } else {
+            match operation.execution_receipt() {
+                Ok(receipt) => match executor.verify(operation.definition(), receipt).await {
+                    Ok(_) => take(&executor),
+                    Err(_) => (false, false),
+                },
+                Err(_) => (false, false),
+            }
+        };
+        Ok(MySqlPasswordRestoreOutcome {
+            operation_id: plan.operation.id.clone(),
+            verified,
+            saved_password_restored: saved_restored,
+            journal_recorded,
+        })
+    }
+
+    /// Read-side step runner: keeps re-checking target and profile snapshot
+    /// while the step runs on its own SSH channel.
+    async fn mysql_password_step(
+        &self,
+        session: &BoundSshSession,
+        profile_id: &str,
+        profile_digest: &str,
+        step: MySqlPasswordStep,
+    ) -> CoreResult<MySqlPasswordResult> {
+        self.target.validate(session.target())?;
+        let pending = self.ssh.mysql_password_step_bound(session, step);
+        tokio::pin!(pending);
+        let mut target_check = tokio::time::interval(Duration::from_millis(100));
+        let result = loop {
+            tokio::select! {
+                result = &mut pending => break result,
+                _ = target_check.tick() => {
+                    self.target.validate(session.target())?;
+                    self.profiles.ensure_snapshot(profile_id, profile_digest, "database password change")?;
+                }
+            }
+        };
+        self.target.validate(session.target())?;
+        self.profiles
+            .ensure_snapshot(profile_id, profile_digest, "database password change")?;
+        result
+    }
+
+    /// Write steps run to completion once dispatched; a transport failure
+    /// after dispatch means the remote state is unknown.
+    async fn mysql_password_step_write(
+        &self,
+        session: &BoundSshSession,
+        profile_id: &str,
+        profile_digest: &str,
+        step: MySqlPasswordStep,
+    ) -> CoreResult<MySqlPasswordResult> {
+        self.target.validate(session.target())?;
+        self.profiles
+            .ensure_snapshot(profile_id, profile_digest, "database password change")?;
+        self.ssh
+            .mysql_password_step_bound(session, step)
+            .await
+            .map_err(write_step_error)
+    }
+}
+
+/// Rebuilds a request with a fresh `SecretValue` (each step needs its own
+/// copy of the credential).
+fn request_for(request: &MySqlRuntimeRequest) -> CoreResult<MySqlRuntimeRequest> {
+    MySqlRuntimeRequest::new(
+        request.connection.clone(),
+        request.tls.clone(),
+        request
+            .password
+            .as_ref()
+            .map(|value| SecretValue::new(value.expose())),
+    )
+}
+
+/// A failed reply on a write step means remote state is unknown.
+fn write_step_error(error: CoreError) -> CoreError {
+    match error {
+        CoreError::Ssh { .. } | CoreError::OperationCancelled { .. } => {
+            invalid("口令修改的执行结果未确认，数据库上的口令可能已经改变，请刷新核对")
+        }
+        other => other,
+    }
+}
+
+fn constant_time_eq(left: &Zeroizing<String>, right: &Zeroizing<String>) -> bool {
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right.iter())
+        .fold(0u8, |diff, (a, b)| diff | (a ^ b))
+        == 0
+}
+
+#[derive(Debug)]
+struct MySqlPasswordExecutor {
+    service: DatabaseService,
+    session: BoundSshSession,
+    profile_id: String,
+    profile_digest: String,
+    snapshot: DatabaseProfileSnapshot,
+    request: MySqlRuntimeRequest,
+    account: MySqlAccount,
+    apply: Zeroizing<String>,
+    new_password: SecretValue,
+    is_connection_account: bool,
+    update_saved_password: bool,
+    plan: OperationPlan,
+    outcome: Mutex<
+        Option<(
+            MySqlPasswordVerification,
+            crate::database_password::SavedPasswordUpdate,
+        )>,
+    >,
+}
+
+#[async_trait]
+impl OperationExecutor for MySqlPasswordExecutor {
+    async fn execute(&self, plan: &OperationPlan) -> CoreResult<ExecutionReceipt> {
+        if plan != &self.plan {
+            return Err(CoreError::validation(
+                "database password change",
+                "executor received a different immutable plan",
+            ));
+        }
+        self.service
+            .mysql_password_step_write(
+                &self.session,
+                &self.profile_id,
+                &self.profile_digest,
+                MySqlPasswordStep::Apply {
+                    request: request_for(&self.request)?,
+                    account: self.account.clone(),
+                    statement: Zeroizing::new(self.apply.to_string()),
+                },
+            )
+            .await?;
+        Ok(ExecutionReceipt {
+            summary: format!(
+                "mysql password change committed for {}",
+                self.account.quoted()
+            ),
+            restore_token: None,
+        })
+    }
+
+    async fn verify(
+        &self,
+        plan: &OperationPlan,
+        _receipt: &ExecutionReceipt,
+    ) -> CoreResult<VerificationResult> {
+        if plan != &self.plan {
+            return Err(CoreError::validation(
+                "database password change",
+                "verification received a different immutable plan",
+            ));
+        }
+        let verification = match self
+            .service
+            .mysql_password_step(
+                &self.session,
+                &self.profile_id,
+                &self.profile_digest,
+                MySqlPasswordStep::VerifyLogin {
+                    request: self.request.for_user(
+                        &self.account.user,
+                        Some(SecretValue::new(self.new_password.expose())),
+                    )?,
+                    account: self.account.clone(),
+                },
+            )
+            .await
+        {
+            Ok(MySqlPasswordResult::VerifiedLogin(verification)) => verification,
+            Ok(_) => return Err(invalid("数据库口令复核返回了不符合约定的结果")),
+            Err(CoreError::Ssh { .. }) => MySqlPasswordVerification::Unverifiable,
+            Err(error) => return Err(error),
+        };
+        use crate::database_password::SavedPasswordUpdate;
+        let saved_password = match (self.update_saved_password, verification) {
+            (false, _) => SavedPasswordUpdate::NotRequested,
+            (true, MySqlPasswordVerification::Passed) if self.is_connection_account => {
+                match self.service.save_profile_if_unchanged(
+                    self.snapshot.view().config.clone(),
+                    DatabaseProfileChanges {
+                        password: DatabaseSecretChange::Replace(SecretValue::new(
+                            self.new_password.expose(),
+                        )),
+                    },
+                    Some(&self.snapshot),
+                ) {
+                    Ok(_) => SavedPasswordUpdate::Updated,
+                    Err(CoreError::Validation { .. }) => SavedPasswordUpdate::ProfileChanged,
+                    Err(_) => SavedPasswordUpdate::Failed,
+                }
+            }
+            (true, _) => SavedPasswordUpdate::SkippedVerificationNotPassed,
+        };
+        *self.outcome.lock().expect("executor state") = Some((verification, saved_password));
+        Ok(VerificationResult {
+            passed: verification == MySqlPasswordVerification::Passed,
+            detail: match verification {
+                MySqlPasswordVerification::Passed => "verification:passed",
+                MySqlPasswordVerification::Rejected => "verification:rejected",
+                MySqlPasswordVerification::Unverifiable => "verification:unverifiable",
+            }
+            .to_owned(),
+        })
+    }
+
+    async fn restore(&self, _: &OperationPlan, _: &ExecutionReceipt) -> CoreResult<()> {
+        Err(CoreError::Unsupported {
+            feature: "automatic MySQL password restore",
+        })
+    }
+}
+
+#[derive(Debug)]
+struct MySqlPasswordRestoreExecutor {
+    service: DatabaseService,
+    session: BoundSshSession,
+    profile_id: String,
+    profile_digest: String,
+    snapshot: DatabaseProfileSnapshot,
+    request: MySqlRuntimeRequest,
+    account: MySqlAccount,
+    statement: Zeroizing<String>,
+    expected_verifier: Zeroizing<String>,
+    previous_saved_password: Option<SecretValue>,
+    saved_password_updated: bool,
+    plan: OperationPlan,
+    outcome: Mutex<Option<(bool, bool)>>,
+}
+
+#[async_trait]
+impl OperationExecutor for MySqlPasswordRestoreExecutor {
+    async fn execute(&self, plan: &OperationPlan) -> CoreResult<ExecutionReceipt> {
+        if plan != &self.plan {
+            return Err(CoreError::validation(
+                "database password restore",
+                "executor received a different immutable plan",
+            ));
+        }
+        self.service
+            .mysql_password_step_write(
+                &self.session,
+                &self.profile_id,
+                &self.profile_digest,
+                MySqlPasswordStep::Restore {
+                    request: request_for(&self.request)?,
+                    statement: Zeroizing::new(self.statement.to_string()),
+                },
+            )
+            .await?;
+        Ok(ExecutionReceipt {
+            summary: format!(
+                "mysql password restore committed for {}",
+                self.account.quoted()
+            ),
+            restore_token: None,
+        })
+    }
+
+    async fn verify(
+        &self,
+        plan: &OperationPlan,
+        _receipt: &ExecutionReceipt,
+    ) -> CoreResult<VerificationResult> {
+        if plan != &self.plan {
+            return Err(CoreError::validation(
+                "database password restore",
+                "verification received a different immutable plan",
+            ));
+        }
+        // Read back the authentication form and compare constant-time with
+        // the captured one — the honest restore check (old plaintext is not
+        // available for a login re-verify).
+        let verified = match self
+            .service
+            .mysql_password_step(
+                &self.session,
+                &self.profile_id,
+                &self.profile_digest,
+                MySqlPasswordStep::Capture {
+                    request: request_for(&self.request)?,
+                    account: self.account.clone(),
+                },
+            )
+            .await
+        {
+            Ok(MySqlPasswordResult::Captured { verifier, .. }) => verifier
+                .map(|actual| constant_time_eq(&actual, &self.expected_verifier))
+                .unwrap_or(false),
+            Ok(_) => return Err(invalid("数据库口令恢复复核返回了不符合约定的结果")),
+            Err(_) => false,
+        };
+        let mut saved_restored = false;
+        if verified
+            && self.saved_password_updated
+            && let Some(previous) = &self.previous_saved_password
+        {
+            saved_restored = self
+                .service
+                .save_profile_if_unchanged(
+                    self.snapshot.view().config.clone(),
+                    DatabaseProfileChanges {
+                        password: DatabaseSecretChange::Replace(SecretValue::new(
+                            previous.expose(),
+                        )),
+                    },
+                    Some(&self.snapshot),
+                )
+                .is_ok();
+        }
+        *self.outcome.lock().expect("executor state") = Some((verified, saved_restored));
+        Ok(VerificationResult {
+            passed: verified,
+            detail: if verified {
+                "restore-verification:passed"
+            } else {
+                "restore-verification:mismatch"
+            }
+            .to_owned(),
+        })
+    }
+
+    async fn restore(&self, _: &OperationPlan, _: &ExecutionReceipt) -> CoreResult<()> {
+        Err(CoreError::Unsupported {
+            feature: "MySQL password restore undo",
+        })
     }
 }
