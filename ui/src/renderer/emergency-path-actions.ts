@@ -116,7 +116,7 @@ export function useEmergencyPathActions(api: EmergencyCommandApi, bindingHandle:
     if (abandoned !== null) cancelPlan(abandoned);
   }, []);
 
-  const start = useCallback(async (menuAction: Exclude<EmergencyPathMenuAction, "evidence">,
+  const start = useCallback(async (menuAction: Exclude<EmergencyPathMenuAction, "evidence" | "local-scan">,
     offer: EmergencyCommandPathOffer) => {
     setMenu(null);
     if (bindingHandle === null || operationRef.current !== null ||

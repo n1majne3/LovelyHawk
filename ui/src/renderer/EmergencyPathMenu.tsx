@@ -3,12 +3,13 @@ import { Fragment, useEffect, useLayoutEffect, useRef, useState, type ReactEleme
 import { menuMaxHeight, placeMenu } from "./menu-placement";
 
 import type { EmergencyCommandPathOffer } from "../shared/emergency-command-contract";
-import { InfoIcon, PermissionIcon, RefreshIcon, TrashIcon } from "./file-icons";
+import { InfoIcon, PermissionIcon, RefreshIcon, SearchIcon, TrashIcon } from "./file-icons";
 import "./emergency-path.css";
 
 export type EmergencyPathMenuAction =
   | "properties"
   | "evidence"
+  | "local-scan"
   | "disarm"
   | "remove-capabilities"
   | "restore-residue"
@@ -19,6 +20,8 @@ export interface EmergencyPathMenuProps {
   position: { x: number; y: number };
   offer: EmergencyCommandPathOffer;
   busy: boolean;
+  /** Whether the page this menu is on can fetch to the local scan area. */
+  localScan?: boolean;
   onAction: (action: EmergencyPathMenuAction) => void;
   onDismiss: () => void;
 }
@@ -32,6 +35,7 @@ interface MenuItem {
 
 const ITEMS: MenuItem[] = [
   { action: "evidence", label: "下载留证", icon: <InfoIcon /> },
+  { action: "local-scan", label: "取回本机扫描", icon: <SearchIcon /> },
   {
     action: "properties",
     label: "查看属性",
@@ -71,6 +75,7 @@ export function EmergencyPathMenu({
   position,
   offer,
   busy,
+  localScan = false,
   onAction,
   onDismiss,
 }: EmergencyPathMenuProps) {
@@ -121,7 +126,9 @@ export function EmergencyPathMenu({
       }}
     >
       <p className="emergency-path-menu-title" title={offer.path}>{offer.path}</p>
-      {ITEMS.map((item) => (
+      {/* Fetching to the local scan area only exists where the page wired it;
+          the item stays off menus that never handle the action. */}
+      {ITEMS.filter((item) => item.action !== "local-scan" || localScan).map((item) => (
         <Fragment key={item.action}>
           {item.action === "disarm" ? <div className="emergency-path-menu-separator" role="separator" /> : null}
           <button

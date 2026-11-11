@@ -26,6 +26,8 @@
     "allow-file-evidence-begin",
     "allow-packet-capture-evidence-begin",
     "allow-pod-file-evidence-begin",
+    "allow-local-scan",
+    "allow-local-scan-configure",
     "allow-kubernetes-manifest-export",
     "allow-application-log-export",
     "allow-disposal-report-export",

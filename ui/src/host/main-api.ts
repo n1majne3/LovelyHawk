@@ -100,6 +100,7 @@ import {
   type WindowThemeApplied,
 } from "../shared/contract.js";
 import { isExecDirectoryPath, isExecFilePath } from "../shared/exec-files-contract.js";
+import { isLocalScanRequest, matchesLocalScanResult, type LocalScanRequest } from "../shared/local-scan-contract.js";
 import { BackendClient } from "./backend-client.js";
 import { hostBackendTransport, invokeHost, utf8ByteLength, type BackendTransport } from "./transport.js";
 
@@ -229,6 +230,19 @@ export function createMainApi(transport: BackendTransport = hostBackendTransport
       const result = await host("file_evidence_begin", { request }, DIALOG_TIMEOUT_MS);
       if (result === null) return null;
       if (!matchesFileEvidenceResult(request as FileEvidenceRequest, result)) refuse("留证响应与本次请求不一致。");
+      return result;
+    },
+    localScan: async (...values: unknown[]) => {
+      requireArity(values, 1, "本机扫描请求无效。");
+      const request = values[0];
+      if (!isLocalScanRequest(request)) refuse("本机扫描请求无效。");
+      // configure's program path comes from a system dialog; every other
+      // action resolves stored ids, so the page never sends a local path.
+      const command = request.action === "configure" ? "local_scan_configure" : "local_scan";
+      const timeoutMs = request.action === "fetch" || request.action === "run" ? 700_000 : request.action === "configure" ? DIALOG_TIMEOUT_MS : LOCAL_TIMEOUT_MS;
+      const result = await host(command, { request }, timeoutMs);
+      if (result === null) return null;
+      if (!matchesLocalScanResult(request as LocalScanRequest, result)) refuse("本机扫描结果与本次请求不一致。");
       return result;
     },
     packetCaptureEvidence: async (...values: unknown[]) => {

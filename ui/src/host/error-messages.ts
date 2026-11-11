@@ -117,6 +117,12 @@ export const BACKEND_ERROR_MESSAGES: Readonly<Record<string, string>> = Object.f
   "emergency-path-capability-privilege": "修改文件能力需要目标机上的 root 权限或免密码 sudo。",
   "emergency-path-capability-kind": "只能移除普通文件的能力；符号链接、目录与其他类型不支持。",
   "emergency-path-capability-empty": "该文件当前没有文件能力，无需移除。",
+  "emergency-path-restore-tools": "目标机缺少 sha256sum 等校验工具，无法安全核对写回的内容。",
+  "emergency-path-restore-privilege": "写回系统命令需要目标机上的 root 权限或免密码 sudo。",
+  "emergency-path-restore-kind": "只能恢复普通文件；符号链接、目录与其他类型不支持。",
+  "emergency-path-restore-location": "只能恢复 /bin、/sbin、/usr/bin 等系统命令目录里的命令，这个位置不在范围内。",
+  "emergency-path-restore-empty": "同目录下没有找到可用于恢复的备份残留。",
+  "emergency-path-restore-ambiguous": "同目录下有多个备份残留，无法自动判断来源，请先人工核实该用哪一个。",
 
   // Baseline and audits.
   "baseline-binding-unavailable": "目标连接已断开或已切换，基线检查没有执行。",

@@ -478,6 +478,8 @@ export interface LovelyHawkApi {
   postgresqlRuntime(request: PostgresqlRuntimeRequest): Promise<PostgresqlRuntimeResponse>;
   mysqlRuntime(request: MySqlRuntimeRequest): Promise<MySqlRuntimeResponse>;
   fileEvidence(request: FileEvidenceRequest): Promise<FileEvidenceResult | null>;
+  /** Fetch offered target content into the local quarantine area and launch a configured local engine against it. */
+  localScan(request: import("./local-scan-contract").LocalScanRequest): Promise<import("./local-scan-contract").LocalScanResult | null>;
   packetCaptureEvidence(request: PacketCaptureEvidenceRequest): Promise<PacketCaptureEvidenceResult | null>;
   podFileEvidence(request: PodFileEvidenceRequest): Promise<PodFileEvidenceResult | null>;
   nginxRepair(request: NginxRepairRequest): Promise<NginxRepairResponse>;

@@ -1,0 +1,268 @@
+/* 取回本机扫描: the fetch summary, the engine list and the run answer. The
+   dialog frame itself comes from emergency-path.css. */
+
+.emergency-path-dialog.local-scan-dialog {
+  width: min(680px, calc(100vw - 48px));
+  max-height: calc(100vh - 48px);
+  overflow: auto;
+}
+
+.local-scan-dialog > p {
+  margin: 0;
+  line-height: 1.6;
+}
+
+.local-scan-dialog dd,
+.local-scan-dialog header p {
+  overflow-wrap: anywhere;
+}
+
+.local-scan-scope {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  background: var(--surface-alt);
+}
+
+.local-scan-scope legend {
+  padding: 0 4px;
+  color: var(--muted);
+  font-size: var(--font-caption);
+}
+
+.local-scan-scope label {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  color: var(--text);
+  font-size: var(--font-small);
+  line-height: 1.5;
+}
+
+.local-scan-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.local-scan-actions button,
+.local-scan-engine-actions button,
+.local-scan-secondary button,
+.local-scan-configure button {
+  min-height: 32px;
+  padding: 6px 15px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  color: var(--text);
+  background: var(--surface);
+  font: inherit;
+  font-size: var(--font-small);
+  cursor: pointer;
+}
+
+.local-scan-actions button.is-primary,
+.local-scan-run > button.is-primary {
+  border-color: var(--accent);
+  color: var(--on-accent);
+  background: var(--accent);
+  font-weight: 650;
+}
+
+.local-scan-actions button:disabled,
+.local-scan-engine-actions button:disabled,
+.local-scan-secondary button:disabled,
+.local-scan-configure button:disabled,
+.local-scan-run > button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.local-scan-actions p {
+  margin: 0;
+  color: var(--muted);
+  font-size: var(--font-caption);
+}
+
+.local-scan-engines h3 {
+  margin: 0 0 8px;
+  font-size: var(--font-small);
+}
+
+.local-scan-engines > p {
+  margin: 0 0 8px;
+  color: var(--muted);
+  font-size: var(--font-small);
+}
+
+.local-scan-engines > p button {
+  margin-left: 8px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--accent);
+  background: var(--surface);
+  font: inherit;
+  cursor: pointer;
+}
+
+.local-scan-engine-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0 0 8px;
+  padding: 0;
+  list-style: none;
+}
+
+.local-scan-engine-list label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: var(--font-small);
+}
+
+.local-scan-engine-list label:has(input:checked) {
+  border-color: var(--accent);
+  background: var(--surface-alt);
+}
+
+.local-scan-engine-list strong {
+  flex: none;
+}
+
+.local-scan-engine-kind {
+  flex: none;
+  color: var(--muted);
+  font-size: var(--font-caption);
+}
+
+.local-scan-engine-list code {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: var(--font-caption);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.local-scan-engine-actions {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.local-scan-configure {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-alt);
+}
+
+.local-scan-configure label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--muted);
+  font-size: var(--font-caption);
+}
+
+.local-scan-configure input,
+.local-scan-configure select {
+  min-height: 34px;
+  padding: 6px 9px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  color: var(--text);
+  background: var(--surface);
+  font: inherit;
+  font-size: var(--font-small);
+}
+
+.local-scan-configure input:focus-visible,
+.local-scan-configure select:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -1px;
+}
+
+.local-scan-configure p {
+  margin: 0;
+}
+
+.local-scan-configure button {
+  align-self: flex-start;
+}
+
+.local-scan-run {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.local-scan-run > button.is-primary {
+  align-self: flex-start;
+}
+
+.local-scan-secondary {
+  display: flex;
+  gap: 8px;
+}
+
+.local-scan-warning {
+  margin: 10px 0 0;
+  padding: 8px 10px;
+  border: 1px solid var(--warning-border);
+  border-radius: 8px;
+  color: var(--warning-text);
+  background: var(--warning-soft);
+  font-size: var(--font-caption);
+}
+
+.local-scan-skipped {
+  margin: 10px 0 0;
+  padding-left: 18px;
+  color: var(--muted);
+  font-size: var(--font-caption);
+}
+
+.local-scan-entries {
+  margin-top: 10px;
+}
+
+.local-scan-entries summary {
+  color: var(--muted);
+  font-size: var(--font-caption);
+  cursor: pointer;
+}
+
+.local-scan-entries ul {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  color: var(--text);
+  font-size: var(--font-caption);
+  word-break: break-all;
+}
+
+.local-scan-output {
+  overflow: auto;
+  max-height: 220px;
+  margin: 6px 0 0;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--console-text);
+  background: var(--console-bg);
+  font-family: "Cascadia Mono", monospace;
+  font-size: var(--font-caption);
+  white-space: pre-wrap;
+  word-break: break-all;
+}

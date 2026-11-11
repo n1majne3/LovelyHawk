@@ -46,12 +46,14 @@ import { EmergencyPathMenu } from "./EmergencyPathMenu";
 import { useEmergencyPathActions } from "./emergency-path-actions";
 import { FileEvidenceDialog } from "./FileEvidenceDialog";
 import type { FileEvidenceApi } from "../shared/file-evidence-contract";
+import { LocalScanDialog } from "./LocalScanDialog";
+import type { LocalScanApi } from "../shared/local-scan-contract";
 import { useListExpiry } from "./use-list-expiry";
 import "./emergency-commands.css";
 
 export interface EmergencyCommandsPageProps {
   bindingHandle: string | null;
-  api: EmergencyCommandApi & FileEvidenceApi;
+  api: EmergencyCommandApi & FileEvidenceApi & LocalScanApi;
   /**
    * A command-history record whose check should be put in front of the
    * operator again. A new key is a new request; nothing runs by itself.
@@ -76,7 +78,8 @@ const RERUN_MISSING: Record<Exclude<EmergencyHistoryLocationStatus, "found">, st
 
 export function EmergencyCommandsPage({ bindingHandle, api, rerun = null, runIn = null }: EmergencyCommandsPageProps) {
   const [evidence, setEvidence] = useState<{ offer: EmergencyCommandPathOffer; binding: string; api: FileEvidenceApi; returnFocus: HTMLElement | null } | null>(null);
-  useEffect(() => { setEvidence(null); }, [api, bindingHandle]);
+  const [localScan, setLocalScan] = useState<{ offer: EmergencyCommandPathOffer; binding: string; api: LocalScanApi; returnFocus: HTMLElement | null } | null>(null);
+  useEffect(() => { setEvidence(null); setLocalScan(null); }, [api, bindingHandle]);
   const [state, dispatch] = useReducer(emergencyCommandReducer, undefined, createEmergencyCommandState);
   const [refreshVersion, setRefreshVersion] = useState(0);
   const [runVersion, setRunVersion] = useState(0);
@@ -471,6 +474,7 @@ export function EmergencyCommandsPage({ bindingHandle, api, rerun = null, runIn 
         position={pathActions.menu.position}
         offer={pathActions.menu.offer}
         busy={acting !== null}
+        localScan={true}
         onAction={(action) => {
           const { offer } = pathActions.menu ?? { offer: null };
           if (offer !== null && action === "evidence" && bindingHandle !== null) {
@@ -478,12 +482,22 @@ export function EmergencyCommandsPage({ bindingHandle, api, rerun = null, runIn 
               (document.activeElement instanceof HTMLElement ? document.activeElement : null);
             pathActions.dismissMenu();
             setEvidence({ offer, binding: bindingHandle, api, returnFocus });
-          } else if (offer !== null && action !== "evidence") void pathActions.start(action, offer);
+          } else if (offer !== null && action === "local-scan" && bindingHandle !== null) {
+            const returnFocus = document.querySelector<HTMLElement>(`[data-path-handle="${CSS.escape(offer.pathHandle)}"]`) ??
+              (document.activeElement instanceof HTMLElement ? document.activeElement : null);
+            pathActions.dismissMenu();
+            setLocalScan({ offer, binding: bindingHandle, api, returnFocus });
+          } else if (offer !== null && action !== "evidence" && action !== "local-scan") {
+            void pathActions.start(action, offer);
+          }
         }}
         onDismiss={pathActions.dismissMenu} />}
       {evidence !== null && evidence.binding === bindingHandle && evidence.api === api ? <FileEvidenceDialog
         key={`${evidence.binding}:${evidence.offer.pathHandle}`} api={api} binding={evidence.binding}
         offer={evidence.offer} returnFocus={evidence.returnFocus} onClose={() => setEvidence(null)} /> : null}
+      {localScan !== null && localScan.binding === bindingHandle && localScan.api === api ? <LocalScanDialog
+        key={`${localScan.binding}:${localScan.offer.pathHandle}`} api={api} binding={localScan.binding}
+        offer={localScan.offer} returnFocus={localScan.returnFocus} onClose={() => setLocalScan(null)} /> : null}
       {acting !== null && (acting.action === null ? <EmergencyPathProperties
         path={acting.offer.path}
         detail={acting.detail}

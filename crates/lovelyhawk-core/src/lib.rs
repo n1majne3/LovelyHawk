@@ -45,6 +45,7 @@ pub mod investigation;
 pub mod java;
 pub mod kubernetes;
 pub mod line_config_visual;
+pub mod local_scan;
 pub mod log_analysis;
 pub mod mariadb_config;
 pub mod middleware;

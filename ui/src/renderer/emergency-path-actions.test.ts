@@ -89,6 +89,7 @@ function deferred<T>() {
 function mockApi() {
   return {
     fileEvidence: vi.fn(async () => null),
+    localScan: vi.fn(async () => null),
     loadEmergencyCommandCatalog: vi.fn(async () => ({
       snapshotHandle: "snapshot-one", expiresInSeconds: 300, commandSet: "portable", commands: [], containers: [],
     })),
@@ -100,7 +101,7 @@ function mockApi() {
     cancelEmergencyPathAction: vi.fn(async () => undefined),
     undoEmergencyPathAction: vi.fn(async (): Promise<unknown> => undone),
     locateEmergencyHistoryCommand: vi.fn(async (): Promise<unknown> => ({ status: "missing", commandHandle: null })),
-  } satisfies EmergencyCommandApi & import("../shared/file-evidence-contract").FileEvidenceApi;
+  } satisfies EmergencyCommandApi & import("../shared/file-evidence-contract").FileEvidenceApi & import("../shared/local-scan-contract").LocalScanApi;
 }
 
 let api = mockApi();

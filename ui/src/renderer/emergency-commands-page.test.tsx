@@ -21,8 +21,9 @@ import {
 import { EmergencyPathDialog, EmergencyPathOutcome, EmergencyPathProperties, symbolicMode } from "./EmergencyPathDialog";
 import { EmergencyPathMenu } from "./EmergencyPathMenu";
 
-const api: EmergencyCommandApi & import("../shared/file-evidence-contract").FileEvidenceApi = {
+const api: EmergencyCommandApi & import("../shared/file-evidence-contract").FileEvidenceApi & import("../shared/local-scan-contract").LocalScanApi = {
   fileEvidence: async () => { throw new Error(); },
+  localScan: async () => { throw new Error(); },
   loadEmergencyCommandCatalog: async () => { throw new Error(); },
   runEmergencyCommand: async () => { throw new Error(); },
   inspectEmergencyPath: async () => { throw new Error(); },
@@ -266,6 +267,8 @@ describe("EmergencyCommandsPage", () => {
         onAction={() => undefined} onDismiss={() => undefined} />,
     );
     expect(html).toContain("/usr/local/lib/pyshared/.helper");
+    // The local scan item only exists where the page wired it; this bare menu has none.
+    expect(html).not.toContain("取回本机扫描");
     expect(html).toContain("查看属性");
     expect(html).toContain("去掉执行权限");
     expect(html).toContain("移除文件能力");
@@ -568,7 +571,8 @@ describe("EmergencyCommandsPage", () => {
       .filter((name) => /className="[^"]*emergency-path-(?:backdrop|dialog|menu)\b/u
         .test(readFileSync(new URL(name, directory), "utf8")));
     expect(users.sort()).toEqual([
-      "EmergencyPathDialog.tsx", "EmergencyPathMenu.tsx", "FileEvidenceDialog.tsx", "LogRulesDialog.tsx",
+      "EmergencyPathDialog.tsx", "EmergencyPathMenu.tsx", "FileEvidenceDialog.tsx", "LocalScanDialog.tsx",
+      "LogRulesDialog.tsx",
     ]);
     for (const name of users) {
       expect(readFileSync(new URL(name, directory), "utf8"), name).toContain('import "./emergency-path.css";');

@@ -670,7 +670,9 @@ export function IntegrityPage({ bindingHandle, api, initialState }: IntegrityPag
               (document.activeElement instanceof HTMLElement ? document.activeElement : null);
             pathActions.dismissMenu();
             setEvidence({ offer, binding: bindingHandle, returnFocus });
-          } else if (offer !== null && action !== "evidence") void pathActions.start(action, offer);
+          } else if (offer !== null && action !== "evidence" && action !== "local-scan") {
+            void pathActions.start(action, offer);
+          }
         }}
         onDismiss={pathActions.dismissMenu} />}
       {evidence !== null && evidence.binding === bindingHandle ? <FileEvidenceDialog

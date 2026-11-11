@@ -28,6 +28,7 @@ mod java_hot_update_api;
 mod kubernetes_pod_evidence_api;
 mod kubernetes_read_api;
 mod kubernetes_write_api;
+mod local_scan_api;
 mod log_analysis_read_api;
 mod log_rules_api;
 mod mysql_runtime_api;
@@ -99,6 +100,7 @@ use crate::{
     },
     kubernetes_read_api::{KubernetesListInput, KubernetesReadApi, KubernetesReadApiError},
     kubernetes_write_api::{KubernetesWriteAction, KubernetesWriteApi, KubernetesWriteApiError},
+    local_scan_api::{LocalScanApi, LocalScanError, LocalScanRequest},
     log_analysis_read_api::{
         LogAnalysisReadApi, LogAnalysisReadApiError, LogCorrelationInput, LogIocSearchInput,
         LogSourceReadInput,
@@ -214,6 +216,7 @@ pub struct BackendState {
     docker_write: DockerWriteApi,
     emergency_command: EmergencyCommandApi,
     file_evidence: FileEvidenceApi,
+    local_scan: LocalScanApi,
     postgresql_runtime: PostgresqlRuntimeApi,
     mysql_runtime: MySqlRuntimeApi,
     case_workspace: CaseWorkspaceApi,
@@ -316,6 +319,11 @@ impl BackendState {
         let mysql_runtime = MySqlRuntimeApi::new(services.clone(), Arc::clone(&ssh));
         let file_evidence =
             FileEvidenceApi::new(services.clone(), emergency_command.paths().clone());
+        let local_scan = LocalScanApi::new(
+            services.clone(),
+            Arc::clone(&ssh),
+            emergency_command.paths().clone(),
+        );
         let sftp_browser = SftpBrowserApi::new(services.clone(), Arc::clone(&ssh));
         let integrity = Arc::new(IntegrityApi::new(
             services.clone(),
@@ -369,6 +377,7 @@ impl BackendState {
             docker_write,
             emergency_command,
             file_evidence,
+            local_scan,
             postgresql_runtime,
             mysql_runtime,
             sftp_browser,
@@ -833,6 +842,7 @@ impl BackendState {
                                 .close_binding(&params.binding_handle);
                             self.mysql_runtime.close_binding(&params.binding_handle);
                             self.file_evidence.close_binding(&params.binding_handle);
+                            self.local_scan.close_binding(&params.binding_handle);
                             self.case_workspace.close_binding(&params.binding_handle);
                             self.check_audit_read.close_binding(&params.binding_handle);
                             self.check_audit_write.close_binding(&params.binding_handle);
@@ -1154,6 +1164,15 @@ impl BackendState {
                     .await
                     .map(to_value)
                     .map_err(file_evidence_failure),
+                Err(failure) => Err(failure),
+            },
+            RpcMethod::LocalScan => match parse_params::<LocalScanRequest>(request.params) {
+                Ok(params) => self
+                    .local_scan
+                    .dispatch(params)
+                    .await
+                    .map(to_value)
+                    .map_err(local_scan_failure),
                 Err(failure) => Err(failure),
             },
             RpcMethod::JavaHotUpdate => {
@@ -2917,6 +2936,8 @@ enum RpcMethod {
     MySqlRuntime,
     #[serde(rename = "emergency.file-evidence")]
     FileEvidence,
+    #[serde(rename = "local.scan")]
+    LocalScan,
     #[serde(rename = "case.workspace")]
     CaseWorkspace,
     #[serde(rename = "case.library")]
@@ -5572,6 +5593,50 @@ fn packet_capture_evidence_failure(error: PacketCaptureEvidenceError) -> RpcFail
     };
     RpcFailure {
         operation: "packet capture evidence",
+        code,
+        public_message: message,
+        source: None,
+    }
+}
+
+fn local_scan_failure(error: LocalScanError) -> RpcFailure {
+    let (code, message) = match error {
+        LocalScanError::Invalid => ("invalid-params", "本机扫描请求无效。"),
+        LocalScanError::Stale => (
+            "local-scan-stale",
+            "连接、文件结果或取回内容已失效，请重新操作。",
+        ),
+        LocalScanError::Capacity => (
+            "local-scan-capacity",
+            "取回数量已达上限，请先删除较早的取回内容。",
+        ),
+        LocalScanError::Tools => (
+            "local-scan-tools",
+            "目标机缺少 tar 或 find，无法打包取回内容。",
+        ),
+        LocalScanError::Kind => (
+            "local-scan-kind",
+            "只能取回普通文件或目录；符号链接、套接字与设备不支持。",
+        ),
+        LocalScanError::Size => (
+            "local-scan-size",
+            "取回包超出大小上限，请缩小目录或改用文件留证。",
+        ),
+        LocalScanError::Engine => (
+            "local-scan-engine",
+            "引擎不存在或配置无效，请重新配置本机扫描引擎。",
+        ),
+        LocalScanError::Launch => (
+            "local-scan-launch",
+            "无法启动本机扫描引擎，请检查程序路径与权限。",
+        ),
+        LocalScanError::Unavailable => (
+            "local-scan-unavailable",
+            "无法完成取回或启动，请检查连接、目标工具与本机空间。",
+        ),
+    };
+    RpcFailure {
+        operation: "local scan",
         code,
         public_message: message,
         source: None,

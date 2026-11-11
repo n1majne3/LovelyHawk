@@ -249,6 +249,8 @@ pub fn run() -> ExitCode {
             main_commands::file_evidence_begin,
             main_commands::packet_capture_evidence_begin,
             main_commands::pod_file_evidence_begin,
+            main_commands::local_scan,
+            main_commands::local_scan_configure,
             main_commands::kubernetes_manifest_export,
             main_commands::application_log_export,
             main_commands::disposal_report_export,

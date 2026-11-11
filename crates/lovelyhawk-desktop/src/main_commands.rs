@@ -401,6 +401,90 @@ pub async fn packet_capture_evidence_begin<R: Runtime>(
     host.bridge.call("packet-capture.evidence", params).await
 }
 
+/// Fetch-for-local-scan calls carry local paths in both directions, so the
+/// whole surface stays behind dedicated commands rather than the backend
+/// whitelist. `configure` is refused here: the program path comes from the
+/// system file dialog, never from the page.
+#[tauri::command]
+pub async fn local_scan<R: Runtime>(
+    window: WebviewWindow<R>,
+    host: State<'_, Host>,
+    request: Value,
+) -> CommandResult<Value> {
+    require_main(&window)?;
+    let action = request.get("action").and_then(Value::as_str);
+    let fields_ok = request.as_object().is_some_and(|fields| {
+        if fields.is_empty()
+            || fields.len() > 4
+            || !fields.contains_key("action")
+            || fields.contains_key("program")
+        {
+            return false;
+        }
+        let strings = |keys: &[&str]| {
+            keys.iter()
+                .all(|key| fields.get(*key).and_then(Value::as_str).is_some())
+        };
+        match action {
+            Some("engines") => fields.len() == 1,
+            Some("fetch") => {
+                fields.len() == 4 && strings(&["bindingHandle", "pathHandle", "scope"])
+            }
+            Some("inspect") | Some("reveal") | Some("discard") => {
+                fields.len() == 3 && strings(&["bindingHandle", "fetchId"])
+            }
+            Some("run") => fields.len() == 4 && strings(&["bindingHandle", "fetchId", "engineId"]),
+            Some("remove-engine") => fields.len() == 2 && strings(&["engineId"]),
+            _ => false,
+        }
+    });
+    if !fields_ok {
+        return Err("本机扫描请求无效。".to_owned());
+    }
+    host.bridge.call("local.scan", request).await
+}
+
+/// Configuring a scan engine: the program path comes from the file dialog.
+#[tauri::command]
+pub async fn local_scan_configure<R: Runtime>(
+    window: WebviewWindow<R>,
+    host: State<'_, Host>,
+    request: Value,
+) -> CommandResult<Value> {
+    require_main(&window)?;
+    let valid = request.as_object().is_some_and(|fields| {
+        fields.len() == 4
+            && text_field(&request, "action") == Some("configure")
+            && ["name", "kind"]
+                .iter()
+                .all(|key| fields.get(*key).and_then(Value::as_str).is_some())
+            && fields.get("arguments").is_some_and(Value::is_array)
+            && matches!(
+                fields.get("kind").and_then(Value::as_str),
+                Some("gui" | "cli")
+            )
+    });
+    if !valid {
+        return Err("引擎配置请求无效。".to_owned());
+    }
+    let Some(path) = local_files::choose(
+        &window,
+        "选择本机扫描引擎程序",
+        DialogKind::OpenFile,
+        Some(Filter {
+            name: "可执行程序",
+            extensions: &["exe", "bat", "cmd", "com"],
+        }),
+    )
+    .await
+    else {
+        return Ok(Value::Null);
+    };
+    let mut params = request;
+    params["program"] = Value::String(path.to_string_lossy().into_owned());
+    host.bridge.call("local.scan", params).await
+}
+
 /// Keeping a pod file as evidence: the folder comes from the dialog. The pod
 /// is the list's handles and the path the page's, both checked by the backend.
 #[tauri::command]

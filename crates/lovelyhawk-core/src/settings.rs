@@ -365,6 +365,10 @@ pub struct AppSettings {
     pub ai: AiSettings,
     #[serde(default)]
     pub security_reference: SecurityReferenceSettings,
+    /// Local scan engines for fetched content (D盾-style). Paths inside are
+    /// local machine paths, set only through the native file dialog.
+    #[serde(default)]
+    pub local_scan: crate::local_scan::LocalScanSettings,
 }
 
 impl Default for AppSettings {
@@ -386,6 +390,7 @@ impl Default for AppSettings {
             ssh: SshSettings::default(),
             ai: AiSettings::default(),
             security_reference: SecurityReferenceSettings::default(),
+            local_scan: crate::local_scan::LocalScanSettings::default(),
         }
     }
 }
@@ -504,6 +509,7 @@ impl AppSettings {
             proxy.validate()?;
         }
         self.security_reference.validate()?;
+        self.local_scan.validate()?;
         Ok(())
     }
 }
