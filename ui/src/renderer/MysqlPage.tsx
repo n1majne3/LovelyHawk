@@ -1,6 +1,6 @@
 import { TransientNotice } from "./NotificationCenter";
 import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState, useSyncExternalStore } from "react";
-import type { MySqlPasswordChange, MySqlProfileInput, MySqlProfileSummary, MySqlRuntimeApi } from "../shared/mysql-runtime-contract";
+import type { MySqlInstanceReview, MySqlPasswordChange, MySqlProfileInput, MySqlProfileSummary, MySqlReviewLevel, MySqlRuntimeApi } from "../shared/mysql-runtime-contract";
 import { MysqlRuntimeController } from "./mysql-runtime-controller";
 import { DialogHost } from "./DialogHost";
 import { useConfirmDialog } from "./use-confirm-dialog";
@@ -50,6 +50,43 @@ function MysqlProfileEditor({ editor, saving, onChange, onSubmit, onCancel, name
       </fieldset>
     </form>
   </section></div>;
+}
+
+const reviewLevelText: Record<MySqlReviewLevel, string> = { info: "参考", review: "需人工核对", high: "高风险" };
+const reviewLevelClass: Record<MySqlReviewLevel, string> = { info: "is-info", review: "is-review", high: "is-high" };
+const reviewVariables = ["general_log", "general_log_file", "log_output", "local_infile", "secure_file_priv"] as const;
+export function MysqlReviewPanel({ profile, review, onClose }: { profile: MySqlProfileSummary; review: MySqlInstanceReview; onClose(): void }): React.JSX.Element {
+  return <section className="database-result" aria-label={`实例检查：${profile.name}`}>
+    <h3>实例检查：{profile.name}</h3>
+    <p>{review.product} {review.serverVersion} · 连接账号 {review.connecting} · 账号 {review.accounts.length}/{review.accountTotal} 个 · 自定义函数 {review.udfTotal} 个</p>
+    <p role="note">以下均为需人工核对的线索，不代表已确认的风险结论；未发现条目也不代表无风险。</p>
+    <h4>线索</h4>
+    {review.findings.length ? <ul className="database-findings">{review.findings.map((finding, index) => <li key={`${finding.code}-${index}`}>
+      <span className={`database-badge ${reviewLevelClass[finding.level]}`}>{reviewLevelText[finding.level]}</span> <code>{finding.code}</code> {finding.detail}
+    </li>)}</ul> : <p>未返回线索条目。</p>}
+    <h4>数据库账号（{review.accounts.length}/{review.accountTotal}）</h4>
+    {review.accounts.length ? <div className="database-table" tabIndex={0} role="region" aria-label="数据库账号，可横向滚动"><table>
+      <thead><tr><th>账号</th><th>认证插件</th><th>高危权限</th><th>状态</th></tr></thead>
+      <tbody>{review.accounts.map((account, index) => <tr key={`${account.user}@${account.host}-${index}`}>
+        <th scope="row">{account.user}@{account.host}</th><td>{account.plugin}</td>
+        <td>{[account.superuser ? "SUPER" : null, account.filePriv ? "FILE" : null, account.grantPriv ? "GRANT" : null].filter(Boolean).join("、") || "—"}</td>
+        <td>{account.emptySecret ? <span className="database-badge is-high">空口令</span> : null}{account.locked === true ? <> <span className="database-badge">已锁定</span></> : account.locked === null ? <> <span className="database-badge">锁定状态未知</span></> : null}{!account.emptySecret && account.locked === false ? "—" : null}</td>
+      </tr>)}</tbody></table></div> : <p>未取得账号列表。</p>}
+    {review.udfs.length || review.udfTotal ? <>
+      <h4>自定义函数 UDF（{review.udfs.length}/{review.udfTotal}）</h4>
+      {review.udfs.length ? <ul>{review.udfs.map((udf, index) => <li key={`${udf.name}-${index}`}><code>{udf.name}</code> · 动态库 {udf.library}</li>)}</ul> : <p>仅取得数量，未列出条目。</p>}
+    </> : null}
+    <h4>重点变量</h4>
+    <dl className="database-variables">{reviewVariables.map(name => <div key={name}><dt><code>{name}</code></dt><dd>{name in review.variables ? (review.variables[name] === "" ? "空值" : review.variables[name]) : "未提供"}</dd></div>)}</dl>
+    {review.gaps.length ? <><h4>读取缺口</h4><ul>{review.gaps.map((gap, index) => <li key={index}>无法读取：{gap}</li>)}</ul></> : null}
+    {review.log ? <><h4>错误日志线索</h4>
+      <p>日志 {review.log.path} · 读取末尾 {review.log.tailBytes} 字节。</p>
+      {review.log.denied.length ? <p>连接被拒来源：{review.log.denied.map(item => `${item.user}@${item.host} × ${item.count}`).join("、")}</p> : null}
+      {review.log.hits.length ? <ul>{review.log.hits.map((hit, index) => <li key={index}><code>{hit.kind}</code> {hit.excerpt}</li>)}</ul> : null}
+      {!review.log.denied.length && !review.log.hits.length ? <p>日志末尾未检出相关条目。</p> : null}
+    </> : null}
+    <div className="database-toolbar"><button type="button" onClick={onClose}>关闭检查结果</button></div>
+  </section>;
 }
 
 export const MysqlPage = forwardRef<MysqlPageHandle, MysqlPageProps>(function MysqlPage({ api, bindingHandle, targetLabel }, ref) {
@@ -173,9 +210,14 @@ export const MysqlPage = forwardRef<MysqlPageHandle, MysqlPageProps>(function My
             <td>{profile.tlsMode === "verify-full" ? `TLS 校验证书与地址${profile.hasCa ? "（私有 CA）" : ""}` : "仅 SSH 加密（回环）"}</td>
             <td>{profile.hasPassword ? "已保存" : "未保存"}</td>
             <td><button disabled={blocked || !profile.hasPassword || profile.unassigned || passwordProfile !== null} onClick={event => { passwordOpener.current = event.currentTarget; setPasswordProfile(profile); }}>修改口令</button>
+              <button disabled={blocked || !profile.hasPassword || profile.unassigned || passwordProfile !== null} onClick={() => void controller.inspect(profile.profileHandle)}>{state.reviewBusy === profile.profileHandle ? "正在检查…" : "检查实例"}</button>
               <button disabled={blocked} onClick={() => startEditor(profile)}>编辑</button>
               <button disabled={blocked} onClick={() => void remove(profile)}>删除</button></td>
           </tr>)}</tbody></table></div> : null}
+        {state.profiles.map(item => {
+          const review = state.reviews[item.profileHandle];
+          return review ? <MysqlReviewPanel key={item.profileHandle} profile={item} review={review} onClose={() => controller.clearReview(item.profileHandle)} /> : null;
+        })}
         {state.profiles.some(profile => profile.unassigned) ? <p>标记“待关联”的旧连接需要先编辑并保存，明确关联当前 SSH 主机后才能修改口令。</p> : null}
       </>}
       {state.error ? <TransientNotice source="数据库" message={state.error ?? ""} severity="error"><p role="alert" className="database-error">{state.error}</p></TransientNotice> : null}
@@ -187,8 +229,8 @@ export const MysqlPage = forwardRef<MysqlPageHandle, MysqlPageProps>(function My
     {passwordProfile && bindingHandle ? <MysqlPasswordDialog api={api} bindingHandle={bindingHandle} profile={passwordProfile} targetLabel={targetLabel}
       onClose={() => { setPasswordProfile(null); if (passwordOpener.current?.isConnected) passwordOpener.current.focus(); else heading.current?.focus(); }}
       onDirty={dirty => { passwordDirty.current = dirty; }}
-      onProfile={profile => { setPasswordProfile(profile); void controller.list(); }}
-      onInvalidate={() => void controller.list()}
+      onProfile={profile => { setPasswordProfile(profile); controller.clearReview(profile.profileHandle); void controller.list(); }}
+      onInvalidate={() => { if (passwordProfile) controller.clearReview(passwordProfile.profileHandle); void controller.list(); }}
       ask={dialog.ask} /> : null}
     {dialog.dialog ? <DialogHost dialog={dialog.dialog} onResolve={dialog.resolve} /> : null}
   </section>;

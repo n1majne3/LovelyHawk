@@ -60,7 +60,7 @@
 
 ### 数据库应急（入侵排查视角，非配置基线）
 
-- MySQL/MariaDB 运行实例在线检查与日志溯源：匿名账号、`root@'%'`、空口令、非 root `File_priv`、`mysql.func` 表 UDF 痕迹（sys_eval/sys_exec）、`general_log_file` 指向 Web 目录、general log 中 `Access denied` 爆破统计与 `INTO OUTFILE` 写马 SQL。现有 MySQL 基线全部为配置文件项（`baseline.rs:530` 起）；可复用 PostgreSQL 原生协议模式（`postgresql_wire.rs`）。
+- ~~MySQL/MariaDB 运行实例在线检查与日志溯源~~：已实现 `mysql_instance.rs` 只读实例审查 + backend `mysql.runtime` `inspect` 动作——账号目录复核（匿名账号、`root@'%'` 类远程 root、空口令、`File_priv`/SUPER/GRANT、锁定态，MySQL `mysql.user` 与 MariaDB `mysql.global_priv` 双 schema）、`mysql.func` UDF 行、风险相关全局变量（`general_log`/`general_log_file`/`log_output`/`local_infile`/`secure_file_priv`），以及 general_log 有界尾部溯源（`Access denied` 来源统计、`INTO OUTFILE`/`CREATE FUNCTION` 写马语句命中）；所有结论分级为线索而非定性，变量缺失/非 FILE 日志/日志不可读以缺口明示。MySQL 8.0.46 与 MariaDB 11.8.9 一次性容器端到端验证（探针夹具覆盖全部发现类别，64/64）。
 - 数据库账号口令修改（运维2 用 `SET PASSWORD` 加固 MySQL root 弱口令）：现无此功能，桌面端只能编辑 LovelyHawk 自己保存的连接口令；PostgreSQL 原生连接强制只读（`postgresql_native.rs:214`）；core 遗留的通用 `plan_mutation`（`database.rs:1507`，任意 SQL）未接线，按 `UNWIRED_FEATURES.md` 不作为此功能的实现路径。需按产品分别实现固定语句（PostgreSQL `ALTER ROLE … PASSWORD`、MySQL/MariaDB `ALTER USER 'u'@'host' IDENTIFIED BY`，区分 host 部分），新口令只在 core 内处理、不进 DTO/日志/审计原文；确认时说明业务应用配置中的旧口令会失效，执行后用新口令独立登录复核，并提示更新应用配置与已保存的连接口令。MySQL 依赖先补原生连接。
 - MSSQL 日志审计：ERRORLOG/log.trc、18454/18456 事件、`xp_cmdshell`/`sp_OACreate` 与 `xplog70.dll` 等存储过程恢复痕迹。未实现；Windows 侧 16 类事件日志查询是现成载体。
 

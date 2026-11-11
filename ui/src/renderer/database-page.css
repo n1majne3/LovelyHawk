@@ -40,4 +40,15 @@
 .database-retention textarea { margin-top: 8px; white-space: pre; }
 .database-objects { border-top: 1px solid var(--border); margin-top: 18px; padding-top: 14px; }
 .database-access :is(h5, h6) { font-size: var(--font-body); line-height: 1.5; margin: 16px 0 10px; overflow-wrap: anywhere; }
+.database-result h4 { margin: 14px 0 8px; font-size: var(--font-body); }
+.database-badge { display: inline-flex; align-items: center; justify-content: center; padding: 0 7px; border-radius: 4px; color: var(--muted); background: var(--surface-inset); font-size: var(--font-caption); font-weight: 600; line-height: 20px; white-space: nowrap; word-break: keep-all; }
+.database-badge.is-high { color: var(--danger-text); background: var(--danger-soft); }
+.database-badge.is-review { color: var(--warning-text); background: var(--warning-soft); }
+.database-badge.is-info { color: var(--info-text); background: var(--info-soft); }
+.database-findings { padding-left: 18px; }
+.database-findings li { margin: 6px 0; overflow-wrap: anywhere; }
+.database-variables { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 8px; margin: 8px 0; }
+.database-variables div { min-width: 0; }
+.database-variables dt { color: var(--text-secondary); font-size: var(--font-small); }
+.database-variables dd { margin: 2px 0 0; overflow-wrap: anywhere; }
 @media (max-width: 850px) { .database-page { padding: 12px; } .database-fields, .database-observations { grid-template-columns: minmax(0, 1fr); } .database-page header { flex-wrap: wrap; } }

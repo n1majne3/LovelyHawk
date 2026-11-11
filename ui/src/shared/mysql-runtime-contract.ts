@@ -13,7 +13,8 @@ export type MySqlRuntimeRequest =
   | { action: "plan-password"; bindingHandle: string; profileHandle: string; account: MySqlAccountInput; password: string; updateSavedPassword: boolean }
   | { action: "execute-password"; bindingHandle: string; planHandle: string }
   | { action: "plan-password-restore"; bindingHandle: string; restoreHandle: string; profileHandle: string }
-  | { action: "execute-password-restore"; bindingHandle: string; planHandle: string };
+  | { action: "execute-password-restore"; bindingHandle: string; planHandle: string }
+  | { action: "inspect"; bindingHandle: string; profileHandle: string };
 export interface MySqlPasswordPlanView {
   account: string; plugin: string; product: string; isConnectionAccount: boolean;
   restorable: boolean; updateSavedPassword: boolean; warnings: string[];
@@ -35,6 +36,23 @@ export interface MySqlProfileSummary {
   profileHandle: string; name: string; host: string; port: number; username: string; database: string;
   tlsMode: MySqlTlsMode; hasPassword: boolean; hasCa: boolean; unassigned: boolean;
 }
+export interface MySqlReviewAccount {
+  user: string; host: string; plugin: string;
+  emptySecret: boolean; superuser: boolean; filePriv: boolean; grantPriv: boolean; locked: boolean | null;
+}
+export interface MySqlReviewUdf { name: string; library: string; }
+export type MySqlReviewLevel = "info" | "review" | "high";
+export interface MySqlReviewFinding { level: MySqlReviewLevel; code: string; detail: string; }
+export interface MySqlReviewDenied { user: string; host: string; count: number; }
+export interface MySqlReviewHit { kind: string; excerpt: string; }
+export interface MySqlReviewLog { path: string; tailBytes: number; denied: MySqlReviewDenied[]; hits: MySqlReviewHit[]; }
+export interface MySqlInstanceReview {
+  product: "MySQL" | "MariaDB"; serverVersion: string; connecting: string;
+  accounts: MySqlReviewAccount[]; accountTotal: number;
+  udfs: MySqlReviewUdf[]; udfTotal: number;
+  variables: Record<string, string>;
+  findings: MySqlReviewFinding[]; gaps: string[]; log: MySqlReviewLog | null;
+}
 export type MySqlRuntimeResponse =
   | { kind: "rejected"; action: MySqlRuntimeRequest["action"]; code: "invalid-params" | "invalid" | "stale" | "busy" | "capacity" | "store" | "unknown-state" | "rejected"; detail: string }
   | { kind: "profiles"; profiles: MySqlProfileSummary[] }
@@ -44,7 +62,8 @@ export type MySqlRuntimeResponse =
   | { kind: "password-plan"; planHandle: string; expiresInMs: number; plan: MySqlPasswordPlanView }
   | { kind: "password-result"; result: MySqlPasswordResult }
   | { kind: "password-restore-plan"; planHandle: string; expiresInMs: number; plan: MySqlPasswordRestorePlanView }
-  | { kind: "password-restore-result"; result: MySqlPasswordRestoreResult };
+  | { kind: "password-restore-result"; result: MySqlPasswordRestoreResult }
+  | { kind: "review"; review: MySqlInstanceReview };
 export interface MySqlRuntimeApi {
   mysqlRuntime(request: MySqlRuntimeRequest): Promise<MySqlRuntimeResponse>;
 }
@@ -101,6 +120,7 @@ export function isMySqlRuntimeRequest(value: unknown): value is MySqlRuntimeRequ
     case "execute-password": return keys(value, [...basic, "planHandle"]) && string(value.planHandle, 128);
     case "plan-password-restore": return keys(value, [...basic, "restoreHandle", "profileHandle"]) && string(value.restoreHandle, 128) && string(value.profileHandle, 128);
     case "execute-password-restore": return keys(value, [...basic, "planHandle"]) && string(value.planHandle, 128);
+    case "inspect": return keys(value, [...basic, "profileHandle"]) && string(value.profileHandle, 128);
     default: return false;
   }
 }
@@ -120,6 +140,45 @@ function passwordVerification(value: unknown): value is MySqlPasswordVerificatio
 function savedUpdate(value: unknown): value is SavedPasswordUpdate {
   return oneOf(value, ["not-requested", "updated", "profile-changed", "skipped-verification-not-passed", "failed"]);
 }
+function reviewAccount(value: unknown): value is MySqlReviewAccount {
+  return record(value) && keys(value, ["user", "host", "plugin", "emptySecret", "superuser", "filePriv", "grantPriv", "locked"]) &&
+    string(value.user, 128) && string(value.host, 255) && string(value.plugin, 128) &&
+    typeof value.emptySecret === "boolean" && typeof value.superuser === "boolean" && typeof value.filePriv === "boolean" &&
+    typeof value.grantPriv === "boolean" && (value.locked === null || typeof value.locked === "boolean");
+}
+function reviewUdf(value: unknown): value is MySqlReviewUdf {
+  return record(value) && keys(value, ["name", "library"]) && string(value.name, 128) && string(value.library, 512);
+}
+function reviewFinding(value: unknown): value is MySqlReviewFinding {
+  return record(value) && keys(value, ["level", "code", "detail"]) &&
+    oneOf(value.level, ["info", "review", "high"]) && string(value.code, 64) && string(value.detail, 1024);
+}
+function reviewDenied(value: unknown): value is MySqlReviewDenied {
+  return record(value) && keys(value, ["user", "host", "count"]) &&
+    string(value.user, 128) && string(value.host, 255) && integer(value.count, 2147483647, 1);
+}
+function reviewHit(value: unknown): value is MySqlReviewHit {
+  return record(value) && keys(value, ["kind", "excerpt"]) && string(value.kind, 64) && string(value.excerpt, 1024);
+}
+function reviewLog(value: unknown): value is MySqlReviewLog {
+  return record(value) && keys(value, ["path", "tailBytes", "denied", "hits"]) &&
+    string(value.path, 1024) && integer(value.tailBytes, 16777216) &&
+    Array.isArray(value.denied) && value.denied.length <= 8 && value.denied.every(reviewDenied) &&
+    Array.isArray(value.hits) && value.hits.length <= 40 && value.hits.every(reviewHit);
+}
+function instanceReview(value: unknown): value is MySqlInstanceReview {
+  return record(value) && keys(value, ["product", "serverVersion", "connecting", "accounts", "accountTotal", "udfs", "udfTotal", "variables", "findings", "gaps", "log"]) &&
+    oneOf(value.product, ["MySQL", "MariaDB"]) && string(value.serverVersion, 128) && string(value.connecting, 300) &&
+    Array.isArray(value.accounts) && value.accounts.length <= 512 && value.accounts.every(reviewAccount) &&
+    integer(value.accountTotal, 1000000) && value.accountTotal >= value.accounts.length &&
+    Array.isArray(value.udfs) && value.udfs.length <= 64 && value.udfs.every(reviewUdf) &&
+    integer(value.udfTotal, 1000000) && value.udfTotal >= value.udfs.length &&
+    record(value.variables) && Object.keys(value.variables).length <= 64 &&
+    Object.entries(value.variables).every(([name, item]) => string(name, 128) && string(item, 1024, true)) &&
+    Array.isArray(value.findings) && value.findings.length <= 64 && value.findings.every(reviewFinding) &&
+    Array.isArray(value.gaps) && value.gaps.length <= 24 && value.gaps.every(gap => string(gap, 256)) &&
+    (value.log === null || reviewLog(value.log));
+}
 function profileSummary(value: unknown): value is MySqlProfileSummary {
   return record(value) && keys(value, ["profileHandle", "name", "host", "port", "username", "database", "tlsMode", "hasPassword", "hasCa", "unassigned"]) &&
     string(value.profileHandle, 128) && string(value.name, 256) && host(value.host) && integer(value.port, 65535, 1) &&
@@ -129,7 +188,7 @@ function profileSummary(value: unknown): value is MySqlProfileSummary {
 export function isMySqlRuntimeResponse(value: unknown): value is MySqlRuntimeResponse {
   if (!record(value)) return false;
   switch (value.kind) {
-    case "rejected": return keys(value, ["kind", "action", "code", "detail"]) && oneOf(value.action, ["list", "save", "plan-delete", "delete", "plan-password", "execute-password", "plan-password-restore", "execute-password-restore"]) && oneOf(value.code, ["invalid-params", "invalid", "stale", "busy", "capacity", "store", "unknown-state", "rejected"]) && string(value.detail, 2048);
+    case "rejected": return keys(value, ["kind", "action", "code", "detail"]) && oneOf(value.action, ["list", "save", "plan-delete", "delete", "plan-password", "execute-password", "plan-password-restore", "execute-password-restore", "inspect"]) && oneOf(value.code, ["invalid-params", "invalid", "stale", "busy", "capacity", "store", "unknown-state", "rejected"]) && string(value.detail, 2048);
     case "profiles": return keys(value, ["kind", "profiles"]) && Array.isArray(value.profiles) && value.profiles.length <= 256 &&
       value.profiles.every(profileSummary) && new Set(value.profiles.map(item => item.profileHandle)).size === value.profiles.length;
     case "saved": return keys(value, ["kind", "profile"]) && profileSummary(value.profile) && !value.profile.unassigned;
@@ -143,6 +202,7 @@ export function isMySqlRuntimeResponse(value: unknown): value is MySqlRuntimeRes
     case "password-restore-result": return keys(value, ["kind", "result"]) && record(value.result) && keys(value.result, ["verified", "savedPasswordRestored", "journalRecorded", "profile"]) &&
       typeof value.result.verified === "boolean" && typeof value.result.savedPasswordRestored === "boolean" && typeof value.result.journalRecorded === "boolean" &&
       (value.result.profile === null || profileSummary(value.result.profile));
+    case "review": return keys(value, ["kind", "review"]) && instanceReview(value.review);
     default: return false;
   }
 }
@@ -161,5 +221,6 @@ export function matchesMySqlRuntimeResponse(request: MySqlRuntimeRequest, respon
     case "execute-password": return response.kind === "password-result";
     case "plan-password-restore": return response.kind === "password-restore-plan";
     case "execute-password-restore": return response.kind === "password-restore-result";
+    case "inspect": return response.kind === "review";
   }
 }
