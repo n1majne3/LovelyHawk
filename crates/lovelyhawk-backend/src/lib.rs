@@ -30,6 +30,7 @@ mod kubernetes_read_api;
 mod kubernetes_write_api;
 mod log_analysis_read_api;
 mod log_rules_api;
+mod mysql_runtime_api;
 mod nginx_repair_api;
 mod notes_api;
 mod packet_capture_evidence_api;
@@ -103,6 +104,7 @@ use crate::{
         LogSourceReadInput,
     },
     log_rules_api::{LogRulesApi, LogRulesApiError, LogRulesRequest},
+    mysql_runtime_api::{MySqlRuntimeApi, MySqlRuntimeRequest},
     nginx_repair_api::{NginxRepairApi, NginxRepairError, NginxRepairRequest},
     notes_api::{NotesApi, NotesApiError},
     packet_capture_evidence_api::{
@@ -213,6 +215,7 @@ pub struct BackendState {
     emergency_command: EmergencyCommandApi,
     file_evidence: FileEvidenceApi,
     postgresql_runtime: PostgresqlRuntimeApi,
+    mysql_runtime: MySqlRuntimeApi,
     case_workspace: CaseWorkspaceApi,
     case_library: CaseLibraryApi,
     sftp_browser: SftpBrowserApi,
@@ -310,6 +313,7 @@ impl BackendState {
             DockerWriteApi::new(services.clone(), Arc::clone(&ssh), Arc::clone(&docker_read));
         let emergency_command = EmergencyCommandApi::new(services.clone(), Arc::clone(&ssh));
         let postgresql_runtime = PostgresqlRuntimeApi::new(services.clone(), Arc::clone(&ssh));
+        let mysql_runtime = MySqlRuntimeApi::new(services.clone(), Arc::clone(&ssh));
         let file_evidence =
             FileEvidenceApi::new(services.clone(), emergency_command.paths().clone());
         let sftp_browser = SftpBrowserApi::new(services.clone(), Arc::clone(&ssh));
@@ -366,6 +370,7 @@ impl BackendState {
             emergency_command,
             file_evidence,
             postgresql_runtime,
+            mysql_runtime,
             sftp_browser,
             integrity,
             integrity_write,
@@ -826,6 +831,7 @@ impl BackendState {
                             self.java_hot_update.close_binding(&params.binding_handle);
                             self.postgresql_runtime
                                 .close_binding(&params.binding_handle);
+                            self.mysql_runtime.close_binding(&params.binding_handle);
                             self.file_evidence.close_binding(&params.binding_handle);
                             self.case_workspace.close_binding(&params.binding_handle);
                             self.check_audit_read.close_binding(&params.binding_handle);
@@ -1137,6 +1143,10 @@ impl BackendState {
                     Err(failure) => Err(failure),
                 }
             }
+            RpcMethod::MySqlRuntime => match parse_params::<MySqlRuntimeRequest>(request.params) {
+                Ok(params) => Ok(to_value(self.mysql_runtime.dispatch(params).await)),
+                Err(failure) => Err(failure),
+            },
             RpcMethod::FileEvidence => match parse_params::<FileEvidenceRequest>(request.params) {
                 Ok(params) => self
                     .file_evidence
@@ -2903,6 +2913,8 @@ enum RpcMethod {
     JavaHotUpdateClassStage,
     #[serde(rename = "postgresql.runtime")]
     PostgresqlRuntime,
+    #[serde(rename = "mysql.runtime")]
+    MySqlRuntime,
     #[serde(rename = "emergency.file-evidence")]
     FileEvidence,
     #[serde(rename = "case.workspace")]

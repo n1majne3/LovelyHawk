@@ -158,6 +158,8 @@ pub struct DatabaseProfileConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub postgresql_tls: Option<PostgresqlTlsSettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mysql_tls: Option<crate::mysql_native::MySqlTlsSettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh_connection_id: Option<String>,
 }
 
@@ -167,6 +169,7 @@ impl DatabaseProfileConfig {
             id: Uuid::new_v4().to_string(),
             name: name.into(),
             postgresql_tls: None,
+            mysql_tls: None,
             ssh_connection_id: None,
             connection: DatabaseConnection {
                 engine,
@@ -198,6 +201,9 @@ impl DatabaseProfileConfig {
         }
         self.connection.validate()?;
         if let Some(tls) = &self.postgresql_tls {
+            tls.validate(&self.connection)?;
+        }
+        if let Some(tls) = &self.mysql_tls {
             tls.validate(&self.connection)?;
         }
         Ok(())
@@ -509,6 +515,7 @@ pub(crate) struct ResolvedDatabaseProfile {
     pub(crate) connection: DatabaseConnection,
     pub(crate) credentials: DatabaseCredentials,
     pub(crate) postgresql_tls: Option<PostgresqlTlsSettings>,
+    pub(crate) mysql_tls: Option<crate::mysql_native::MySqlTlsSettings>,
 }
 
 impl ResolvedDatabaseProfile {
@@ -737,6 +744,7 @@ impl DatabaseProfileRepository {
             ResolvedDatabaseProfile {
                 ssh_connection_id: profile.config.ssh_connection_id,
                 postgresql_tls: profile.config.postgresql_tls,
+                mysql_tls: profile.config.mysql_tls,
                 connection: profile.config.connection,
                 credentials: password
                     .map_or_else(DatabaseCredentials::none, DatabaseCredentials::password),
@@ -3183,6 +3191,7 @@ mod tests {
                 DatabaseProfileConfig {
                     ssh_connection_id: None,
                     postgresql_tls: None,
+                    mysql_tls: None,
                     id: "mysql-main".to_owned(),
                     name: "MySQL main".to_owned(),
                     connection: connection(DatabaseEngine::Mysql),
@@ -3200,6 +3209,7 @@ mod tests {
                 DatabaseProfileConfig {
                     ssh_connection_id: None,
                     postgresql_tls: None,
+                    mysql_tls: None,
                     id: "mysql-main".to_owned(),
                     name: "MySQL runtime".to_owned(),
                     connection: connection(DatabaseEngine::Mysql),
@@ -3340,6 +3350,7 @@ mod tests {
         let mysql_profile = ResolvedDatabaseProfile {
             ssh_connection_id: None,
             postgresql_tls: None,
+            mysql_tls: None,
             connection: DatabaseConnection {
                 engine: DatabaseEngine::Mysql,
                 host: "127.0.0.1".to_owned(),
@@ -3379,6 +3390,7 @@ mod tests {
         let postgresql_profile = ResolvedDatabaseProfile {
             ssh_connection_id: None,
             postgresql_tls: None,
+            mysql_tls: None,
             connection: DatabaseConnection {
                 engine: DatabaseEngine::Postgresql,
                 host: "::1".to_owned(),
@@ -3409,6 +3421,7 @@ mod tests {
         let password_profile = ResolvedDatabaseProfile {
             ssh_connection_id: None,
             postgresql_tls: None,
+            mysql_tls: None,
             connection: connection(DatabaseEngine::Mysql),
             credentials: DatabaseCredentials::password(SecretValue::new("do-not-export")),
         };
@@ -3425,6 +3438,7 @@ mod tests {
         let profile = ResolvedDatabaseProfile {
             ssh_connection_id: None,
             postgresql_tls: None,
+            mysql_tls: None,
             connection: DatabaseConnection {
                 engine: DatabaseEngine::Mysql,
                 host: "127.0.0.1".to_owned(),
@@ -3503,6 +3517,7 @@ mod tests {
         let profile = ResolvedDatabaseProfile {
             ssh_connection_id: None,
             postgresql_tls: None,
+            mysql_tls: None,
             connection: DatabaseConnection {
                 engine: DatabaseEngine::Mysql,
                 host: "127.0.0.1".to_owned(),
@@ -3536,6 +3551,7 @@ mod tests {
         let profile = ResolvedDatabaseProfile {
             ssh_connection_id: None,
             postgresql_tls: None,
+            mysql_tls: None,
             connection: DatabaseConnection {
                 engine: DatabaseEngine::Mysql,
                 host: "127.0.0.1".to_owned(),
@@ -4024,6 +4040,7 @@ mod tests {
             &ResolvedDatabaseProfile {
                 ssh_connection_id: None,
                 postgresql_tls: None,
+                mysql_tls: None,
                 connection: connection(DatabaseEngine::Mysql),
                 credentials,
             },

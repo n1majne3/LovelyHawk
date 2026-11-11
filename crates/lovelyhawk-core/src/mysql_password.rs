@@ -959,6 +959,26 @@ pub struct MySqlPasswordRestoreOutcome {
     pub journal_recorded: bool,
 }
 
+impl MySqlPasswordPlan {
+    pub fn definition(&self) -> &OperationPlan {
+        &self.operation
+    }
+
+    pub fn view(&self) -> &MySqlPasswordPlanView {
+        &self.view
+    }
+}
+
+impl MySqlPasswordRestorePlan {
+    pub fn definition(&self) -> &OperationPlan {
+        &self.operation
+    }
+
+    pub fn view(&self) -> &MySqlPasswordRestorePlanView {
+        &self.view
+    }
+}
+
 impl DatabaseService {
     /// Plans changing `account`'s password on the bound target. Runs the
     /// Inspect step on its own channel, then freezes the vendor-specific
@@ -988,7 +1008,10 @@ impl DatabaseService {
         validate_profile_session(&profile, session)?;
         let request = MySqlRuntimeRequest::new(
             profile.connection.clone(),
-            tls_settings_for(&profile.connection),
+            profile
+                .mysql_tls
+                .clone()
+                .unwrap_or_else(|| tls_settings_for(&profile.connection)),
             profile.password(),
         )?;
         let result = self
@@ -1118,7 +1141,10 @@ impl DatabaseService {
         validate_profile_session(&profile, session)?;
         let request = MySqlRuntimeRequest::new(
             profile.connection.clone(),
-            tls_settings_for(&profile.connection),
+            profile
+                .mysql_tls
+                .clone()
+                .unwrap_or_else(|| tls_settings_for(&profile.connection)),
             profile.password(),
         )?;
         let mut operation = PlannedOperation::plan(plan.operation.clone());
@@ -1286,7 +1312,10 @@ impl DatabaseService {
         validate_profile_session(&profile, session)?;
         let request = MySqlRuntimeRequest::new(
             profile.connection.clone(),
-            tls_settings_for(&profile.connection),
+            profile
+                .mysql_tls
+                .clone()
+                .unwrap_or_else(|| tls_settings_for(&profile.connection)),
             plan.connect_password
                 .map(|value| SecretValue::new(value.expose()))
                 .or_else(|| profile.password()),
