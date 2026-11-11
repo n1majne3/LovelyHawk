@@ -10,7 +10,7 @@
   - 实验：PostgreSQL 16 一次性容器 6/6（`tools/lab/probe-postgresql-password.mjs`）。
   - 桌面：调试构建 21/21（`tools/lab/probe-ui-postgresql-password.mjs`），报告在 `target/desktop-debug/postgresql-password-*/`。
   - 已知限制：执行中按 Escape 的阻止只有单元测试覆盖（探针中执行先于按键完成）；服务层 duplex 夹具未建，提交后失败路径由单元接缝测试与实验覆盖；其他 PostgreSQL 版本、TLS 证书模式、复制拓扑未测。
-- MySQL / MariaDB：未开始。
+- MySQL / MariaDB：进行中（2026-11-11，本地未推送）。core `mysql_wire.rs`（自写协议：HandshakeV10、`mysql_native_password`/`caching_sha2_password` 快速认证、完整认证仅 TLS、COM_QUERY 文本结果集、有界读取）与 `mysql_native.rs`（TLS 升级、请求校验、会话封装）已实现并过单测 8 项；口令模块、backend API、UI、实验室验证未完成。
 
 ## 共同规则
 
