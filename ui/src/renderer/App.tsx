@@ -20,6 +20,7 @@ import type {
 } from "../shared/contract";
 import type { SshTargetSummary } from "../shared/ssh-contract";
 import type { DatabasePageHandle } from "./DatabasePage";
+import type { MysqlPageHandle } from "./MysqlPage";
 import type { ConfigurationPageHandle } from "./ConfigurationPage";
 import { ConnectionManager } from "./ConnectionManager";
 import {
@@ -63,6 +64,7 @@ import { NotificationStack } from "./NotificationStack";
  * entry chunk, so a page still loads from local disk with nothing to fetch.
  */
 const DatabasePage = lazy(async () => ({ default: (await import("./DatabasePage")).DatabasePage }));
+const MysqlPage = lazy(async () => ({ default: (await import("./MysqlPage")).MysqlPage }));
 const SecurityReference = lazy(async () => ({ default: (await import("./SecurityReference")).SecurityReference }));
 const Notes = lazy(async () => ({ default: (await import("./Notes")).Notes }));
 const ConfigurationPage = lazy(async () => ({ default: (await import("./ConfigurationPage")).ConfigurationPage }));
@@ -180,6 +182,7 @@ export function App() {
   const overlayOpen = connectionManagerRequest !== undefined || settingsOpen || commandHistoryOpen ||
     disposalReportOpen || applicationLogOpen || notificationsOpen;
   const databaseRef = useRef<DatabasePageHandle>(null);
+  const mysqlRef = useRef<MysqlPageHandle>(null);
   const configurationRef = useRef<ConfigurationPageHandle>(null);
   const notesRef = useRef<NotesHandle>(null);
   const settingsPanelRef = useRef<SettingsPanelHandle>(null);
@@ -255,6 +258,7 @@ export function App() {
       return notesRef.current?.beforeDeactivate() ?? true;
     }
     if (activePageId === "database") return databaseRef.current?.beforeDeactivate() ?? true;
+    if (activePageId === "mysql") return mysqlRef.current?.beforeDeactivate() ?? true;
     if (activePageId === "config-generator") {
       return configurationRef.current?.beforeDeactivate() ?? true;
     }
@@ -367,6 +371,7 @@ export function App() {
         if (!canDeactivate) return false;
       }
       if (activePageId === "database" && !(await databaseRef.current?.beforeDeactivate() ?? true)) return false;
+      if (activePageId === "mysql" && !(await mysqlRef.current?.beforeDeactivate() ?? true)) return false;
       if (activePageId === "config-generator") {
         const canDeactivate = await configurationRef.current?.beforeDeactivate() ?? true;
         if (!canDeactivate) return false;
@@ -422,6 +427,7 @@ export function App() {
         "放弃修改并断开",
       ))) return;
       if (activePageId === "database" && !(await databaseRef.current?.beforeDeactivate() ?? true)) return;
+      if (activePageId === "mysql" && !(await mysqlRef.current?.beforeDeactivate() ?? true)) return;
       if (activePageId === "config-generator" && !(await configurationRef.current?.beforeDeactivate() ?? true)) return;
       if (commandHistoryOpen) await closeCommandHistory();
       if (disposalReportOpen) await closeDisposalReport();
@@ -462,6 +468,7 @@ export function App() {
     returnFocus: HTMLElement,
   ) {
     if (activePageId === "database" && !(await databaseRef.current?.beforeDeactivate() ?? true)) return;
+    if (activePageId === "mysql" && !(await mysqlRef.current?.beforeDeactivate() ?? true)) return;
     if (activePageId === "config-generator" && !(await configurationRef.current?.beforeDeactivate() ?? true)) return;
     if (settingsOpen || commandHistoryOpen || disposalReportOpen || applicationLogOpen) return;
     connectionManagerReturnFocusRef.current = returnFocus;
@@ -675,6 +682,9 @@ export function App() {
             <Notes ref={notesRef} />
           ) : activePage.id === "database" ? (
             <DatabasePage ref={databaseRef} api={window.lovelyhawk} bindingHandle={activeTarget?.bindingHandle ?? null}
+              targetLabel={activeTarget === null ? "未连接主机" : `${activeTarget.target.username}@${activeTarget.target.host}:${activeTarget.target.port}`} />
+          ) : activePage.id === "mysql" ? (
+            <MysqlPage ref={mysqlRef} api={window.lovelyhawk} bindingHandle={activeTarget?.bindingHandle ?? null}
               targetLabel={activeTarget === null ? "未连接主机" : `${activeTarget.target.username}@${activeTarget.target.host}:${activeTarget.target.port}`} />
           ) : activePage.id === "config-generator" ? (
             <ConfigurationPage

@@ -92,6 +92,14 @@ const ICONS: Record<string, () => ReactElement> = {
       <path d="M2.8 8c0 1 2.3 1.8 5.2 1.8s5.2-.8 5.2-1.8" />
     </svg>
   ),
+  mysql: () => (
+    <svg {...ICON_PROPS}>
+      <ellipse cx="8" cy="3.4" rx="5" ry="1.7" />
+      <path d="M3 3.4v8.2c0 .9 2.2 1.7 5 1.7s5-.8 5-1.7V3.4" />
+      <path d="M3 7.4c0 .9 2.2 1.7 5 1.7s5-.8 5-1.7" />
+      <path d="M5.6 5.6 6.8 6.4 5.6 7.2M10.4 5.6 9.2 6.4l1.2.8" />
+    </svg>
+  ),
   "java-hot-update": () => (
     <svg {...ICON_PROPS}>
       <path d="M2.6 6.4h8.6v3.4a3.2 3.2 0 0 1-3.2 3.2H5.8a3.2 3.2 0 0 1-3.2-3.2Z" />

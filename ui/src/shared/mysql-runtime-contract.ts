@@ -58,7 +58,7 @@ function keys(value: Record<string, unknown>, expected: string[]): boolean {
 }
 function string(value: unknown, maximum: number, empty = false, multiline = false): value is string {
   return typeof value === "string" && (empty || value.trim().length > 0) && encoder.encode(value).length <= maximum &&
-    !/[-￿]/u.test(value) && ![...value].some(char => {
+    !/[\uD800-\uDFFF]/u.test(value) && ![...value].some(char => {
       const code = char.codePointAt(0)!;
       return code < 0x20 && !(multiline && [9, 10, 13].includes(code)) || code >= 0x7f && code <= 0x9f;
     });
@@ -82,10 +82,10 @@ function passwordChange(value: unknown): value is MySqlPasswordChange {
   if (!record(value)) return false;
   if (value.action === "keep" || value.action === "remove") return keys(value, ["action"]);
   return value.action === "replace" && keys(value, ["action", "value"]) && typeof value.value === "string" &&
-    value.value.length > 0 && encoder.encode(value.value).length <= 16384 && !value.value.includes("\0") && !/[-￿]/u.test(value.value);
+    value.value.length > 0 && encoder.encode(value.value).length <= 16384 && !value.value.includes("\0") && !/[\uD800-\uDFFF]/u.test(value.value);
 }
 function passwordText(value: unknown): boolean {
-  return typeof value === "string" && encoder.encode(value).length <= 1024 && !value.includes("\0") && !/[-￿]/u.test(value);
+  return typeof value === "string" && encoder.encode(value).length <= 1024 && !value.includes("\0") && !/[\uD800-\uDFFF]/u.test(value);
 }
 export function isMySqlRuntimeRequest(value: unknown): value is MySqlRuntimeRequest {
   if (!record(value) || !string(value.bindingHandle, 128)) return false;

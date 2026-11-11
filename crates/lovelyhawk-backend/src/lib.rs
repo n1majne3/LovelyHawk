@@ -6676,6 +6676,17 @@ fn page_descriptors() -> Vec<PageDescriptor> {
             migration_state: Pending,
         },
         PageDescriptor {
+            id: "mysql",
+            group: Operations,
+            title: "MySQL",
+            icon: "▦",
+            capability: ConnectedTarget,
+            summary: "通过 SSH 连接 MySQL 或 MariaDB，并可按计划修改账号口令。",
+            primary_action: "新建连接",
+            sections: &["MySQL 连接"],
+            migration_state: Pending,
+        },
+        PageDescriptor {
             id: "java-hot-update",
             group: Operations,
             title: "Java 热更新",
@@ -7870,7 +7881,7 @@ mod tests {
         assert!(response.ok);
         let result = response.result.unwrap();
         assert_eq!(result["protocolVersion"], PROTOCOL_VERSION);
-        assert_eq!(result["pages"].as_array().unwrap().len(), 14);
+        assert_eq!(result["pages"].as_array().unwrap().len(), 15);
         assert!(result.get("dataRoot").is_none());
         assert_eq!(
             result["pages"]
