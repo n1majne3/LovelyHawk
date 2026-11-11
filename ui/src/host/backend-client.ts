@@ -6,6 +6,7 @@ import { isNginxRepairRequest, matchesNginxRepairResponse, type NginxRepairReque
 import { isLogRulesRequest, matchesLogRulesResponse, type LogRulesRequest, type LogRulesResponse } from "../shared/log-rules-contract.js";
 import { isAiAssistRequest, matchesAiAssistResponse, type AiAssistRequest, type AiAssistResponse } from "../shared/ai-assist-contract.js";
 import { isPostgresqlRuntimeRequest, matchesPostgresqlRuntimeResponse, type PostgresqlRuntimeRequest, type PostgresqlRuntimeResponse } from "../shared/postgresql-runtime-contract.js";
+import { isMySqlRuntimeRequest, matchesMySqlRuntimeResponse, type MySqlRuntimeRequest, type MySqlRuntimeResponse } from "../shared/mysql-runtime-contract.js";
 import { isFileEvidenceRequest, matchesFileEvidenceResult, type FileEvidenceRequest, type FileEvidenceResult } from "../shared/file-evidence-contract.js";
 import { isPacketCaptureEvidenceRequest, matchesPacketCaptureEvidenceResult, type PacketCaptureEvidenceRequest, type PacketCaptureEvidenceResult } from "../shared/packet-capture-evidence-contract.js";
 import { isPodFileEvidenceRequest, matchesPodFileEvidenceResult, type PodFileEvidenceRequest, type PodFileEvidenceResult } from "../shared/pod-file-evidence-contract.js";
@@ -701,6 +702,13 @@ export class BackendClient {
     if (!isPostgresqlRuntimeRequest(request)) throw new Error("数据库请求无效。");
     const response = await this.#request("postgresql.runtime", request, 30_000);
     if (!matchesPostgresqlRuntimeResponse(request, response)) throw new Error("数据库返回了无法核实的结果，请刷新后重试。");
+    return response;
+  }
+
+  async mysqlRuntime(request: MySqlRuntimeRequest): Promise<MySqlRuntimeResponse> {
+    if (!isMySqlRuntimeRequest(request)) throw new Error("数据库请求无效。");
+    const response = await this.#request("mysql.runtime", request, 30_000);
+    if (!matchesMySqlRuntimeResponse(request, response)) throw new Error("数据库返回了无法核实的结果，请刷新后重试。");
     return response;
   }
 

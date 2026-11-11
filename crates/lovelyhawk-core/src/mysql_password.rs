@@ -862,6 +862,7 @@ fn tls_settings_for(
 
 /// What the caller sees before confirming: everything the plan binds.
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MySqlPasswordPlanView {
     pub account: String,
     pub plugin: String,
@@ -931,6 +932,7 @@ impl MySqlPasswordRestoreToken {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MySqlPasswordRestorePlanView {
     pub account: String,
     pub saved_password_was_updated: bool,

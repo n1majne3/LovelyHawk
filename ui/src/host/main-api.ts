@@ -15,6 +15,7 @@ import { isAiAssistRequest } from "../shared/ai-assist-contract.js";
 import { isJavaClassStageResult, isJavaHandle, isJavaHotUpdateRequest } from "../shared/java-hot-update-contract.js";
 import { isWindowsFileId, isWindowsFileSaveResult, isWindowsIncidentRequest } from "../shared/windows-incident-contract.js";
 import { isPostgresqlRuntimeRequest } from "../shared/postgresql-runtime-contract.js";
+import { isMySqlRuntimeRequest } from "../shared/mysql-runtime-contract.js";
 import { isThemeId } from "../shared/theme-contract.js";
 import {
   isAiHistoryExportFormat,
@@ -214,6 +215,11 @@ export function createMainApi(transport: BackendTransport = hostBackendTransport
       requireArity(values, 1, "数据库请求无效。");
       if (!isPostgresqlRuntimeRequest(values[0])) refuse("数据库请求无效。");
       return backend.postgresqlRuntime(values[0]);
+    },
+    mysqlRuntime: async (...values: unknown[]) => {
+      requireArity(values, 1, "数据库请求无效。");
+      if (!isMySqlRuntimeRequest(values[0])) refuse("数据库请求无效。");
+      return backend.mysqlRuntime(values[0]);
     },
     fileEvidence: async (...values: unknown[]) => {
       requireArity(values, 1, "留证请求无效。");

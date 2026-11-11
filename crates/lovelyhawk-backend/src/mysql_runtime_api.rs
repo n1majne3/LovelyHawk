@@ -214,6 +214,19 @@ fn handle(value: &str) -> Result<()> {
     }
 }
 
+fn action_name(request: &MySqlRuntimeRequest) -> &'static str {
+    match request {
+        MySqlRuntimeRequest::List { .. } => "list",
+        MySqlRuntimeRequest::Save { .. } => "save",
+        MySqlRuntimeRequest::PlanDelete { .. } => "plan-delete",
+        MySqlRuntimeRequest::Delete { .. } => "delete",
+        MySqlRuntimeRequest::PlanPassword { .. } => "plan-password",
+        MySqlRuntimeRequest::ExecutePassword { .. } => "execute-password",
+        MySqlRuntimeRequest::PlanPasswordRestore { .. } => "plan-password-restore",
+        MySqlRuntimeRequest::ExecutePasswordRestore { .. } => "execute-password-restore",
+    }
+}
+
 fn core_error(error: CoreError) -> MySqlRuntimeError {
     let (code, detail) = lovelyhawk_core::database_password::public_reason(&error);
     MySqlRuntimeError::Rejected(code, detail)
@@ -346,25 +359,27 @@ impl MySqlRuntimeApi {
     }
 
     pub(crate) async fn dispatch(&self, request: MySqlRuntimeRequest) -> Value {
+        let action = action_name(&request);
         match self.dispatch_inner(request).await {
             Ok(value) => value,
-            Err(MySqlRuntimeError::Rejected(code, detail)) => {
-                json!({"kind":"rejected","code":code,"detail":detail})
-            }
-            Err(MySqlRuntimeError::Invalid) => {
-                json!({"kind":"rejected","code":"invalid","detail":"请求内容不符合要求"})
-            }
-            Err(MySqlRuntimeError::Stale) => {
-                json!({"kind":"rejected","code":"stale","detail":"连接、配置或计划已变化或过期，请刷新后重试。"})
-            }
-            Err(MySqlRuntimeError::Busy) => {
-                json!({"kind":"rejected","code":"busy","detail":"上一个操作尚未结束，请稍候。"})
-            }
-            Err(MySqlRuntimeError::Capacity) => {
-                json!({"kind":"rejected","code":"capacity","detail":"打开的连接页过多，请先关闭不需要的。"})
-            }
-            Err(MySqlRuntimeError::Store) => {
-                json!({"kind":"rejected","code":"store","detail":"本机配置存储暂时不可用。"})
+            Err(error) => {
+                let (code, detail) = match error {
+                    MySqlRuntimeError::Rejected(code, detail) => (code, detail),
+                    MySqlRuntimeError::Invalid => {
+                        ("invalid-params", "请求内容不符合要求".to_owned())
+                    }
+                    MySqlRuntimeError::Stale => (
+                        "stale",
+                        "连接、配置或计划已变化或过期，请刷新后重试。".to_owned(),
+                    ),
+                    MySqlRuntimeError::Busy => ("busy", "上一个操作尚未结束，请稍候。".to_owned()),
+                    MySqlRuntimeError::Capacity => (
+                        "capacity",
+                        "打开的连接页过多，请先关闭不需要的。".to_owned(),
+                    ),
+                    MySqlRuntimeError::Store => ("store", "本机配置存储暂时不可用。".to_owned()),
+                };
+                json!({"kind":"rejected", "action":action, "code":code, "detail":detail})
             }
         }
     }

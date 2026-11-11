@@ -5,6 +5,7 @@ import type { NginxRepairRequest, NginxRepairResponse } from "./nginx-repair-con
 import type { LogRulesRequest, LogRulesResponse } from "./log-rules-contract.js";
 import type { AiAssistRequest, AiAssistResponse } from "./ai-assist-contract.js";
 import type { PostgresqlRuntimeRequest, PostgresqlRuntimeResponse } from "./postgresql-runtime-contract.js";
+import type { MySqlRuntimeRequest, MySqlRuntimeResponse } from "./mysql-runtime-contract.js";
 import type { FileEvidenceRequest, FileEvidenceResult } from "./file-evidence-contract.js";
 import type { PacketCaptureEvidenceRequest, PacketCaptureEvidenceResult } from "./packet-capture-evidence-contract.js";
 import type { PodFileEvidenceRequest, PodFileEvidenceResult } from "./pod-file-evidence-contract.js";
@@ -475,6 +476,7 @@ export interface LovelyHawkApi {
   caseLibrary(request: CaseLibraryRequest): Promise<CaseLibraryResult | null>;
   caseWorkspace(request: CaseWorkspaceRequest): Promise<CaseWorkspaceResult>;
   postgresqlRuntime(request: PostgresqlRuntimeRequest): Promise<PostgresqlRuntimeResponse>;
+  mysqlRuntime(request: MySqlRuntimeRequest): Promise<MySqlRuntimeResponse>;
   fileEvidence(request: FileEvidenceRequest): Promise<FileEvidenceResult | null>;
   packetCaptureEvidence(request: PacketCaptureEvidenceRequest): Promise<PacketCaptureEvidenceResult | null>;
   podFileEvidence(request: PodFileEvidenceRequest): Promise<PodFileEvidenceResult | null>;
