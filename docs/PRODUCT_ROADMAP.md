@@ -8,7 +8,9 @@
 
 逐项进度同步到 GitHub issue #1–#11（n1majne3/LovelyHawk）。以下已实现并通过所列验证；“不纳入范围”外的其余条目继续按优先级推进。
 
-- 数据库账号口令修改（PostgreSQL）：core 计划/执行/独立登录复核/限时恢复与已存口令放回，桌面数据库页“修改口令”对话框，见 [设计与边界](DATABASE_PASSWORD_CHANGE.md)。PostgreSQL 16 一次性容器实验 6/6（scram 自改并放回、超级用户改他人、非超级用户不可恢复、md5、nologin 拒绝、`log_statement=all` 日志无明文）；调试构建桌面端到端 21/21（`tools/lab/probe-ui-postgresql-password.mjs`：修改并复核、已存口令同步、容器内 psql 独立核对、界面放回、非超级用户不可恢复、焦点与键盘、日志与便携数据无口令），过程中修正计划视图字段命名、格式名与确认步骤立即过期三处缺陷。MySQL/MariaDB 未开始。
+- 数据库账号口令修改（PostgreSQL）：core 计划/执行/独立登录复核/限时恢复与已存口令放回，桌面数据库页“修改口令”对话框，见 [设计与边界](DATABASE_PASSWORD_CHANGE.md)。PostgreSQL 16 一次性容器实验 6/6（scram 自改并放回、超级用户改他人、非超级用户不可恢复、md5、nologin 拒绝、`log_statement=all` 日志无明文）；调试构建桌面端到端 21/21（`tools/lab/probe-ui-postgresql-password.mjs`：修改并复核、已存口令同步、容器内 psql 独立核对、界面放回、非超级用户不可恢复、焦点与键盘、日志与便携数据无口令），过程中修正计划视图字段命名、格式名与确认步骤立即过期三处缺陷。
+- 数据库账号口令修改（MySQL/MariaDB）：自研原生协议 `mysql_wire.rs`（握手、能力协商、mysql_native_password/caching_sha2_password/sha256_password 令牌、有界查询）与会话层 `mysql_native.rs`（TLS 验证或字面回环下的 SSH 保护两种模式）；`mysql_password.rs` 编排（Inspect 独立通道核实账号/插件/版本/`log_raw`/锁定态，冻结 MySQL `ALTER USER 'u'@'h' IDENTIFIED WITH … AS` 与 MariaDB `IDENTIFIED VIA … USING` 语句进计划，Apply 后新口令独立登录复核，恢复令牌单用 10 分钟、恢复后重捕认证串常量时间比对）；backend `mysql.runtime`（连接配置 list/save/删除 + 口令计划/执行/恢复，句柄化、作用域校验）；桌面 MySQL 页提供连接管理与改口令对话框。MySQL 8.0.46 与 MariaDB 11.8.9 一次性容器端到端 54/54（`tools/lab/probe-mysql-password.mjs`：修改后新口令独立 TCP 登录通过、旧口令明确 1045、恢复后互换、已用计划/恢复令牌 stale、弱口令/含账号名/未知账号按码拒绝、服务端日志与本地存储无口令明文）。实验发现并修正三处缺陷：MariaDB 无 `@@log_raw` 变量且 `mysql.user` 无 `account_locked` 列（改为 SHOW VARIABLES 容忍探测 + `mysql.global_priv` JSON 取锁状态）、MariaDB `SHOW CREATE USER` 输出 `IDENTIFIED BY PASSWORD` 不带插件名（回退为目录插件）、共享口令策略错误前缀误标 PostgreSQL。验证：core mysql 相关 46 项、fmt/clippy 干净、UI 1217 项测试。未覆盖：verify-full TLS、连接账号的已存口令更新、第二网络位置复核。
+- 打包链：PowerShell 7.6.9 已装，`pnpm release:package` 全链通过（源码门禁、两个 exe 的静态 CRT/PE 导入校验、445 crates + 7 UI 包第三方清单、便携 zip 校验），产物 `artifacts\LovelyHawk-0.0.4-windows-x64.zip`；llvm-objdump 经 gnu 工具链 rustlib 提供。
 - 判定规则（命令工作台）：shell 启动文件与 init 脚本中的 `insmod`/`modprobe`、可写目录 `nohup`、xinetd shell 服务与 TCP wrappers `spawn`/`twist`；init.d 内容扫描；alias/同名函数/`trap` 劫持；Web 根内任意压缩包、依赖/认证清单、`.git`/`.svn`（不下钻）、云与集群凭据文件；Web 根隐藏脚本。
 - 包校验：Debian 无 debsums 时用 `dpkg --verify` 校验关键软件包，并先以 `dpkg.md5sums` 核对 dpkg 自身；命令备份残留（`.bak`/`.orig`/`.old`/`~`/同目录点号副本/`psd`/`lsd` 等）。
 - Rootkit：`/sys/module` 与 `/proc/modules`、`/proc/kallsyms` 模块标签比对；隐藏进程改为两次目录列表 + 直接探测（上限 65536，排除自身子进程与瞬时进程）。
@@ -73,10 +75,10 @@
   - 外部扫描器编排：支持配置本机已安装扫描器（如 D 盾）的可执行路径，一键把目标 Web 目录整目录拉回本机临时目录，自动调用扫描、解析并回显结果，与留证/案件记录关联；依赖“传输能力”节的整目录下载。涉及本机路径与本机进程调用，按仓库规范走宿主专用命令而非主窗口白名单，扫描器输出按不可信纯文本处理，任务可取消、临时目录用后清理。
   - 边界：D 盾为闭源 Windows 工具，不能嵌入或再分发；内置特征库与“用户自备路径的外部扫描器编排”是两条互补路线，内置路线仍需写明误报边界。
 - Web 日志攻击特征内置规则：`union.*select`、`../`、`${jndi:`、thinkphp 特征路径与攻击源 IP 统计；现有 `log_analysis.rs` 只是自定义规则框架。
-- 访问日志反查文件：运维2 的免杀马 D 盾扫不出，是从 apache 访问日志找到的。需从访问日志提取被请求的脚本路径（重点是点号隐藏文件、只有 POST 的脚本），再到磁盘核对存在性与特征。
+- 访问日志反查文件：运维2 的免杀马 D 盾扫不出，是从 apache 访问日志找到的。`log-web-trace`（`command_workbench.rs`）已覆盖第一版：读取 nginx/apache 访问日志尾部与 .1 轮转，提取点号隐藏段、样本内仅 POST、疑似随机命名、含 `..` 或 PUT/DELETE/TRACE/CONNECT 的脚本路径，并把前 20 条 URI 拼到常见站点根核对存在性，全部为需人工核对的线索。剩余缺口：自定义日志位置与 vhost 日志目录、压缩轮转文件、URL 编码与路径规范化带来的漏判，以及对命中文件的进一步特征深查（可结合 `file-webshell-hint`）。
 - Web 根内的站点打包与敏感文件：`file-credential` 只在文件名含 backup/dump/bak 时才标出压缩包（`command_workbench.rs:644`），运维2 的 `www.zip` 不会命中；`composer.json`、`.git/config` 与云凭证文件（`.aws/credentials` 等）均无检查（站点内 `.env.*` 已覆盖）。
 - Web 根内的隐藏文件：`file-hidden`（`command_workbench.rs:919`）只查 `/tmp`、`/var/tmp`、`/dev/shm`、`/home`、`/root`，不含 Web 根（运维2 的 `.a.php`、`.dont_delete_me.php`）。
-- Web 组件版本识别与已知漏洞：ThinkPHP、phpMyAdmin、Smarty 等在 core 中只出现在 `settings.rs`；运维2/运维3 多个容器的修复方式就是按版本升级或修补。
+- Web 组件版本识别与已知漏洞：`file-web-version`（`command_workbench.rs`）已覆盖第一版：在常见站点根（含 `/usr/share/phpmyadmin`、`/home/*/public_html`）内定位 ThinkPHP（`base.php`、`library/think/App.php`、`thinkphp.php`、`topthink/framework`）、phpMyAdmin（`doc/html/index.html`、`README`、`ChangeLog`、`libraries/classes/Version.php`）与 Smarty（`Smarty.class.php`）的版本文件并解析版本，命中 ThinkPHP 5.0.x/5.1.x、phpMyAdmin <4.9、Smarty <3.1.45 历史风险区间时标为需人工核对的版本线索（非 CVE 确证）。剩余缺口：其他产品与自定义站点目录、更多版本证据来源、按精确补丁版本比对漏洞库。
 - 模板编译缓存污染：Smarty `templates_c` 被写入后即使修补 WAF 仍可利用（运维3），发现与清理未实现。
 
 ### 传输能力：整目录上传/下载与批量传输

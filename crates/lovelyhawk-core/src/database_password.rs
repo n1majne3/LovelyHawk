@@ -462,13 +462,13 @@ fn one_row(rows: Vec<Row>) -> CoreResult<Row> {
 pub(crate) fn validate_new_password(password: &SecretValue) -> CoreResult<()> {
     let value = password.expose();
     if value.is_empty() {
-        return Err(invalid("请填写新口令"));
+        return Err(policy("请填写新口令"));
     }
     if !(MIN_PASSWORD_BYTES..=MAX_PASSWORD_BYTES).contains(&value.len()) {
-        return Err(invalid("新口令长度需在 12 到 1024 字节之间"));
+        return Err(policy("新口令长度需在 12 到 1024 字节之间"));
     }
     if value.chars().any(char::is_control) {
-        return Err(invalid("新口令不能包含控制字符"));
+        return Err(policy("新口令不能包含控制字符"));
     }
     let classes = [
         value.chars().any(|c| c.is_uppercase()),
@@ -479,7 +479,7 @@ pub(crate) fn validate_new_password(password: &SecretValue) -> CoreResult<()> {
             .any(|c| !c.is_uppercase() && !c.is_lowercase() && !c.is_ascii_digit()),
     ];
     if classes.iter().filter(|present| **present).count() < 3 {
-        return Err(invalid(
+        return Err(policy(
             "新口令至少需要包含大写字母、小写字母、数字、其他字符中的三类",
         ));
     }
@@ -496,9 +496,13 @@ pub(crate) fn validate_password_against_role(
             .to_lowercase()
             .contains(&role_name.to_lowercase())
     {
-        return Err(invalid("新口令不能包含账号名"));
+        return Err(policy("新口令不能包含账号名"));
     }
     Ok(())
+}
+
+fn policy(reason: &'static str) -> CoreError {
+    CoreError::validation("database password policy", reason)
 }
 
 fn constant_time_eq(left: &Option<String>, right: &Option<String>) -> bool {

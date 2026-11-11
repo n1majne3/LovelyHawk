@@ -208,7 +208,7 @@ fn literal(value: &str) -> String {
 
 /// `SELECT` the inspect facts. Everything except the fixed literals is a
 /// server-computed value.
-const INSPECT_SQL: &str = "SELECT VERSION(), @@version_comment, @@log_raw, CURRENT_USER()";
+const INSPECT_SQL: &str = "SELECT VERSION(), @@version_comment, CURRENT_USER()";
 
 fn parse_version_comment(version: &str, comment: &str) -> Option<MySqlProduct> {
     let comment = comment.to_ascii_lowercase();
@@ -410,7 +410,7 @@ where
 }
 
 async fn inspect(session: &mut MySqlSession, account: &MySqlAccount) -> CoreResult<MySqlInspect> {
-    let rows = session.query_rows(INSPECT_SQL.as_bytes(), 4, 1).await?;
+    let rows = session.query_rows(INSPECT_SQL.as_bytes(), 3, 1).await?;
     let row = rows
         .first()
         .ok_or_else(|| invalid("数据库身份检查没有返回结果"))?;
@@ -421,23 +421,46 @@ async fn inspect(session: &mut MySqlSession, account: &MySqlAccount) -> CoreResu
     if !supported_version(product, &version) {
         return Err(invalid("该数据库版本尚未适配口令修改，未执行"));
     }
-    let log_raw = row[2]
-        .as_deref()
-        .is_some_and(|v| v.eq_ignore_ascii_case("on") || v == "1");
-    let connecting = parse_current_user(row[3].as_deref().unwrap_or_default())
+    // `log_raw` exists on some builds only (MySQL 8.0); `SHOW VARIABLES`
+    // returns an empty set where the variable is absent rather than erroring,
+    // and a build without it cannot log statements raw.
+    let log_raw = match session
+        .query_rows(b"SHOW GLOBAL VARIABLES LIKE 'log_raw'", 2, 1)
+        .await
+    {
+        Ok(rows) => rows
+            .first()
+            .and_then(|row| row[1].as_deref())
+            .is_some_and(|v| v.eq_ignore_ascii_case("on") || v == "1"),
+        Err(_) => {
+            return Err(invalid("无法核实数据库日志是否会记录明文口令"));
+        }
+    };
+    let connecting = parse_current_user(row[2].as_deref().unwrap_or_default())
         .ok_or_else(|| invalid("无法取得当前连接账号身份"))?;
 
-    // Account facts from mysql.user; a missing read permission surfaces as a
-    // server error which the caller maps.
+    // Account facts: MySQL keeps the lock flag in mysql.user, while MariaDB
+    // (≥10.4) exposes it only through the `priv` JSON of mysql.global_priv.
+    // A missing read permission surfaces as a server error which the caller maps.
     let user_rows = session
         .query_rows(
-            format!(
-                "SELECT plugin, account_locked, password_expired FROM mysql.user WHERE user={} AND host={}",
-                literal(&account.user),
-                literal(&account.host)
-            )
+            match product {
+                MySqlProduct::MySql => format!(
+                    "SELECT plugin, account_locked FROM mysql.user WHERE user={} AND host={}",
+                    literal(&account.user),
+                    literal(&account.host)
+                ),
+                MySqlProduct::MariaDb => format!(
+                    "SELECT plugin FROM mysql.user WHERE user={} AND host={}",
+                    literal(&account.user),
+                    literal(&account.host)
+                ),
+            }
             .as_bytes(),
-            3,
+            match product {
+                MySqlProduct::MySql => 2,
+                MySqlProduct::MariaDb => 1,
+            },
             1,
         )
         .await
@@ -458,9 +481,36 @@ async fn inspect(session: &mut MySqlSession, account: &MySqlAccount) -> CoreResu
             "该账号的认证插件不支持口令修改（如 unix_socket/ed25519/PAM）",
         ));
     }
-    let account_locked = user_row[1].as_deref() == Some("Y");
+    let account_locked = match product {
+        MySqlProduct::MySql => user_row[1].as_deref() == Some("Y"),
+        MySqlProduct::MariaDb => {
+            let lock_rows = session
+                .query_rows(
+                    format!(
+                        "SELECT JSON_VALUE(Priv, '$.account_locked') FROM mysql.global_priv WHERE User={} AND Host={}",
+                        literal(&account.user),
+                        literal(&account.host)
+                    )
+                    .as_bytes(),
+                    1,
+                    1,
+                )
+                .await
+                .map_err(|_| invalid("无法确认账号锁定状态（需要读取 mysql.global_priv 的权限）"))?;
+            lock_rows
+                .first()
+                .and_then(|row| row[0].as_deref())
+                .is_some_and(|v| v == "true")
+        }
+    };
     let captured = match capture_verifier(session, account).await {
-        Ok((plugin, verifier)) => (plugin, verifier),
+        Ok((captured_plugin, captured_verifier)) => (
+            // MariaDB emits `IDENTIFIED BY PASSWORD 'x'` which names no
+            // plugin; the string is the stored form for the plugin the
+            // account currently uses, so fall back to the inspected plugin.
+            captured_plugin.or_else(|| captured_verifier.as_ref().map(|_| plugin.clone())),
+            captured_verifier,
+        ),
         Err(_) => (None, None),
     };
     Ok(MySqlInspect {
