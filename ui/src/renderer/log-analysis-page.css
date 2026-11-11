@@ -929,6 +929,11 @@
   font-weight: 750;
 }
 
+/* A built-in signature's hit: a lead, drawn with a dashed edge. */
+.log-analysis-rule-hit.is-builtin {
+  border-style: dashed;
+}
+
 .log-analysis-gutter span.has-rule {
   color: var(--warning-text);
   font-weight: 700;
@@ -942,6 +947,50 @@
 
 .log-analysis-rule-summary.is-failed {
   color: var(--warning-text);
+}
+
+/* The apparent attack sources the built-in signatures point at: one compact
+   list of leads, ranked like the backend ranked them. */
+.log-analysis-rule-sources {
+  margin: 0;
+  padding: 9px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-inset);
+  font-size: var(--font-small);
+}
+
+.log-analysis-rule-sources h3 {
+  margin: 0 0 6px;
+  color: var(--muted);
+  font-size: var(--font-caption);
+  font-weight: 650;
+}
+
+.log-analysis-rule-sources ul {
+  display: flex;
+  margin: 0;
+  padding: 0;
+  flex-direction: column;
+  gap: 3px;
+  list-style: none;
+}
+
+.log-analysis-rule-sources li {
+  color: var(--text);
+  font-family: "Cascadia Mono", monospace;
+  font-size: var(--font-caption);
+  overflow-wrap: anywhere;
+}
+
+.log-analysis-rule-sources li strong {
+  font-weight: 650;
+}
+
+.log-analysis-rule-sources > p {
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-size: var(--font-caption);
 }
 
 /* The rules dialog: wider than a confirmation, a list and a form. */
@@ -1054,6 +1103,30 @@
 
 .log-rules-notice {
   color: var(--success-text);
+}
+
+/* The fixed built-in signatures: listed, never edited. */
+.log-rules-builtin h3 {
+  margin: 0 0 4px;
+  color: var(--text);
+  font-size: var(--font-body);
+  font-weight: 650;
+}
+
+.log-rules-builtin > p {
+  margin: 0 0 8px;
+  color: var(--text-secondary);
+  font-size: var(--font-small);
+  line-height: 1.6;
+}
+
+.log-rules-builtin-tag {
+  padding: 2px 9px;
+  border: 1px dashed var(--border-strong);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: var(--font-caption);
+  white-space: nowrap;
 }
 
 @media (max-width: 760px) {

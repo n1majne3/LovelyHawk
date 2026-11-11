@@ -7337,7 +7337,15 @@ mod tests {
             .await
             .result
             .unwrap();
-        assert_eq!(empty, serde_json::json!({ "rules": [], "maximum": 128 }));
+        assert_eq!(empty["rules"], serde_json::json!([]));
+        assert_eq!(empty["maximum"], 128);
+        let builtin = empty["builtinRules"].as_array().unwrap();
+        assert_eq!(builtin.len(), 7);
+        assert!(
+            builtin
+                .iter()
+                .all(|rule| rule["builtin"] == true && !rule["name"].as_str().unwrap().is_empty())
+        );
         let added = rules(&state, serde_json::json!({
             "action": "add", "name": "webshell", "pattern": r"eval\(|base64_decode", "severity": "high",
         }))
@@ -7391,19 +7399,39 @@ mod tests {
             );
         }
 
-        // Matching is core's, case-insensitive, first rule wins, one answer per line.
-        let matched = rules(&state, serde_json::json!({
-            "action": "match",
-            "lines": ["GET /up.php?c=eval(base64_decode('aGk='))", "an ordinary line", "EVAL(1)"],
-        }))
+        // Matching is core's, case-insensitive, first rule wins, one answer per
+        // line. Stored rules come first; the fixed signatures run behind them.
+        let matched = rules(
+            &state,
+            serde_json::json!({
+                "action": "match",
+                "lines": [
+                    "GET /up.php?c=eval(base64_decode('aGk='))",
+                    "an ordinary line",
+                    "EVAL(1)",
+                    r#"10.0.0.8 - - "GET /a?id=1 union select 1 HTTP/1.1" 200 1"#,
+                ],
+            }),
+        )
         .await
         .result
         .unwrap();
-        assert_eq!(matched["ruleCount"], 1);
+        assert_eq!(matched["ruleCount"], 8);
+        assert_eq!(matched["builtinRuleCount"], 7);
         assert_eq!(matched["matches"][0]["name"], "webshell");
         assert_eq!(matched["matches"][0]["id"], id.as_str());
+        assert_eq!(matched["matches"][0]["builtin"], false);
         assert!(matched["matches"][1].is_null());
         assert_eq!(matched["matches"][2]["severity"], "high");
+        // A line only the fixed catalog knows lands on the built-in rule, and
+        // its apparent source is tallied as a lead.
+        assert_eq!(matched["matches"][3]["name"], "union-select-sqli");
+        assert_eq!(matched["matches"][3]["builtin"], true);
+        assert_eq!(matched["matches"][3]["severity"], "critical");
+        assert_eq!(
+            matched["sources"],
+            serde_json::json!([{ "source": "10.0.0.8", "hits": 1, "rules": ["union-select-sqli"] }])
+        );
 
         // Removing: a cancelled plan cannot be confirmed afterwards.
         let plan = rules(

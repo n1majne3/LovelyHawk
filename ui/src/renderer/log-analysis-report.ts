@@ -86,11 +86,15 @@ function entryLines(entries: readonly PublicLogEntry[], hits: RuleHits): string[
   return entries.map((entry, index) => entryLine(entry, index, hits?.[index] ?? null));
 }
 
-/** A line saying how many lines the operator's rules marked, when there are rules to speak of. */
+/** A line saying how many lines the rules and built-in signatures marked, when there are marks to speak of. */
 function ruleHitLine(hits: RuleHits): string[] {
   if (hits === null || hits === undefined) return [];
-  const count = hits.filter((hit) => hit !== null).length;
-  return count === 0 ? [] : [`匹配规则：${count} 行命中你的规则，已在行内标出`];
+  const marked = hits.filter((hit) => hit !== null);
+  if (marked.length === 0) return [];
+  const builtins = marked.filter((hit) => hit.builtin).length;
+  return builtins === 0
+    ? [`匹配规则：${marked.length} 行命中你的规则，已在行内标出`]
+    : [`匹配规则：${marked.length} 行命中自定义规则或内置攻击特征，已在行内标出；内置命中仅为排查线索`];
 }
 
 function entryLine(entry: PublicLogEntry, index: number, hit: LogRuleHit | null): string {
@@ -99,7 +103,11 @@ function entryLine(entry: PublicLogEntry, index: number, hit: LogRuleHit | null)
     : [entry.timestamp, entry.level, entry.service, entry.message].filter((part) => part !== "").join(" ");
   const parts = [`${index + 1}.`];
   if (entry.highlighted) parts.push("[可疑]");
-  if (hit !== null) parts.push(`[规则：${plainReportText(hit.name)}（${logRuleSeverityLabel(hit.severity)}）]`);
+  if (hit !== null) {
+    parts.push(hit.builtin
+      ? `[内置特征：${plainReportText(hit.name)}（${logRuleSeverityLabel(hit.severity)}）]`
+      : `[规则：${plainReportText(hit.name)}（${logRuleSeverityLabel(hit.severity)}）]`);
+  }
   if (entry.sourceName !== null && entry.sourceName !== "") parts.push(`[${plainReportText(entry.sourceName)}]`);
   parts.push(plainReportText(text) || "—");
   if (entry.textTruncated) parts.push("（这一行已截断）");

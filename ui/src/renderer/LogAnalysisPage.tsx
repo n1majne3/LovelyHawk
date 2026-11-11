@@ -51,6 +51,7 @@ import {
 import { CopyIcon } from "./file-icons";
 import { AiAssistPanel, type AiAssistApi } from "./AiAssistPanel";
 import type { AiAssistTask } from "../shared/ai-assist-contract";
+import { LOG_RULE_LIMITS } from "../shared/log-rules-contract";
 import { LogRulesDialog } from "./LogRulesDialog";
 import {
   logRuleHitCount,
@@ -925,26 +926,51 @@ export function logLineMeta(entry: PublicLogEntry): { kind: "time" | "level" | "
   return meta;
 }
 
-/** How many of the shown lines the operator's own rules marked, said once above them. */
+/**
+ * How many of the shown lines the saved rules and the fixed built-in
+ * signatures marked, said once above them — plus the apparent sources the
+ * signatures point at, always as leads to review rather than a verdict.
+ */
 export function LogRuleSummary({ hits }: { hits: LogRuleHits | null }) {
   if (hits === null || (!hits.failed && hits.ruleCount === 0)) return null;
   if (hits.failed) {
     return <p className="log-analysis-rule-summary is-failed" role="status">没能用匹配规则比对这些行，下面的行没有规则标记。</p>;
   }
+  const customCount = hits.ruleCount - hits.builtinRuleCount;
+  const scope = [
+    customCount > 0 ? `${customCount} 条自定义规则` : "",
+    hits.builtinRuleCount > 0 ? `${hits.builtinRuleCount} 条内置攻击特征` : "",
+  ].filter((part) => part !== "").join(" 和 ");
   const count = logRuleHitCount(hits);
   return (
-    <p className="log-analysis-rule-summary" role="status" data-testid="log-analysis-rule-summary">
-      {count === 0
-        ? `这些行没有命中你的 ${hits.ruleCount} 条匹配规则。`
-        : `${count} 行命中你的匹配规则，已在行首标出。`}
-    </p>
+    <>
+      <p className="log-analysis-rule-summary" role="status" data-testid="log-analysis-rule-summary">
+        {count === 0
+          ? `这些行没有命中 ${scope}。`
+          : `${count} 行命中 ${scope}，已在行首标出。`}
+      </p>
+      {hits.sources.length === 0 ? null : (
+        <section className="log-analysis-rule-sources" aria-label="攻击来源线索" data-testid="log-analysis-rule-sources">
+          <h3>攻击来源线索</h3>
+          <ul>
+            {hits.sources.slice(0, LOG_RULE_LIMITS.maximumSources).map((stat) => (
+              <li key={stat.source}>
+                <strong>{stat.source}</strong>{" · 命中 "}{stat.hits}{" 次 · "}
+                {stat.rules.slice(0, LOG_RULE_LIMITS.maximumSourceRules).join("、")}
+              </li>
+            ))}
+          </ul>
+          <p>命中的内置攻击特征按来源统计，仅为排查线索，不代表已入侵。</p>
+        </section>
+      )}
+    </>
   );
 }
 
 export function LogEntriesView({ entries, empty, hits = null }: {
   entries: readonly PublicLogEntry[];
   empty: string;
-  /** The operator's rules, matched against these same lines, one answer per line. */
+  /** The saved rules and built-in signatures, matched against these same lines, one answer per line. */
   hits?: LogRuleHits | null;
 }) {
   if (entries.length === 0) {
@@ -967,9 +993,12 @@ export function LogEntriesView({ entries, empty, hits = null }: {
           return (
             <p key={`${entry.timestamp}\0${index}`} className={lineClass(entry, index)}>
               {hit === null ? null : (
-                <span className={`log-analysis-rule-hit is-${hit.severity}`} data-testid="log-analysis-rule-hit"
-                  title={`命中你的规则「${hit.name}」，级别${logRuleSeverityLabel(hit.severity)}`}>
-                  {hit.name}
+                <span className={`log-analysis-rule-hit is-${hit.severity}${hit.builtin ? " is-builtin" : ""}`}
+                  data-testid="log-analysis-rule-hit"
+                  title={hit.builtin
+                    ? `命中内置攻击特征「${hit.name}」，级别${logRuleSeverityLabel(hit.severity)}；仅为排查线索，需人工核对`
+                    : `命中你的规则「${hit.name}」，级别${logRuleSeverityLabel(hit.severity)}`}>
+                  {hit.builtin ? `内置·${hit.name}` : hit.name}
                 </span>
               )}
               {meta.length === 0 ? null : (

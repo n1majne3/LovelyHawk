@@ -12,7 +12,7 @@ import type {
 } from "../shared/log-analysis-read-contract";
 import type { FileEvidenceApi } from "../shared/file-evidence-contract";
 import { logEvidenceOffer } from "./log-analysis-read-helpers";
-import type { LogRulesApi } from "./log-rule-hits";
+import { mergeLogRuleSources, type LogRulesApi } from "./log-rule-hits";
 import type { AiAssistApi } from "./AiAssistPanel";
 import {
   EmptyPanel,
@@ -30,6 +30,7 @@ import {
   LogThreatCards,
   StatusPanel,
 } from "./LogAnalysisPage";
+import { LogRulesBuiltinSection } from "./LogRulesDialog";
 
 const hostile = "</pre><script>steal()</script><img src=x onerror=steal()>";
 const api: LogAnalysisReadApi & FileEvidenceApi & LogRulesApi & AiAssistApi = {
@@ -389,24 +390,131 @@ describe("copying a log result", () => {
 });
 
 describe("the operator's match rules on a page", () => {
-  const hit = { id: "log-rule-0f8fad5b-d9cb-469f-a165-70867728950e", name: "webshell", severity: "high" as const };
+  const hit = {
+    id: "log-rule-0f8fad5b-d9cb-469f-a165-70867728950e", name: "webshell", severity: "high" as const, builtin: false,
+  };
+  const builtinHit = {
+    id: "log-rule-3f7c9a2e-1b6d-4e8a-9c5d-2a1e0f6b8d4c",
+    name: "union-select-sqli", severity: "critical" as const, builtin: true,
+  };
 
   it("marks a matched line at its start, with the rule's name and level", () => {
     const html = renderToStaticMarkup(<LogEntriesView entries={[entry, { ...entry, rawText: "plain" }]} empty="none"
-      hits={{ hits: [hit, null], ruleCount: 1, failed: false }} />);
+      hits={{ hits: [hit, null], ruleCount: 8, builtinRuleCount: 7, sources: [], failed: false }} />);
     // The fixture line is also flagged suspicious; the two marks sit side by side.
     expect(html).toMatch(/<p class="is-abnormal has-rule"><span class="log-analysis-rule-hit is-high" data-testid="log-analysis-rule-hit" title="命中你的规则「webshell」，级别高">webshell<\/span>/u);
     expect(html.match(/data-testid="log-analysis-rule-hit"/gu)).toHaveLength(1);
   });
 
-  it("says how many lines the rules marked, or that none did, or that it could not tell", () => {
+  it("marks a built-in signature hit as a lead, not as the operator's rule", () => {
+    const html = renderToStaticMarkup(<LogEntriesView entries={[entry]} empty="none"
+      hits={{
+        hits: [builtinHit], ruleCount: 7, builtinRuleCount: 7,
+        sources: [{ source: "10.0.0.8", hits: 1, rules: ["union-select-sqli"] }], failed: false,
+      }} />);
+    expect(html).toContain('class="log-analysis-rule-hit is-critical is-builtin"');
+    expect(html).toContain("内置·union-select-sqli");
+    expect(html).toContain("仅为排查线索，需人工核对");
+    expect(html).not.toContain("命中你的规则「union-select-sqli」");
+  });
+
+  it("says how many lines the rules marked, splitting custom from built-in, or that it could not tell", () => {
     expect(renderToStaticMarkup(<LogRuleSummary hits={null} />)).toBe("");
-    expect(renderToStaticMarkup(<LogRuleSummary hits={{ hits: [null], ruleCount: 0, failed: false }} />)).toBe("");
-    expect(renderToStaticMarkup(<LogRuleSummary hits={{ hits: [hit, null, hit], ruleCount: 3, failed: false }} />))
-      .toContain("2 行命中你的匹配规则，已在行首标出。");
-    expect(renderToStaticMarkup(<LogRuleSummary hits={{ hits: [null], ruleCount: 3, failed: false }} />))
-      .toContain("这些行没有命中你的 3 条匹配规则。");
-    expect(renderToStaticMarkup(<LogRuleSummary hits={{ hits: [null], ruleCount: 0, failed: true }} />))
+    expect(renderToStaticMarkup(<LogRuleSummary
+      hits={{ hits: [null], ruleCount: 0, builtinRuleCount: 0, sources: [], failed: false }} />)).toBe("");
+    expect(renderToStaticMarkup(<LogRuleSummary
+      hits={{ hits: [hit, null, hit], ruleCount: 10, builtinRuleCount: 7, sources: [], failed: false }} />))
+      .toContain("2 行命中 3 条自定义规则 和 7 条内置攻击特征，已在行首标出。");
+    expect(renderToStaticMarkup(<LogRuleSummary
+      hits={{ hits: [null], ruleCount: 10, builtinRuleCount: 7, sources: [], failed: false }} />))
+      .toContain("这些行没有命中 3 条自定义规则 和 7 条内置攻击特征。");
+    // With no saved rules the strip names the built-in catalog, not "你的 0 条规则".
+    const builtinOnly = renderToStaticMarkup(<LogRuleSummary
+      hits={{ hits: [null], ruleCount: 7, builtinRuleCount: 7, sources: [], failed: false }} />);
+    expect(builtinOnly).toContain("这些行没有命中 7 条内置攻击特征。");
+    expect(builtinOnly).not.toContain("0 条");
+    expect(renderToStaticMarkup(<LogRuleSummary
+      hits={{ hits: [null], ruleCount: 0, builtinRuleCount: 0, sources: [], failed: true }} />))
       .toContain("没能用匹配规则比对这些行");
+  });
+
+  it("lists apparent attack sources as ranked leads, never as a verdict", () => {
+    const html = renderToStaticMarkup(<LogRuleSummary hits={{
+      hits: [builtinHit, builtinHit, builtinHit],
+      ruleCount: 7,
+      builtinRuleCount: 7,
+      sources: [
+        { source: "10.0.0.8", hits: 2, rules: ["union-select-sqli", "path-traversal"] },
+        { source: "10.0.0.9", hits: 1, rules: ["jndi-injection"] },
+      ],
+      failed: false,
+    }} />);
+    expect(html).toContain('data-testid="log-analysis-rule-sources"');
+    expect(html).toContain("攻击来源线索");
+    expect(html).toContain("<strong>10.0.0.8</strong> · 命中 2 次 · union-select-sqli、path-traversal");
+    expect(html).toContain("<strong>10.0.0.9</strong> · 命中 1 次 · jndi-injection");
+    // The ranking the backend gave is the ranking shown.
+    expect(html.indexOf("10.0.0.8")).toBeLessThan(html.indexOf("10.0.0.9"));
+    expect(html).toContain("仅为排查线索，不代表已入侵");
+    expect(html).not.toContain("确认入侵");
+    // No sources, nothing to show.
+    expect(renderToStaticMarkup(<LogRuleSummary
+      hits={{ hits: [null], ruleCount: 7, builtinRuleCount: 7, sources: [], failed: false }} />))
+      .not.toContain("log-analysis-rule-sources");
+  });
+
+  it("merges per-batch source statistics into one ranked list", () => {
+    // A page bigger than one match batch gets one answer per batch; the
+    // operator sees the sources once, summed and ranked across all of them.
+    expect(mergeLogRuleSources([
+      { source: "10.0.0.9", hits: 1, rules: ["jndi-injection"] },
+      { source: "10.0.0.8", hits: 1, rules: ["union-select-sqli"] },
+      { source: "10.0.0.8", hits: 2, rules: ["union-select-sqli", "path-traversal"] },
+    ])).toEqual([
+      { source: "10.0.0.8", hits: 3, rules: ["union-select-sqli", "path-traversal"] },
+      { source: "10.0.0.9", hits: 1, rules: ["jndi-injection"] },
+    ]);
+    expect(mergeLogRuleSources([])).toEqual([]);
+    // More sources than one answer may hold stay inside the bound.
+    const many = Array.from({ length: 20 }, (_, index) => ({
+      source: `10.0.0.${index + 1}`, hits: 1, rules: ["union-select-sqli"],
+    }));
+    expect(mergeLogRuleSources(many)).toHaveLength(16);
+  });
+});
+
+describe("the built-in signatures inside the rules dialog", () => {
+  const builtin = {
+    id: "log-rule-3f7c9a2e-1b6d-4e8a-9c5d-2a1e0f6b8d4c",
+    name: "union-select-sqli",
+    pattern: String.raw`union(\s|%20|\+|/\*\*/)+(all(\s|%20|\+)+)?select`,
+    severity: "critical" as const,
+    builtin: true,
+  };
+
+  it("shows the fixed catalog read-only: no delete action, marked as not removable", () => {
+    const html = renderToStaticMarkup(<LogRulesBuiltinSection rules={[builtin]} />);
+    expect(html).toContain('data-testid="log-rules-builtin"');
+    expect(html).toContain("内置攻击特征");
+    expect(html).toContain("union-select-sqli");
+    expect(html).toContain("内置·不可删除");
+    expect(html).toContain("命中只是排查线索，不代表已经入侵");
+    // Nothing in the section runs an action: no button, no removal wording.
+    expect(html).not.toContain("<button");
+    expect(html).not.toContain("删除…");
+    // And the empty catalog takes no space.
+    expect(renderToStaticMarkup(<LogRulesBuiltinSection rules={[]} />)).toBe("");
+  });
+
+  it("keeps the section out of the saved-rule add and remove flow", () => {
+    const source = readFileSync(new URL("./LogRulesDialog.tsx", import.meta.url), "utf8");
+    // The list answer's two halves land in separate state, and the fixed
+    // catalog renders through the read-only section only.
+    expect(source).toContain("setBuiltinRules(list.builtinRules)");
+    expect(source).toContain("<LogRulesBuiltinSection rules={builtinRules} />");
+    expect(source).toContain('action: "plan-remove", id: rule.id');
+    const section = source.slice(source.indexOf("export function LogRulesBuiltinSection"));
+    expect(section).not.toContain("plan-remove");
+    expect(section).not.toContain("<button");
   });
 });

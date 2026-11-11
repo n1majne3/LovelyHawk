@@ -56,21 +56,41 @@ describe("log match rule contract", () => {
   });
 
   it("checks each answer against what was asked", () => {
-    const rule = { id: ID, name: "webshell", pattern: "eval\\(", severity: "high" };
+    const rule = { id: ID, name: "webshell", pattern: "eval\\(", severity: "high", builtin: false };
+    const builtin = { ...rule, name: "union-select-sqli", builtin: true };
     const add: LogRulesRequest = { action: "add", name: " webshell ", pattern: "eval\\(", severity: "high" };
     expect(matchesLogRulesResponse(add, rule)).toBe(true);
     expect(matchesLogRulesResponse(add, { ...rule, severity: "low" })).toBe(false);
     expect(matchesLogRulesResponse(add, { ...rule, extra: true })).toBe(false);
+    // A saved rule never comes back claiming to be built in.
+    expect(matchesLogRulesResponse(add, { ...rule, builtin: true })).toBe(false);
 
-    expect(matchesLogRulesResponse({ action: "list" }, { rules: [rule], maximum: 128 })).toBe(true);
-    expect(matchesLogRulesResponse({ action: "list" }, { rules: [{ ...rule, id: "x" }], maximum: 128 })).toBe(false);
+    const list = { rules: [rule], builtinRules: [builtin], maximum: 128 };
+    expect(matchesLogRulesResponse({ action: "list" }, list)).toBe(true);
+    expect(matchesLogRulesResponse({ action: "list" }, { rules: [{ ...rule, id: "x" }], builtinRules: [], maximum: 128 })).toBe(false);
+    // Stored rules may not pose as built-ins, nor built-ins as stored rules.
+    expect(matchesLogRulesResponse({ action: "list" }, { ...list, rules: [builtin] })).toBe(false);
+    expect(matchesLogRulesResponse({ action: "list" }, { ...list, builtinRules: [rule] })).toBe(false);
+    expect(matchesLogRulesResponse({ action: "list" }, { rules: [rule], maximum: 128 })).toBe(false);
 
     const match: LogRulesRequest = { action: "match", lines: ["a", "b"] };
-    const hit = { id: ID, name: "webshell", severity: "high" };
-    expect(matchesLogRulesResponse(match, { matches: [hit, null], ruleCount: 1 })).toBe(true);
+    const hit = { id: ID, name: "webshell", severity: "high", builtin: false };
+    const source = { source: "10.0.0.8", hits: 2, rules: ["union-select-sqli"] };
+    const answer = { matches: [hit, null], ruleCount: 8, builtinRuleCount: 7, sources: [source] };
+    expect(matchesLogRulesResponse(match, answer)).toBe(true);
     // One answer per line, no more and no fewer.
-    expect(matchesLogRulesResponse(match, { matches: [hit], ruleCount: 1 })).toBe(false);
-    expect(matchesLogRulesResponse(match, { matches: [hit, null, null], ruleCount: 1 })).toBe(false);
+    expect(matchesLogRulesResponse(match, { ...answer, matches: [hit] })).toBe(false);
+    expect(matchesLogRulesResponse(match, { ...answer, matches: [hit, null, null] })).toBe(false);
+    // Hits must declare their provenance.
+    const legacyHit = { id: ID, name: "webshell", severity: "high" };
+    expect(matchesLogRulesResponse(match, { ...answer, matches: [legacyHit, null] })).toBe(false);
+    // Sources stay bounded and must be real-looking IPv4 leads.
+    expect(matchesLogRulesResponse(match, { ...answer, sources: [{ ...source, source: "not-an-ip" }] })).toBe(false);
+    expect(matchesLogRulesResponse(match, { ...answer, sources: [{ ...source, source: "999.1.1.1" }] })).toBe(false);
+    expect(matchesLogRulesResponse(match, { ...answer, sources: [{ ...source, hits: 0 }] })).toBe(false);
+    expect(matchesLogRulesResponse(match, { ...answer, sources: Array.from({ length: 17 }, () => source) })).toBe(false);
+    expect(matchesLogRulesResponse(match, { ...answer, ruleCount: 145 })).toBe(false);
+    expect(matchesLogRulesResponse(match, { matches: [hit, null], ruleCount: 8 })).toBe(false);
 
     const plan = { handle: HANDLE, summary: "永久删除日志匹配规则「webshell」；此操作不可恢复。", expiresInSeconds: 300 };
     expect(matchesLogRulesResponse({ action: "plan-remove", id: ID }, plan)).toBe(true);

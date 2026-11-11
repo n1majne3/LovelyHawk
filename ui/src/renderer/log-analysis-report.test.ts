@@ -156,7 +156,7 @@ describe("log analysis reports", () => {
   });
 
   it("carries the operator's rule marks into the report", () => {
-    const hit = { id: "log-rule-0f8fad5b-d9cb-469f-a165-70867728950e", name: "webshell", severity: "high" as const };
+    const hit = { id: "log-rule-0f8fad5b-d9cb-469f-a165-70867728950e", name: "webshell", severity: "high" as const, builtin: false };
     const report = buildLogReadReport({
       source: source("auth", "access.log", "/var/log/nginx/access.log"),
       filter: { keyword: "", date: "", journalUnit: "" },
@@ -176,5 +176,22 @@ describe("log analysis reports", () => {
       hits: [null],
     });
     expect(quietReport.text).not.toContain("匹配规则");
+  });
+
+  it("names a built-in signature hit as a lead, never as the operator's rule", () => {
+    const builtinHit = {
+      id: "log-rule-3f7c9a2e-1b6d-4e8a-9c5d-2a1e0f6b8d4c",
+      name: "union-select-sqli", severity: "critical" as const, builtin: true,
+    };
+    const report = buildLogReadReport({
+      source: source("auth", "access.log", "/var/log/nginx/access.log"),
+      filter: { keyword: "", date: "", journalUnit: "" },
+      result: read([entry("GET /a?id=1 union select 1"), entry("GET /")]),
+      copiedAt,
+      hits: [builtinHit, null],
+    });
+    expect(report.text).toContain("匹配规则：1 行命中自定义规则或内置攻击特征，已在行内标出；内置命中仅为排查线索");
+    expect(report.text).toContain("1. [内置特征：union-select-sqli（严重）] GET /a?id=1 union select 1");
+    expect(report.text).not.toContain("[规则：union-select-sqli");
   });
 });

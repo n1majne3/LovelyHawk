@@ -9,6 +9,9 @@ export const LOG_RULE_SEVERITIES: readonly LogRuleSeverity[] = Object.freeze(["l
 
 export const LOG_RULE_LIMITS = Object.freeze({
   maximumRules: 128,
+  maximumBuiltinRules: 16,
+  maximumSources: 16,
+  maximumSourceRules: 8,
   maximumNameBytes: 128,
   maximumPatternBytes: 1_024,
   maximumMatchLines: 500,
@@ -20,10 +23,14 @@ export interface LogRule {
   name: string;
   pattern: string;
   severity: LogRuleSeverity;
+  /** Core-owned fixed signature: shown read-only, never removable. */
+  builtin: boolean;
 }
 
 export interface LogRuleList {
   rules: LogRule[];
+  /** The fixed signatures applied on every match, for display only. */
+  builtinRules: LogRule[];
   maximum: number;
 }
 
@@ -31,12 +38,24 @@ export interface LogRuleHit {
   id: string;
   name: string;
   severity: LogRuleSeverity;
+  builtin: boolean;
+}
+
+/** One apparent attack source: which built-in signatures it hit, most hits first. */
+export interface LogRuleSourceStat {
+  source: string;
+  hits: number;
+  rules: string[];
 }
 
 /** One answer per line asked about, in order. */
 export interface LogRuleMatches {
   matches: (LogRuleHit | null)[];
+  /** Saved plus built-in rules each line was checked against. */
   ruleCount: number;
+  builtinRuleCount: number;
+  /** Apparent sources that hit built-in signatures — leads, not verdicts. */
+  sources: LogRuleSourceStat[];
 }
 
 export interface LogRuleRemovalProposal {
@@ -131,13 +150,29 @@ export function isLogRulesRequest(value: unknown): value is LogRulesRequest {
 }
 
 function isRule(value: unknown): value is LogRule {
-  return record(value) && exactKeys(value, ["id", "name", "pattern", "severity"]) && isLogRuleId(value.id) &&
-    isLogRuleName(value.name) && isLogRulePattern(value.pattern) && isLogRuleSeverity(value.severity);
+  return record(value) && exactKeys(value, ["id", "name", "pattern", "severity", "builtin"]) &&
+    isLogRuleId(value.id) && isLogRuleName(value.name) && isLogRulePattern(value.pattern) &&
+    isLogRuleSeverity(value.severity) && typeof value.builtin === "boolean";
 }
 
 function isHit(value: unknown): value is LogRuleHit {
-  return record(value) && exactKeys(value, ["id", "name", "severity"]) && isLogRuleId(value.id) &&
-    isLogRuleName(value.name) && isLogRuleSeverity(value.severity);
+  return record(value) && exactKeys(value, ["id", "name", "severity", "builtin"]) &&
+    isLogRuleId(value.id) && isLogRuleName(value.name) && isLogRuleSeverity(value.severity) &&
+    typeof value.builtin === "boolean";
+}
+
+function isSourceAddress(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  const octets = value.split(".");
+  return octets.length === 4 && octets.every((part) => /^\d{1,3}$/u.test(part) && Number(part) <= 255);
+}
+
+function isSourceStat(value: unknown): value is LogRuleSourceStat {
+  return record(value) && exactKeys(value, ["source", "hits", "rules"]) && isSourceAddress(value.source) &&
+    typeof value.hits === "number" && Number.isSafeInteger(value.hits) && value.hits >= 1 &&
+    value.hits <= LOG_RULE_LIMITS.maximumMatchLines &&
+    Array.isArray(value.rules) && value.rules.length <= LOG_RULE_LIMITS.maximumSourceRules &&
+    value.rules.every(isLogRuleName);
 }
 
 /** The answer has the shape its request asks for, and says nothing else. */
@@ -145,18 +180,25 @@ export function matchesLogRulesResponse(request: LogRulesRequest, value: unknown
   if (!record(value)) return false;
   switch (request.action) {
     case "list":
-      return exactKeys(value, ["rules", "maximum"]) && Array.isArray(value.rules) &&
+      return exactKeys(value, ["rules", "builtinRules", "maximum"]) && Array.isArray(value.rules) &&
         value.maximum === LOG_RULE_LIMITS.maximumRules && value.rules.length <= LOG_RULE_LIMITS.maximumRules &&
-        value.rules.every(isRule);
+        value.rules.every((rule) => isRule(rule) && !rule.builtin) &&
+        Array.isArray(value.builtinRules) && value.builtinRules.length <= LOG_RULE_LIMITS.maximumBuiltinRules &&
+        value.builtinRules.every((rule) => isRule(rule) && rule.builtin);
     case "add":
-      return isRule(value) && value.name === request.name.trim() && value.pattern === request.pattern &&
-        value.severity === request.severity;
+      return isRule(value) && !value.builtin && value.name === request.name.trim() &&
+        value.pattern === request.pattern && value.severity === request.severity;
     case "match":
-      return exactKeys(value, ["matches", "ruleCount"]) && Array.isArray(value.matches) &&
+      return exactKeys(value, ["matches", "ruleCount", "builtinRuleCount", "sources"]) &&
+        Array.isArray(value.matches) &&
         value.matches.length === request.lines.length &&
         value.matches.every((hit) => hit === null || isHit(hit)) &&
         typeof value.ruleCount === "number" && Number.isSafeInteger(value.ruleCount) &&
-        value.ruleCount >= 0 && value.ruleCount <= LOG_RULE_LIMITS.maximumRules;
+        value.ruleCount >= 0 && value.ruleCount <= LOG_RULE_LIMITS.maximumRules + LOG_RULE_LIMITS.maximumBuiltinRules &&
+        typeof value.builtinRuleCount === "number" && Number.isSafeInteger(value.builtinRuleCount) &&
+        value.builtinRuleCount >= 0 && value.builtinRuleCount <= LOG_RULE_LIMITS.maximumBuiltinRules &&
+        Array.isArray(value.sources) && value.sources.length <= LOG_RULE_LIMITS.maximumSources &&
+        value.sources.every(isSourceStat);
     case "plan-remove":
       return exactKeys(value, ["handle", "summary", "expiresInSeconds"]) && isPlanHandle(value.handle) &&
         typeof value.summary === "string" && value.summary !== "" && value.summary.length <= 1_024 &&

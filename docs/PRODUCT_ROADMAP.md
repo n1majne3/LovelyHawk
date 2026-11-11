@@ -72,7 +72,7 @@
   - `detection.rs` 结构化 `WebshellScan`/`DetectionService` 尚未接 RPC（工作台为桌面可见入口）。
   - 外部扫描器编排：支持配置本机已安装扫描器（如 D 盾）的可执行路径，一键把目标 Web 目录整目录拉回本机临时目录，自动调用扫描、解析并回显结果，与留证/案件记录关联；依赖“传输能力”节的整目录下载。涉及本机路径与本机进程调用，按仓库规范走宿主专用命令而非主窗口白名单，扫描器输出按不可信纯文本处理，任务可取消、临时目录用后清理。
   - 边界：D 盾为闭源 Windows 工具，不能嵌入或再分发；内置特征库与“用户自备路径的外部扫描器编排”是两条互补路线，内置路线仍需写明误报边界。
-- Web 日志攻击特征内置规则：`union.*select`、`../`、`${jndi:`、thinkphp 特征路径与攻击源 IP 统计；现有 `log_analysis.rs` 只是自定义规则框架。
+- ~~Web 日志攻击特征内置规则~~：已实现固定内置特征集（`log_analysis.rs` `builtin_log_rules`，7 条：union select SQL 注入、路径穿越/`%2e%2e`、`${jndi:` JNDI 注入、ThinkPHP 利用路径、webshell 参数访问、扫描器 UA、IFS/`/dev/tcp` 反弹特征），经 `rules_for_matching` 在匹配点与自定义规则合并（自定义优先、内置不可删改列，`match` 命中带 `builtin` 来源标记与 `builtinRuleCount`），并按行内来源地址聚合 `sources` 攻击源统计（按命中数排序、上限 16 源/8 特征，回环与缺源不计），全部为排查线索而非定性。core 单测 7 项（签名命中/大小写/聚合排序/上限/共存/净日志不误报）；backend RPC 与契约同步扩展。剩余缺口：特征覆盖面仍小（无 LFI/RFI 与序列化利用、无更多国产框架与组件特征、无 XSS 线索），`log-web-trace` 的逐行 URI 尚未自动喂给匹配，攻击源仅限行内可解析 IPv4。
 - 访问日志反查文件：运维2 的免杀马 D 盾扫不出，是从 apache 访问日志找到的。`log-web-trace`（`command_workbench.rs`）已覆盖第一版：读取 nginx/apache 访问日志尾部与 .1 轮转，提取点号隐藏段、样本内仅 POST、疑似随机命名、含 `..` 或 PUT/DELETE/TRACE/CONNECT 的脚本路径，并把前 20 条 URI 拼到常见站点根核对存在性，全部为需人工核对的线索。剩余缺口：自定义日志位置与 vhost 日志目录、压缩轮转文件、URL 编码与路径规范化带来的漏判，以及对命中文件的进一步特征深查（可结合 `file-webshell-hint`）。
 - Web 根内的站点打包与敏感文件：`file-credential` 只在文件名含 backup/dump/bak 时才标出压缩包（`command_workbench.rs:644`），运维2 的 `www.zip` 不会命中；`composer.json`、`.git/config` 与云凭证文件（`.aws/credentials` 等）均无检查（站点内 `.env.*` 已覆盖）。
 - Web 根内的隐藏文件：`file-hidden`（`command_workbench.rs:919`）只查 `/tmp`、`/var/tmp`、`/dev/shm`、`/home`、`/root`，不含 Web 根（运维2 的 `.a.php`、`.dont_delete_me.php`）。

@@ -42,6 +42,7 @@ export function LogRulesDialog({ api, returnFocus, onChanged, onClose }: {
   onClose(): void;
 }) {
   const [rules, setRules] = useState<LogRule[] | null>(null);
+  const [builtinRules, setBuiltinRules] = useState<readonly LogRule[]>([]);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [draft, setDraft] = useState<Draft>(emptyDraft);
   const [draftError, setDraftError] = useState<string | null>(null);
@@ -61,6 +62,7 @@ export function LogRulesDialog({ api, returnFocus, onChanged, onClose }: {
     try {
       const list = await api.logRules({ action: "list" }) as LogRuleList;
       setRules(list.rules);
+      setBuiltinRules(list.builtinRules);
       setLoadError(null);
     } catch (reason) {
       setLoadError(errorText(reason, "没能读出已保存的规则。"));
@@ -215,9 +217,36 @@ export function LogRulesDialog({ api, returnFocus, onChanged, onClose }: {
             {notice.text}
           </p></TransientNotice>
         ) : null}
+        <LogRulesBuiltinSection rules={builtinRules} />
         <footer><button type="button" onClick={onClose}>关闭</button></footer>
       </section>
       {dialog !== null ? <DialogHost dialog={dialog} scrollMessage onResolve={resolve} /> : null}
     </div>
+  );
+}
+
+/**
+ * The fixed attack signatures every match applies, listed so the operator can
+ * see exactly what else each line is checked against. They are never saved,
+ * never editable and never removable — a hit is a lead to review, so the list
+ * ends with that limit rather than an action.
+ */
+export function LogRulesBuiltinSection({ rules }: { rules: readonly LogRule[] }) {
+  if (rules.length === 0) return null;
+  return (
+    <section className="log-rules-builtin" aria-label="内置攻击特征" data-testid="log-rules-builtin">
+      <h3>内置攻击特征</h3>
+      <p>固定的攻击特征，比对每一行日志时都会使用；只读，不能修改或删除。命中只是排查线索，不代表已经入侵。</p>
+      <ul className="log-rules-list" aria-label="内置攻击特征">
+        {rules.map((rule) => (
+          <li key={rule.id}>
+            <span className={`log-analysis-rule-hit is-${rule.severity}`}>{logRuleSeverityLabel(rule.severity)}</span>
+            <strong>{rule.name}</strong>
+            <code title={rule.pattern}>{rule.pattern}</code>
+            <span className="log-rules-builtin-tag">内置·不可删除</span>
+          </li>
+        ))}
+      </ul>
+    </section>
   );
 }

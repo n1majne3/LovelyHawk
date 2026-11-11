@@ -6,6 +6,7 @@ import {
   type LogRuleHit,
   type LogRuleMatches,
   type LogRuleSeverity,
+  type LogRuleSourceStat,
   type LogRulesRequest,
   type LogRulesResponse,
 } from "../shared/log-rules-contract";
@@ -14,10 +15,15 @@ export interface LogRulesApi {
   logRules(request: LogRulesRequest): Promise<LogRulesResponse>;
 }
 
-/** What the saved rules said about one set of lines. */
+/** What the saved rules and the built-in signatures said about one set of lines. */
 export interface LogRuleHits {
   hits: readonly (LogRuleHit | null)[];
+  /** Saved plus built-in rules each line was checked against. */
   ruleCount: number;
+  /** How many of those were the fixed built-in attack signatures. */
+  builtinRuleCount: number;
+  /** Apparent sources that hit built-in signatures — leads, not verdicts. */
+  sources: readonly LogRuleSourceStat[];
   /** True when matching could not be done; the lines are then shown unmarked. */
   failed: boolean;
 }
@@ -49,9 +55,38 @@ export function logRuleLine(entry: PublicLogEntry): string {
 }
 
 /**
- * Matches lines a page already read against the saved rules, in batches the
- * backend takes, and answers only for those lines and that version of the
- * rules — a result for an older page or older rules is never shown.
+ * One ranked source list out of the per-batch ones the backend answered:
+ * hits add up, signature names are the union, and the list stays inside the
+ * bounds a single answer keeps.
+ */
+export function mergeLogRuleSources(batches: readonly LogRuleSourceStat[]): LogRuleSourceStat[] {
+  const bySource = new Map<string, { hits: number; rules: string[] }>();
+  for (const stat of batches) {
+    const found = bySource.get(stat.source);
+    if (found === undefined) {
+      bySource.set(stat.source, {
+        hits: stat.hits,
+        rules: stat.rules.slice(0, LOG_RULE_LIMITS.maximumSourceRules),
+      });
+      continue;
+    }
+    found.hits += stat.hits;
+    for (const name of stat.rules) {
+      if (found.rules.length >= LOG_RULE_LIMITS.maximumSourceRules) break;
+      if (!found.rules.includes(name)) found.rules.push(name);
+    }
+  }
+  return [...bySource.entries()]
+    .map(([source, stat]) => ({ source, hits: stat.hits, rules: stat.rules }))
+    .sort((a, b) => b.hits - a.hits || (a.source < b.source ? -1 : 1))
+    .slice(0, LOG_RULE_LIMITS.maximumSources);
+}
+
+/**
+ * Matches lines a page already read against the saved rules and the fixed
+ * built-in signatures, in batches the backend takes, and answers only for
+ * those lines and that version of the rules — a result for an older page or
+ * older rules is never shown.
  */
 export function useLogRuleHits(
   api: LogRulesApi,
@@ -69,26 +104,38 @@ export function useLogRuleHits(
     let live = true;
     void (async () => {
       const hits: (LogRuleHit | null)[] = [];
+      const sources: LogRuleSourceStat[] = [];
       let ruleCount = 0;
+      let builtinRuleCount = 0;
       try {
         for (let start = 0; start < entries.length; start += LOG_RULE_LIMITS.maximumMatchLines) {
           const lines = entries.slice(start, start + LOG_RULE_LIMITS.maximumMatchLines).map(logRuleLine);
           const answer = await api.logRules({ action: "match", lines }) as LogRuleMatches;
           if (!live) return;
           hits.push(...answer.matches);
+          sources.push(...answer.sources);
           ruleCount = answer.ruleCount;
-          // No rules saved: the remaining batches would say the same.
-          if (ruleCount === 0) break;
+          builtinRuleCount = answer.builtinRuleCount;
         }
         if (live) {
           setState({
             entries,
             version: rulesVersion,
-            result: { hits: ruleCount === 0 ? entries.map(() => null) : hits, ruleCount, failed: false },
+            result: {
+              hits,
+              ruleCount,
+              builtinRuleCount,
+              sources: mergeLogRuleSources(sources),
+              failed: false,
+            },
           });
         }
       } catch {
-        if (live) setState({ entries, version: rulesVersion, result: { hits: entries.map(() => null), ruleCount: 0, failed: true } });
+        if (live) setState({
+          entries,
+          version: rulesVersion,
+          result: { hits: entries.map(() => null), ruleCount: 0, builtinRuleCount: 0, sources: [], failed: true },
+        });
       }
     })();
     return () => {
