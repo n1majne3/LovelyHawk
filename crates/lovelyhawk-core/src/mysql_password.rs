@@ -145,6 +145,8 @@ pub(crate) enum MySqlPasswordStep {
         request: MySqlRuntimeRequest,
         statement: Zeroizing<String>,
     },
+    /// Read-only live-instance review (accounts, UDFs, global variables).
+    Review { request: MySqlRuntimeRequest },
 }
 
 impl fmt::Debug for MySqlPasswordStep {
@@ -155,6 +157,7 @@ impl fmt::Debug for MySqlPasswordStep {
             Self::VerifyLogin { .. } => "VerifyLogin",
             Self::Capture { .. } => "Capture",
             Self::Restore { .. } => "Restore",
+            Self::Review { .. } => "Review",
         };
         f.debug_tuple("MySqlPasswordStep")
             .field(&name)
@@ -169,7 +172,8 @@ impl MySqlPasswordStep {
             | Self::Apply { request, .. }
             | Self::VerifyLogin { request, .. }
             | Self::Capture { request, .. }
-            | Self::Restore { request, .. } => request,
+            | Self::Restore { request, .. }
+            | Self::Review { request } => request,
         };
         (request.host().to_owned(), request.port())
     }
@@ -185,6 +189,7 @@ pub(crate) enum MySqlPasswordResult {
         verifier: Option<Zeroizing<String>>,
     },
     Restored,
+    Reviewed(Box<crate::mysql_instance::MySqlInstanceReview>),
 }
 
 impl fmt::Debug for MySqlPasswordResult {
@@ -195,6 +200,7 @@ impl fmt::Debug for MySqlPasswordResult {
             Self::VerifiedLogin(_) => "VerifiedLogin",
             Self::Captured { .. } => "Captured",
             Self::Restored => "Restored",
+            Self::Reviewed(_) => "Reviewed",
         };
         f.debug_tuple("MySqlPasswordResult").field(&name).finish()
     }
@@ -202,7 +208,7 @@ impl fmt::Debug for MySqlPasswordResult {
 
 /// Quote one statement string literal: `'` doubling plus `\` doubling so the
 /// value is identical under default and NO_BACKSLASH_ESCAPES modes.
-fn literal(value: &str) -> String {
+pub(crate) fn literal(value: &str) -> String {
     format!("'{}'", escape_sql_literal(value).replace('\\', "\\\\"))
 }
 
@@ -210,7 +216,7 @@ fn literal(value: &str) -> String {
 /// server-computed value.
 const INSPECT_SQL: &str = "SELECT VERSION(), @@version_comment, CURRENT_USER()";
 
-fn parse_version_comment(version: &str, comment: &str) -> Option<MySqlProduct> {
+pub(crate) fn parse_version_comment(version: &str, comment: &str) -> Option<MySqlProduct> {
     let comment = comment.to_ascii_lowercase();
     if comment.contains("mariadb") || version.to_ascii_lowercase().contains("mariadb") {
         Some(MySqlProduct::MariaDb)
@@ -222,7 +228,7 @@ fn parse_version_comment(version: &str, comment: &str) -> Option<MySqlProduct> {
 }
 
 /// The versions this write path is reviewed for (design doc §MySQL).
-fn supported_version(product: MySqlProduct, version: &str) -> bool {
+pub(crate) fn supported_version(product: MySqlProduct, version: &str) -> bool {
     let mut parts = version.split(|c: char| !c.is_ascii_digit());
     let major = parts
         .find(|p| !p.is_empty())
@@ -240,7 +246,7 @@ fn supported_version(product: MySqlProduct, version: &str) -> bool {
 
 /// Parse `CURRENT_USER()` into user + host. The server always returns the
 /// two-part quoted form `'user'@'host'`.
-fn parse_current_user(value: &str) -> Option<MySqlAccount> {
+pub(crate) fn parse_current_user(value: &str) -> Option<MySqlAccount> {
     let (user, host) = value.split_once('@')?;
     Some(MySqlAccount {
         user: user.trim_matches('\'').to_owned(),
@@ -405,6 +411,12 @@ where
             .await;
             session.quit().await;
             result.map(|_| MySqlPasswordResult::Restored)
+        }
+        MySqlPasswordStep::Review { request } => {
+            let mut session = connect(stream, request).await?;
+            let result = crate::mysql_instance::run_review(&mut session).await;
+            session.quit().await;
+            Ok(MySqlPasswordResult::Reviewed(Box::new(result?)))
         }
     }
 }
@@ -888,7 +900,7 @@ const RESTORE_TOKEN_TTL: Duration = Duration::from_secs(600);
 /// TLS settings for a resolved MySQL connection: a literal loopback
 /// destination is protected by the SSH channel itself (`SshLoopback`), any
 /// other destination must carry database TLS.
-fn tls_settings_for(
+pub(crate) fn tls_settings_for(
     connection: &crate::database::DatabaseConnection,
 ) -> crate::mysql_native::MySqlTlsSettings {
     let host = connection
@@ -1430,7 +1442,7 @@ impl DatabaseService {
 
     /// Read-side step runner: keeps re-checking target and profile snapshot
     /// while the step runs on its own SSH channel.
-    async fn mysql_password_step(
+    pub(crate) async fn mysql_password_step(
         &self,
         session: &BoundSshSession,
         profile_id: &str,
@@ -1477,7 +1489,7 @@ impl DatabaseService {
 
 /// Rebuilds a request with a fresh `SecretValue` (each step needs its own
 /// copy of the credential).
-fn request_for(request: &MySqlRuntimeRequest) -> CoreResult<MySqlRuntimeRequest> {
+pub(crate) fn request_for(request: &MySqlRuntimeRequest) -> CoreResult<MySqlRuntimeRequest> {
     MySqlRuntimeRequest::new(
         request.connection.clone(),
         request.tls.clone(),

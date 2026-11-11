@@ -336,6 +336,38 @@ FLUSH PRIVILEGES;`);
     const restoreReplay = await rpc("plan-password-restore", { profileHandle: profile.profileHandle, restoreHandle: executed.result.restoreHandle });
     check(`[${vendor.key}] a spent restore handle cannot plan twice`, rejected(restoreReplay, "plan-password-restore") && restoreReplay.code === "stale");
 
+    // Instance review fixture. An anonymous ''@'localhost' row would hijack
+    // every earlier localhost login (it outranks 'lrdb1'@'%' on host
+    // specificity), so it is created only now, after the password lifecycle
+    // is fully verified. general_log_file must already be writable by the
+    // mysqld user or SET GLOBAL refuses it (MariaDB checks at set time).
+    admin(`CREATE USER IF NOT EXISTS ''@'localhost';
+CREATE USER IF NOT EXISTS 'lrfile'@'%' IDENTIFIED BY 'Lr#File2026!';
+GRANT FILE ON *.* TO 'lrfile'@'%';
+INSERT IGNORE INTO mysql.func (name, ret, dl, type) VALUES ('sys_eval', 0, 'lib_mysqludf_sys.so', 'function');
+FLUSH PRIVILEGES;`);
+    onHost("sh", "-c", "mkdir -p /var/www/html && touch /var/www/html/lab-general.log && chown mysql /var/www/html /var/www/html/lab-general.log");
+    admin(`SET GLOBAL log_output='FILE';
+SET GLOBAL general_log_file='/var/www/html/lab-general.log';
+SET GLOBAL general_log='ON';`);
+    for (let i = 0; i < 3; i += 1) login(`wrong-pass-${i}`);
+    admin("SELECT 'lab-outfile' INTO OUTFILE '/var/www/html/lab-outfile.txt'");
+
+    const review = await rpc("inspect", { profileHandle: profile.profileHandle });
+    check(`[${vendor.key}] inspect returns a reviewed instance`, review?.kind === "review" && review.review?.product === vendor.product);
+    const codes = new Set((review.review?.findings || []).map(f => f.code));
+    check(`[${vendor.key}] review flags anonymous, remote root, FILE priv, UDF and web-root log`,
+      ["anonymous-account", "root-remote", "file-priv", "udf-registered", "general-log-web-root"].every(c => codes.has(c)));
+    check(`[${vendor.key}] review lists the fixture accounts`,
+      (review.review?.accounts || []).some(a => a.user === ACCOUNT.user && a.host === ACCOUNT.host) &&
+      (review.review?.accounts || []).some(a => a.user === "" && a.host === "localhost") &&
+      (review.review?.accounts || []).some(a => a.user === "lrfile" && a.filePriv === true));
+    check(`[${vendor.key}] review reads the general-log tail`,
+      review.review?.log != null && review.review.log.path.includes("lab-general.log") &&
+      (review.review.log.denied || []).some(d => d.count >= 1) &&
+      (review.review.log.hits || []).some(h => h.kind === "outfile" || h.kind === "udf-ddl"));
+    check(`[${vendor.key}] review response carries no secret`, !valueHasCanary(review));
+
     const serviceLog = [onHost("sh", "-c", "cat /var/log/lab-service.log 2>/dev/null; for f in /var/log/mysql/*.log /var/lib/mysql/*.err; do [ -f \"$f\" ] && tail -n 300 \"$f\"; done; true"),
       podman("logs", "--tail", "400", containerId)].join("\n");
     check(`[${vendor.key}] server logs contain no new/old password plaintext`, !bytesHaveCanary(Buffer.from(serviceLog)));

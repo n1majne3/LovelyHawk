@@ -50,6 +50,7 @@ pub mod middleware;
 pub mod middleware_document;
 pub mod mongodb_config;
 pub mod mysql_config;
+pub mod mysql_instance;
 pub mod mysql_native;
 pub mod mysql_password;
 pub mod mysql_wire;

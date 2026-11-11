@@ -56,6 +56,10 @@ pub(crate) enum MySqlRuntimeRequest {
         binding_handle: String,
         profile_handle: String,
     },
+    Inspect {
+        binding_handle: String,
+        profile_handle: String,
+    },
     Delete {
         binding_handle: String,
         plan_handle: String,
@@ -219,6 +223,7 @@ fn action_name(request: &MySqlRuntimeRequest) -> &'static str {
         MySqlRuntimeRequest::List { .. } => "list",
         MySqlRuntimeRequest::Save { .. } => "save",
         MySqlRuntimeRequest::PlanDelete { .. } => "plan-delete",
+        MySqlRuntimeRequest::Inspect { .. } => "inspect",
         MySqlRuntimeRequest::Delete { .. } => "delete",
         MySqlRuntimeRequest::PlanPassword { .. } => "plan-password",
         MySqlRuntimeRequest::ExecutePassword { .. } => "execute-password",
@@ -390,6 +395,7 @@ impl MySqlRuntimeApi {
             List { binding_handle }
             | Save { binding_handle, .. }
             | PlanDelete { binding_handle, .. }
+            | Inspect { binding_handle, .. }
             | Delete { binding_handle, .. }
             | PlanPassword { binding_handle, .. }
             | ExecutePassword { binding_handle, .. }
@@ -520,6 +526,24 @@ impl MySqlRuntimeApi {
                 entry.profiles.insert(id, saved);
                 Ok(json!({"kind":"saved", "profile":dto}))
             })?,
+            Inspect { profile_handle, .. } => {
+                let snapshot = self.with_entry(&scope, |entry| {
+                    Self::idle(entry)?;
+                    self.profile(entry, &profile_handle)
+                })?;
+                let review = self
+                    .services
+                    .database()
+                    .mysql_instance_review(&session, &snapshot)
+                    .await
+                    .map_err(core_error)?;
+                let view = serde_json::to_value(&review).map_err(|_| MySqlRuntimeError::Store)?;
+                self.with_entry(&scope, |entry| {
+                    Self::idle(entry)?;
+                    entry.touched = Instant::now();
+                    Ok(json!({"kind":"review","review":view}))
+                })?
+            }
             PlanDelete { profile_handle, .. } => self.with_entry(&scope, |entry| {
                 Self::idle(entry)?;
                 let snapshot = self.profile(entry, &profile_handle)?;
