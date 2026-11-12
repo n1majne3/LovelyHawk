@@ -7,6 +7,7 @@ import { isCaseLibraryRequest, matchesCaseLibraryResult, type CaseLibraryRequest
 import { isCaseWorkspaceRequest } from "../shared/case-workspace-contract.js";
 import { isFileEvidenceRequest, matchesFileEvidenceResult, type FileEvidenceRequest } from "../shared/file-evidence-contract.js";
 import { isPacketCaptureEvidenceRequest, matchesPacketCaptureEvidenceResult, type PacketCaptureEvidenceRequest } from "../shared/packet-capture-evidence-contract.js";
+import { isPortForwardRequest } from "../shared/port-forward-contract.js";
 import { isPodFileEvidenceRequest, matchesPodFileEvidenceResult, type PodFileEvidenceRequest } from "../shared/pod-file-evidence-contract.js";
 import { isConfigVisualCopyResult, isConfigVisualProduct, isConfigVisualRequest, isConfigVisualSaveResult, isConfigVisualView } from "../shared/config-visual-contract.js";
 import { isNginxRepairRequest } from "../shared/nginx-repair-contract.js";
@@ -244,6 +245,11 @@ export function createMainApi(transport: BackendTransport = hostBackendTransport
       if (result === null) return null;
       if (!matchesLocalScanResult(request as LocalScanRequest, result)) refuse("本机扫描结果与本次请求不一致。");
       return result;
+    },
+    portForward: async (...values: unknown[]) => {
+      requireArity(values, 1, "端口转发请求无效。");
+      if (!isPortForwardRequest(values[0])) refuse("端口转发请求无效。");
+      return backend.portForward(values[0]);
     },
     packetCaptureEvidence: async (...values: unknown[]) => {
       requireArity(values, 1, "抓包留证请求无效。");

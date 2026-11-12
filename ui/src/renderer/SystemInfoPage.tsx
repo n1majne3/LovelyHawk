@@ -20,6 +20,7 @@ import {
   EMPTY_SYSTEM_INFO_FILTER,
   filterSystemInfoRows,
   firewallBlockAddress,
+  forwardListenAddress,
   systemInfoGauges,
   formatSystemInfoValue,
   groupShellConfigRows,
@@ -36,6 +37,7 @@ import { rowActionFailureText, useSystemInfoRowActions } from "./system-info-row
 import { SystemInfoRowActionDialog } from "./SystemInfoRowActionDialog";
 import { FirewallBlockDialog } from "./FirewallBlockDialog";
 import { SystemInfoRowMenu, type SystemInfoRowLocalAction } from "./SystemInfoRowMenu";
+import { PortForwardPanel } from "./PortForwardPanel";
 import {
   createSystemInfoState,
   systemInfoReducer,
@@ -62,6 +64,8 @@ export function SystemInfoPage({ connection, api, writeClipboard, openFile, onOp
   const [summaryVersion, setSummaryVersion] = useState(0);
   const [notice, setNotice] = useState<string | null>(null);
   const [firewallBlock, setFirewallBlock] = useState<{ address: string | null; direction: "inbound" | "outbound" | "both" } | null>(null);
+  // "open" lists forwards with an empty form; a prefill opens it at one row.
+  const [forwardPanel, setForwardPanel] = useState<"open" | { host: string; port: number } | null>(null);
   const backgroundRef = useRef<HTMLDivElement>(null);
   const tableRequestRef = useRef(0);
   const dialogRef = useRef<HTMLElement>(null);
@@ -416,6 +420,12 @@ export function SystemInfoPage({ connection, api, writeClipboard, openFile, onOp
         return;
       case "detail":
         openDetail(menu.row.id);
+        return;
+      case "forward": {
+        const prefill = table === null ? null : forwardListenAddress(table.tab, menu.row);
+        if (prefill !== null) setForwardPanel(prefill);
+        return;
+      }
     }
   }
 
@@ -506,6 +516,9 @@ export function SystemInfoPage({ connection, api, writeClipboard, openFile, onOp
                     )}
                     {!summaryTabActive && bindingHandle !== null && (selectedTab === "firewall" || selectedTab === "network" || selectedTab === "established") ? (
                       <button type="button" onClick={() => setFirewallBlock({ address: null, direction: selectedTab === "firewall" ? "inbound" : "both" })}>封禁地址…</button>
+                    ) : null}
+                    {bindingHandle !== null ? (
+                      <button type="button" data-testid="port-forward-open" onClick={() => setForwardPanel("open")}>端口转发…</button>
                     ) : null}
                     <button
                       type="button"
@@ -710,8 +723,19 @@ export function SystemInfoPage({ connection, api, writeClipboard, openFile, onOp
           actions={rowActions.menu.actions}
           error={rowActions.menu.error}
           onLocal={handleLocalRowAction}
+          forwardable={table !== null && forwardListenAddress(table.tab, rowActions.menu.row) !== null}
           onAction={(action) => void rowActions.choose(action)}
           onDismiss={rowActions.dismissMenu}
+        />
+      ) : null}
+
+      {forwardPanel !== null && bindingHandle !== null ? (
+        <PortForwardPanel
+          api={api}
+          bindingHandle={bindingHandle}
+          prefill={forwardPanel === "open" ? null : forwardPanel}
+          writeClipboard={writeClipboard}
+          onClose={() => setForwardPanel(null)}
         />
       ) : null}
 

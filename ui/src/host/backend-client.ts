@@ -9,6 +9,7 @@ import { isPostgresqlRuntimeRequest, matchesPostgresqlRuntimeResponse, type Post
 import { isMySqlRuntimeRequest, matchesMySqlRuntimeResponse, type MySqlRuntimeRequest, type MySqlRuntimeResponse } from "../shared/mysql-runtime-contract.js";
 import { isFileEvidenceRequest, matchesFileEvidenceResult, type FileEvidenceRequest, type FileEvidenceResult } from "../shared/file-evidence-contract.js";
 import { isPacketCaptureEvidenceRequest, matchesPacketCaptureEvidenceResult, type PacketCaptureEvidenceRequest, type PacketCaptureEvidenceResult } from "../shared/packet-capture-evidence-contract.js";
+import { isPortForward, isPortForwardList, isPortForwardRequest, type PortForward, type PortForwardRequest } from "../shared/port-forward-contract.js";
 import { isPodFileEvidenceRequest, matchesPodFileEvidenceResult, type PodFileEvidenceRequest, type PodFileEvidenceResult } from "../shared/pod-file-evidence-contract.js";
 import { isConfigVisualRequest, matchesConfigVisualResponse, type ConfigVisualAnswer, type ConfigVisualRequest, type ConfigVisualView } from "../shared/config-visual-contract.js";
 import { isCaseWorkspaceRequest, matchesCaseWorkspaceResult, type CaseWorkspaceRequest, type CaseWorkspaceResult } from "../shared/case-workspace-contract.js";
@@ -728,6 +729,18 @@ export class BackendClient {
     if (!isFileEvidenceRequest(request) || request.action === "begin") throw new Error("留证请求无效。");
     const result = await this.#request("emergency.file-evidence", request, 30_000);
     if (result === null || !matchesFileEvidenceResult(request, result)) throw new Error("留证响应与本次请求不一致。");
+    return result;
+  }
+
+  /** Local port forwards: start binds a loopback listener, list and stop are state. */
+  async portForward(request: PortForwardRequest): Promise<PortForward | PortForward[]> {
+    if (!isPortForwardRequest(request)) throw new Error("端口转发请求无效。");
+    const result = await this.#request(`port-forward.${request.action}`, request, 30_000);
+    if (request.action === "list") {
+      if (!isPortForwardList(result)) throw new Error("端口转发响应未通过校验。");
+      return result;
+    }
+    if (!isPortForward(result)) throw new Error("端口转发响应未通过校验。");
     return result;
   }
 

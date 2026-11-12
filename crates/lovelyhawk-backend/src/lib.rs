@@ -36,6 +36,7 @@ mod nginx_repair_api;
 mod notes_api;
 mod packet_capture_evidence_api;
 mod packet_capture_live_api;
+mod port_forward_api;
 mod postgresql_runtime_api;
 mod settings_api;
 mod sftp_browser_api;
@@ -115,6 +116,7 @@ use crate::{
     packet_capture_live_api::{
         PacketCaptureLiveApi, PacketCaptureLiveApiError, PacketCaptureStartInput,
     },
+    port_forward_api::{PortForwardApi, PortForwardApiError},
     postgresql_runtime_api::{PostgresqlRuntimeApi, PostgresqlRuntimeRequest},
     settings_api::{
         SettingsAiApiKeyReplacementInput, SettingsApi, SettingsApiError, SettingsSaveInput,
@@ -239,6 +241,7 @@ pub struct BackendState {
     note_replays: parking_lot::Mutex<HashMap<String, NoteReplayEntry>>,
     packet_capture_evidence: PacketCaptureEvidenceApi,
     packet_capture_live: PacketCaptureLiveApi,
+    port_forward: PortForwardApi,
     ssh: Arc<SshApi>,
     settings: SettingsApi,
     system_info: SystemInfoApi,
@@ -355,6 +358,7 @@ impl BackendState {
         let packet_capture_evidence =
             PacketCaptureEvidenceApi::new(services.clone(), Arc::clone(&ssh));
         let packet_capture_live = PacketCaptureLiveApi::new(services.clone(), Arc::clone(&ssh));
+        let port_forward = PortForwardApi::new(services.clone(), Arc::clone(&ssh));
         let settings = SettingsApi::new(&services);
         let system_info = SystemInfoApi::new(services.clone(), Arc::clone(&ssh));
         let terminal = TerminalApi::new(services.clone(), Arc::clone(&ssh));
@@ -398,6 +402,7 @@ impl BackendState {
             note_replays: parking_lot::Mutex::new(HashMap::new()),
             packet_capture_evidence,
             packet_capture_live,
+            port_forward,
             ssh,
             settings,
             system_info,
@@ -862,6 +867,7 @@ impl BackendState {
                             self.docker_write.close_binding(&params.binding_handle);
                             self.system_info.close_binding(&params.binding_handle);
                             self.sftp_browser.close_binding(&params.binding_handle);
+                            self.port_forward.close_binding(&params.binding_handle);
                             self.packet_capture_evidence
                                 .close_binding(&params.binding_handle);
                             self.packet_capture_live
@@ -2301,6 +2307,42 @@ impl BackendState {
                     Err(failure) => Err(failure),
                 }
             }
+            RpcMethod::PortForwardStart => {
+                match parse_params::<PortForwardStartParams>(request.params) {
+                    Ok(params) => self
+                        .port_forward
+                        .forward_start(
+                            &params.binding_handle,
+                            params.local_port,
+                            &params.destination_host,
+                            params.destination_port,
+                        )
+                        .await
+                        .map(to_value)
+                        .map_err(port_forward_failure),
+                    Err(failure) => Err(failure),
+                }
+            }
+            RpcMethod::PortForwardList => {
+                match parse_params::<PortForwardListParams>(request.params) {
+                    Ok(params) => self
+                        .port_forward
+                        .forward_list(&params.binding_handle)
+                        .map(to_value)
+                        .map_err(port_forward_failure),
+                    Err(failure) => Err(failure),
+                }
+            }
+            RpcMethod::PortForwardStop => {
+                match parse_params::<PortForwardStopParams>(request.params) {
+                    Ok(params) => self
+                        .port_forward
+                        .forward_stop(&params.binding_handle, &params.forward_handle)
+                        .map(to_value)
+                        .map_err(port_forward_failure),
+                    Err(failure) => Err(failure),
+                }
+            }
             RpcMethod::PacketCaptureInterfacesList => {
                 match parse_params::<PacketCaptureBindingParams>(request.params) {
                     Ok(params) => self
@@ -3361,6 +3403,12 @@ enum RpcMethod {
     SftpBrowserRelayPoll,
     #[serde(rename = "sftp-browser.relay.cancel")]
     SftpBrowserRelayCancel,
+    #[serde(rename = "port-forward.start")]
+    PortForwardStart,
+    #[serde(rename = "port-forward.list")]
+    PortForwardList,
+    #[serde(rename = "port-forward.stop")]
+    PortForwardStop,
     #[serde(rename = "packet-capture.interfaces.list")]
     PacketCaptureInterfacesList,
     #[serde(rename = "packet-capture.start")]
@@ -4190,6 +4238,31 @@ struct SftpBrowserRelayParams {
     binding_handle: String,
     browser_handle: String,
     relay_handle: String,
+}
+
+/// A local port forward: the binding it lives on, the loopback port (0 for
+/// ephemeral), and the destination checked against the target's LISTEN
+/// table — destinationHost is an IP literal, never a page-chosen name.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PortForwardStartParams {
+    binding_handle: String,
+    local_port: u16,
+    destination_host: String,
+    destination_port: u16,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PortForwardListParams {
+    binding_handle: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PortForwardStopParams {
+    binding_handle: String,
+    forward_handle: String,
 }
 
 /// A replacement class file for Java hot update. Host-only, like the SFTP
@@ -5117,6 +5190,59 @@ fn config_failure(error: CoreError) -> RpcFailure {
         public_message,
         error,
     )
+}
+
+fn port_forward_failure(error: PortForwardApiError) -> RpcFailure {
+    match error {
+        PortForwardApiError::Core(source) => RpcFailure::core(
+            "run port-forward operation",
+            "port-forward-failed",
+            "The port-forward operation failed.",
+            source,
+        ),
+        PortForwardApiError::BindingUnavailable => RpcFailure {
+            operation: "validate port-forward SSH binding",
+            code: "system-info-binding-unavailable",
+            public_message: "The SSH binding is missing or stale.",
+            source: None,
+        },
+        PortForwardApiError::InvalidRequest => RpcFailure {
+            operation: "validate port-forward request",
+            code: "invalid-params",
+            public_message: "The port-forward request parameters are invalid.",
+            source: None,
+        },
+        PortForwardApiError::DestinationRefused => RpcFailure {
+            operation: "validate port-forward destination",
+            code: "port-forward-destination-refused",
+            public_message: "The destination is not a listener the target reports.",
+            source: None,
+        },
+        PortForwardApiError::PortTaken => RpcFailure {
+            operation: "bind port-forward listener",
+            code: "port-forward-port-taken",
+            public_message: "That local port is already in use on this workstation.",
+            source: None,
+        },
+        PortForwardApiError::Capacity => RpcFailure {
+            operation: "start port forward",
+            code: "port-forward-capacity",
+            public_message: "At most 8 forwards per binding.",
+            source: None,
+        },
+        PortForwardApiError::NotFound => RpcFailure {
+            operation: "stop port forward",
+            code: "port-forward-gone",
+            public_message: "That forward is not running.",
+            source: None,
+        },
+        PortForwardApiError::RegistryUnavailable => RpcFailure {
+            operation: "read port-forward registry",
+            code: "port-forward-unavailable",
+            public_message: "The port-forward registry is unavailable.",
+            source: None,
+        },
+    }
 }
 
 fn system_info_failure(error: SystemInfoApiError) -> RpcFailure {
@@ -7558,6 +7684,110 @@ mod tests {
         )
         .expect("a well-formed request parses");
         assert_eq!(parsed.rate_limit_kib, 0);
+    }
+
+    /// The port-forward params are closed shapes too: anything extra — a
+    /// socket, a session, a path the page must never supply — is refused at
+    /// parse, and ports are u16, never strings or out-of-range numbers.
+    #[test]
+    fn port_forward_params_reject_unknown_fields_and_bad_values() {
+        for raw in [
+            r#"{"bindingHandle":"b","localPort":0,"destinationHost":"127.0.0.1","destinationPort":80,"extra":1}"#,
+            r#"{"bindingHandle":"b","localPort":0,"destinationHost":"127.0.0.1","destinationPort":80,"localPath":"/x"}"#,
+            r#"{"binding_handle":"b","localPort":0,"destinationHost":"127.0.0.1","destinationPort":80}"#,
+            r#"{"bindingHandle":"b","localPort":"8080","destinationHost":"127.0.0.1","destinationPort":80}"#,
+            r#"{"bindingHandle":"b","localPort":-1,"destinationHost":"127.0.0.1","destinationPort":80}"#,
+            r#"{"bindingHandle":"b","localPort":70000,"destinationHost":"127.0.0.1","destinationPort":80}"#,
+            r#"{"bindingHandle":"b","localPort":0,"destinationHost":"127.0.0.1"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<PortForwardStartParams>(raw).is_err(),
+                "{raw}"
+            );
+        }
+        assert!(
+            serde_json::from_str::<PortForwardListParams>(
+                r#"{"bindingHandle":"b","forwardHandle":"f"}"#
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<PortForwardStopParams>(
+                r#"{"bindingHandle":"b","forwardHandle":"f","localPort":1}"#
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<PortForwardStartParams>(
+                r#"{"bindingHandle":"b","localPort":0,"destinationHost":"::1","destinationPort":8080}"#
+            )
+            .is_ok()
+        );
+        assert!(
+            serde_json::from_str::<PortForwardStopParams>(
+                r#"{"bindingHandle":"b","forwardHandle":"f"}"#
+            )
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn port_forward_rpc_rejects_unknown_fields_and_dead_bindings() {
+        let root = TestRoot::new();
+        let state = BackendState::open(root.0.clone()).unwrap();
+        let forged = "renderer-forged-path-marker";
+        let response = handle_frame(
+            &state,
+            &request(
+                "port-forward.start",
+                &serde_json::json!({
+                    "bindingHandle": "missing",
+                    "localPort": 0,
+                    "destinationHost": "127.0.0.1",
+                    "destinationPort": 8080,
+                    "localPath": forged
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+        assert!(!response.ok);
+        assert_eq!(response.error.as_ref().unwrap().code, "invalid-params");
+        assert!(!serde_json::to_string(&response).unwrap().contains(forged));
+
+        // A well-formed request on a binding that does not exist reports the
+        // binding, not a parse failure — and port 0 in the destination is a
+        // request error, not a target lookup.
+        let response = handle_frame(
+            &state,
+            &request(
+                "port-forward.start",
+                &serde_json::json!({
+                    "bindingHandle": "missing",
+                    "localPort": 0,
+                    "destinationHost": "127.0.0.1",
+                    "destinationPort": 0
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+        assert!(!response.ok);
+        assert_eq!(response.error.as_ref().unwrap().code, "invalid-params");
+
+        let response = handle_frame(
+            &state,
+            &request(
+                "port-forward.list",
+                &serde_json::json!({ "bindingHandle": "missing" }).to_string(),
+            ),
+        )
+        .await;
+        assert!(!response.ok);
+        assert_eq!(
+            response.error.as_ref().unwrap().code,
+            "system-info-binding-unavailable"
+        );
     }
     use lovelyhawk_core::investigation::AddAiHistory;
     use tracing_subscriber::prelude::*;

@@ -19,7 +19,7 @@ import { CopyIcon, InfoIcon } from "./file-icons";
 import { menuMaxHeight, menuStep, placeMenu, placeSubmenu, refitMenu } from "./menu-placement";
 
 /** The things the window can do by itself, without asking the target. */
-export type SystemInfoRowLocalAction = "copy-cell" | "copy-row" | "detail";
+export type SystemInfoRowLocalAction = "copy-cell" | "copy-row" | "detail" | "forward";
 
 export interface SystemInfoRowMenuProps {
   /** Where the menu was summoned, in client coordinates. */
@@ -31,6 +31,8 @@ export interface SystemInfoRowMenuProps {
   actions: SystemInfoRowActions | null;
   error: string | null;
   onLocal: (action: SystemInfoRowLocalAction) => void;
+  /** True on a LISTEN row whose local address:port the page can forward. */
+  forwardable?: boolean;
   onAction: (action: SystemInfoRowActionEntry) => void;
   onDismiss: () => void;
 }
@@ -68,6 +70,7 @@ export function SystemInfoRowMenu({
   actions,
   error,
   onLocal,
+  forwardable = false,
   onAction,
   onDismiss,
 }: SystemInfoRowMenuProps) {
@@ -262,6 +265,11 @@ export function SystemInfoRowMenu({
       <button type="button" role="menuitem" onMouseEnter={() => hoverGroup(null)} onClick={() => onLocal("copy-row")}>
         <CopyIcon />复制整行
       </button>
+      {forwardable ? (
+        <button type="button" role="menuitem" onMouseEnter={() => hoverGroup(null)} onClick={() => onLocal("forward")}>
+          <InfoIcon />转发到本机…
+        </button>
+      ) : null}
       {row.detail ? (
         <button type="button" role="menuitem" onMouseEnter={() => hoverGroup(null)} onClick={() => onLocal("detail")}>
           <InfoIcon />查看详情

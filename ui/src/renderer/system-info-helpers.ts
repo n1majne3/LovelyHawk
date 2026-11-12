@@ -337,6 +337,27 @@ function formatDuration(seconds: number): string {
  * The remote host address a connection row points at, when it is one a block
  * could target. Wildcards, loopback and the unspecified address are not.
  */
+/**
+ * The local address:port of a LISTEN row on the 网络 tab, mapped to an
+ * address the forward may target: wildcards and loopback become 127.0.0.1.
+ */
+export function forwardListenAddress(tab: string, row: SystemInfoRow): { host: string; port: number } | null {
+  if (tab !== "network") return null;
+  const state = row.cells[3]?.trim();
+  if (state !== "LISTEN") return null;
+  const raw = row.cells[1]?.trim();
+  if (raw === undefined) return null;
+  const match = /^(?:\[([^\]]+)\]|([^:]+)):(\d+)$/u.exec(raw);
+  if (match === null) return null;
+  const port = Number.parseInt(match[3] ?? "", 10);
+  if (!Number.isInteger(port) || port < 1 || port > 65_535) return null;
+  const host = match[1] ?? match[2] ?? "";
+  if (host === "" || host === "*" || host === "0.0.0.0" || host === "::" || host === "::1") {
+    return { host: "127.0.0.1", port };
+  }
+  return { host: host.replace(/%.*$/u, "").replace(/^::ffff:/iu, ""), port };
+}
+
 export function firewallBlockAddress(tab: string, row: SystemInfoRow): string | null {
   const raw = tab === "network" ? row.cells[2] : tab === "established" ? row.cells[1] : undefined;
   if (raw === undefined) return null;

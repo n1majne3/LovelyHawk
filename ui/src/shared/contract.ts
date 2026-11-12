@@ -8,6 +8,7 @@ import type { PostgresqlRuntimeRequest, PostgresqlRuntimeResponse } from "./post
 import type { MySqlRuntimeRequest, MySqlRuntimeResponse } from "./mysql-runtime-contract.js";
 import type { FileEvidenceRequest, FileEvidenceResult } from "./file-evidence-contract.js";
 import type { PacketCaptureEvidenceRequest, PacketCaptureEvidenceResult } from "./packet-capture-evidence-contract.js";
+import type { PortForward, PortForwardRequest } from "./port-forward-contract.js";
 import type { PodFileEvidenceRequest, PodFileEvidenceResult } from "./pod-file-evidence-contract.js";
 import type { ConfigVisualAnswer, ConfigVisualCopyResult, ConfigVisualProduct, ConfigVisualRequest, ConfigVisualSaveResult, ConfigVisualView } from "./config-visual-contract.js";
 import type { CaseWorkspaceRequest, CaseWorkspaceResult } from "./case-workspace-contract.js";
@@ -484,6 +485,8 @@ export interface LovelyHawkApi {
   /** Fetch offered target content into the local quarantine area and launch a configured local engine against it. */
   localScan(request: import("./local-scan-contract").LocalScanRequest): Promise<import("./local-scan-contract").LocalScanResult | null>;
   packetCaptureEvidence(request: PacketCaptureEvidenceRequest): Promise<PacketCaptureEvidenceResult | null>;
+  /** Local SSH port forwards bound to this connection. */
+  portForward(request: PortForwardRequest): Promise<PortForward | PortForward[]>;
   podFileEvidence(request: PodFileEvidenceRequest): Promise<PodFileEvidenceResult | null>;
   nginxRepair(request: NginxRepairRequest): Promise<NginxRepairResponse>;
   /** The operator's own log match rules; local only, nothing reaches a target. */

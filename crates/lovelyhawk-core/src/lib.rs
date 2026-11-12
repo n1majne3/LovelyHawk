@@ -66,6 +66,7 @@ pub mod nginx_visual;
 pub mod operations;
 pub mod packet_capture;
 pub mod path_guard;
+pub mod port_forward;
 pub mod postgres_auth_schema;
 pub mod postgresql_access;
 pub mod postgresql_config;

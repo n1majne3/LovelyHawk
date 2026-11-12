@@ -122,6 +122,9 @@ const MAIN_WINDOW_METHODS: &[&str] = &[
     "packet-capture.poll",
     "packet-capture.stop",
     "packet-capture.evidence",
+    "port-forward.start",
+    "port-forward.list",
+    "port-forward.stop",
     "application-log.list",
     "application-log.level.set",
     "application-log.buffer.clear",
@@ -226,6 +229,7 @@ fn lane_for(method: &str) -> Lane {
         || method == "sftp-browser.queue.retry"
         || method == "sftp-browser.relay.poll"
         || method == "sftp-browser.relay.cancel"
+        || method.starts_with("port-forward.")
     {
         // Queue control cannot wait behind the transfers it steers.
         Lane::Control

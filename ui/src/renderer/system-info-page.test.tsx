@@ -26,6 +26,7 @@ const api: SystemInfoApi = {
   executeSystemInfoFirewallBlock: vi.fn(async () => ({})),
   planSystemInfoFirewallRestore: vi.fn(async () => ({})),
   executeSystemInfoFirewallRestore: vi.fn(async () => ({})),
+  portForward: vi.fn(async () => []),
 };
 
 describe("standalone SystemInfo page", () => {

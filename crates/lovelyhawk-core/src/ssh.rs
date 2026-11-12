@@ -37,6 +37,7 @@ use crate::events::{
     EventChannelDefaults, TerminalEvent, TerminalEventKind, TerminalEventReceiver,
     TerminalEventSender, TerminalTransport, terminal_event_channel,
 };
+use crate::port_forward::ForwardDestination;
 use crate::postgresql_native::{NATIVE_READ_TIMEOUT, NativeRuntimeRead, NativeRuntimeRequest};
 use crate::sftp::{BACKUP_DIRECTORY_MODE, BACKUP_FILE_MODE, RemotePath};
 use crate::target::TargetGuard;
@@ -1247,6 +1248,28 @@ impl SshService {
         .await
     }
 
+    /// Opens one `direct-tcpip` channel on the bound session for the port
+    /// forward listener. Same actor admission, connection identity and
+    /// cancellation rules as a bound execute; the destination was already
+    /// checked against the target's own LISTEN table by the caller.
+    pub async fn open_direct_tcpip_bound(
+        &self,
+        session: &BoundSshSession,
+        destination: ForwardDestination,
+        originator_port: u16,
+    ) -> CoreResult<russh::Channel<Msg>> {
+        validate_runtime_id("SSH session id", session.session_id())?;
+        let (reply, response) = oneshot::channel();
+        self.send(WorkerCommand::DirectTcpip {
+            session_id: session.session_id().to_owned(),
+            expected_connection_id: session.connection_id().to_owned(),
+            destination,
+            originator_port,
+            reply,
+        })?;
+        receive(response, "direct-tcpip channel").await?
+    }
+
     /// Executes a core-owned command through the same target-bound actor while
     /// keeping command text and both output streams out of ordinary
     /// `SshCommandOutput`, serialization, and debug paths.
@@ -2150,6 +2173,13 @@ enum WorkerCommand {
         timeout: Duration,
         reply: oneshot::Sender<CoreResult<SshCommandOutput>>,
     },
+    DirectTcpip {
+        session_id: String,
+        expected_connection_id: String,
+        destination: ForwardDestination,
+        originator_port: u16,
+        reply: oneshot::Sender<CoreResult<russh::Channel<Msg>>>,
+    },
     PostgresqlRuntime {
         session_id: String,
         expected_connection_id: String,
@@ -2524,6 +2554,15 @@ async fn router_loop(
                         Err(error) => {
                             let _ = reply.send(Err(error));
                         }
+                    }
+                }
+                WorkerCommand::DirectTcpip { session_id, expected_connection_id, destination, originator_port, reply } => {
+                    match bind_actor_session(&sessions, &session_id, Some(&expected_connection_id), "SSH session binding") {
+                        Ok((session, admission)) => {
+                            tasks.spawn(run_session_response(session, admission, reply, "direct-tcpip channel", DIRECT_TCPIP_TIMEOUT,
+                                move |handle| open_direct_tcpip_on_handle(handle, destination, originator_port)));
+                        }
+                        Err(error) => { let _ = reply.send(Err(error)); }
                     }
                 }
                 WorkerCommand::PostgresqlRuntime { session_id, expected_connection_id, request, reply } => {
@@ -3023,6 +3062,36 @@ async fn execute_on_handle(
         SessionHandle::Real(handle) => execute_command(&handle, command, timeout).await,
         #[cfg(test)]
         SessionHandle::Test(harness) => harness.execute(command).await,
+    }
+}
+
+const DIRECT_TCPIP_TIMEOUT: Duration = Duration::from_secs(20);
+
+async fn open_direct_tcpip_on_handle(
+    handle: SessionHandle,
+    destination: ForwardDestination,
+    originator_port: u16,
+) -> CoreResult<russh::Channel<Msg>> {
+    match handle {
+        SessionHandle::Real(handle) => handle
+            .channel_open_direct_tcpip(
+                destination.host.to_string(),
+                u32::from(destination.port),
+                "127.0.0.1",
+                u32::from(originator_port),
+            )
+            .await
+            .map_err(|error| {
+                CoreError::ssh(
+                    "port forward",
+                    format!("SSH 未能打开到该地址的通道：{error}"),
+                )
+            }),
+        #[cfg(test)]
+        SessionHandle::Test(_harness) => Err(CoreError::ssh(
+            "port forward",
+            "test sessions do not carry direct-tcpip channels",
+        )),
     }
 }
 

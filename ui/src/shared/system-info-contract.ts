@@ -233,6 +233,8 @@ export interface SystemInfoFirewallRestorePlan {
 }
 
 export interface SystemInfoApi {
+  /** Local SSH port forwards on the same binding. */
+  portForward(request: unknown): Promise<unknown>;
   getSystemInfoCatalog(): Promise<unknown>;
   getSystemInfoSummary(bindingHandle: string): Promise<unknown>;
   collectSystemInfo(
