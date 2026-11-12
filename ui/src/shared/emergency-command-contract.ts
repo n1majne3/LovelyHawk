@@ -17,6 +17,7 @@ export interface EmergencyCommandCatalogItem {
   title: string;
   description: string;
   timeoutSeconds: number;
+  optIn: boolean;
 }
 
 export const emergencyCommandPlaces = ["container", "pod"] as const;
@@ -267,10 +268,10 @@ function escapedText(value: unknown, maximumBytes: number): value is string {
 
 function catalogItem(value: unknown): value is EmergencyCommandCatalogItem {
   return record(value) && exact(value, [
-    "commandHandle", "category", "title", "description", "timeoutSeconds",
+    "commandHandle", "category", "title", "description", "timeoutSeconds", "optIn",
   ]) && isEmergencyCommandOpaqueHandle(value.commandHandle) && typeof value.category === "string" &&
     categorySet.has(value.category) && catalogText(value.title, 128) && catalogText(value.description, 512) &&
-    unsigned(value.timeoutSeconds, 60) && value.timeoutSeconds > 0;
+    unsigned(value.timeoutSeconds, 60) && value.timeoutSeconds > 0 && typeof value.optIn === "boolean";
 }
 
 export function isEmergencyCommandCatalog(value: unknown): value is EmergencyCommandCatalog {

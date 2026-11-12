@@ -484,7 +484,10 @@ pub fn credential_file_finding(line: &str) -> bool {
 
 /// A process running out of a writable area, fetching code, or mining.
 pub fn suspicious_process(line: &str) -> bool {
-    in_writable_area(line) || mentions(line, &REMOTE_EXECUTION) || mentions(line, &MINER_NAMES)
+    in_writable_area(line)
+        || mentions(line, &REMOTE_EXECUTION)
+        || mentions(line, &MINER_NAMES)
+        || tunnel_tool_name(line)
 }
 
 /// A job or startup script that pulls something down and runs it.
@@ -742,7 +745,7 @@ pub fn audit_failure(line: &str) -> bool {
 
 /// A path staged in a writable area, or a file carrying an execute bit.
 pub fn planted_file(line: &str) -> bool {
-    if in_writable_area(line) {
+    if in_writable_area(line) || tunnel_tool_name(line) {
         return true;
     }
     let fields = line.split_whitespace().collect::<Vec<_>>();
@@ -865,7 +868,7 @@ pub fn tainted_kernel(line: &str) -> bool {
 }
 
 /// Offensive tooling that has no business being installed on a defended host.
-const OFFENSIVE_PACKAGES: [&str; 12] = [
+const OFFENSIVE_PACKAGES: [&str; 20] = [
     "nmap",
     "masscan",
     "hydra",
@@ -878,7 +881,63 @@ const OFFENSIVE_PACKAGES: [&str; 12] = [
     "responder",
     "john-the-ripper",
     "frpc",
+    "frps",
+    "gost",
+    "ligolo",
+    "stowaway",
+    "rakshasa",
+    "htran",
+    "dnscat2",
+    "iodine",
 ];
+
+/// Tunnel and attack tools worth flagging wherever a process or file name is
+/// listed. Short names (`ew`, `lcx`, `spp`) are only safe on an exact basename
+/// match, never as a substring.
+const TUNNEL_TOOL_NAMES: [&str; 27] = [
+    "chisel",
+    "frpc",
+    "frps",
+    "nps",
+    "npc",
+    "gost",
+    "earthworm",
+    "ew",
+    "venom",
+    "iox",
+    "ligolo",
+    "regeorg",
+    "neo-regeorg",
+    "suo5",
+    "pystinger",
+    "stowaway",
+    "rakshasa",
+    "spp",
+    "lcx",
+    "htran",
+    "ssocks",
+    "fscan",
+    "icmpsh",
+    "iodine",
+    "dnscat2",
+    "proxychains",
+    "meterpreter",
+];
+
+/// A token whose basename exactly names a tunnel or attack tool. `/tmp/lcx`
+/// and `ew -s` match; `viewer` and `lcxd` do not.
+pub fn tunnel_tool_name(line: &str) -> bool {
+    line.split(|c: char| {
+        c.is_ascii_whitespace() || matches!(c, '"' | '\'' | '(' | ')' | '=' | ';' | ':' | ',')
+    })
+    .filter(|token| !token.is_empty())
+    .any(|token| {
+        let base = token.rsplit('/').next().unwrap_or(token);
+        TUNNEL_TOOL_NAMES
+            .iter()
+            .any(|name| base.eq_ignore_ascii_case(name))
+    })
+}
 
 /// Shapes that mean the same thing wherever they appear: something was staged
 /// in a writable area, fetches and runs code, mines, or talks on a handler
@@ -889,6 +948,7 @@ pub fn compromise_marker(line: &str) -> bool {
         || mentions(line, &REMOTE_EXECUTION)
         || mentions(line, &MINER_NAMES)
         || mentions(line, &SUSPECT_PORTS)
+        || tunnel_tool_name(line)
 }
 
 /// A routing policy or device beyond the three rules every kernel starts with.
@@ -2384,5 +2444,36 @@ mod tests {
         ] {
             assert!(!package_verify_mismatch(quiet), "{quiet}");
         }
+    }
+
+    #[test]
+    fn tunnel_tool_names_match_exact_basenames_only() {
+        for line in [
+            "root 1234 0.0 ./lcx -listen 8080 9090",
+            "-rwxr-xr-x 1 root root 4096 /tmp/ew",
+            "nobody 55 /opt/nps/nps --config",
+            "root 99 /usr/local/bin/gost -L :1080",
+            "root 12 /var/tmp/neo-regeorg",
+        ] {
+            assert!(super::tunnel_tool_name(line), "{line}");
+        }
+        for line in [
+            "root 1 viewer --help",
+            "root 1 /usr/sbin/lcxd",
+            "-rw-r--r-- 1 root root 2 /var/log/messages",
+            "root 1 networkd-dispatcher",
+            "root 1 /usr/bin/newaliases",
+        ] {
+            assert!(!super::tunnel_tool_name(line), "{line}");
+        }
+        assert!(super::suspicious_process(
+            "root 7 ./stowaway admin 10.0.0.1"
+        ));
+        assert!(super::planted_file(
+            "-rwx------ 1 root root 9 /opt/rakshasa"
+        ));
+        assert!(!super::planted_file(
+            "-rw------- 1 root root 9 /opt/rakshasa.conf"
+        ));
     }
 }

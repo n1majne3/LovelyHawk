@@ -765,6 +765,22 @@ pub const BASELINE_CATALOG: &[BaselineDefinition] = &[
         reload: ReloadGroup::None,
     },
     BaselineDefinition {
+        id: "sudo-operation-log",
+        category: BaselineCategory::Logging,
+        title: "启用 sudo 操作日志",
+        description: "检查 /etc/sudoers 与 /etc/sudoers.d 中 Defaults logfile、log_output、log_input、iolog_dir；enabled 表示显式开启，syslog-only 表示仅默认 syslog 记录，unset 表示未找到或已关闭。sudoers 不可读时明确无法判断。",
+        recommendation: "enabled",
+        risk: BaselineRisk::Medium,
+        value_kind: BaselineValueKind::Choice(&["enabled"]),
+        component: BaselineComponent::System,
+        reading: Reading::HostState,
+        implicit: None,
+        file: "/etc/sudoers",
+        key: "sudo_logging",
+        format: FileFormat::Whitespace,
+        reload: ReloadGroup::None,
+    },
+    BaselineDefinition {
         id: "ssh-password-authentication",
         category: BaselineCategory::Ssh,
         title: "关闭 SSH 密码认证",
@@ -6216,7 +6232,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(BASELINE_CATALOG.len(), 120);
+        assert_eq!(BASELINE_CATALOG.len(), 121);
         // One plan carries every check this tool will write; the rest are read.
         assert!(
             BASELINE_CATALOG

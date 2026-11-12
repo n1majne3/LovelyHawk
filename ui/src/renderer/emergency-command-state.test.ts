@@ -14,8 +14,8 @@ const catalog: EmergencyCommandCatalog = {
   expiresInSeconds: 300,
   commandSet: "detected",
   commands: [
-    { commandHandle: "command-network", category: "network", title: "监听端口", description: "网络状态", timeoutSeconds: 30 },
-    { commandHandle: "command-system", category: "system", title: "系统状态", description: "内核资源", timeoutSeconds: 30 },
+    { commandHandle: "command-network", category: "network", title: "监听端口", description: "网络状态", timeoutSeconds: 30, optIn: false },
+    { commandHandle: "command-system", category: "system", title: "系统状态", description: "内核资源", timeoutSeconds: 30, optIn: false },
   ],
 };
 

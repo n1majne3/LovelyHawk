@@ -463,7 +463,7 @@ export function EmergencyCommandsPage({ bindingHandle, api, writeClipboard, reru
           }}
           onRunGroup={(category) => setGroupRun((value) => ({
             version: (value?.version ?? 0) + 1, category,
-            commandHandles: filtered.filter((command) => command.category === category).map((command) => command.commandHandle),
+            commandHandles: filtered.filter((command) => command.category === category && !command.optIn).map((command) => command.commandHandle),
           }))}
           onStopGroup={() => {
             if (scope === null || state.groupRun === null) return;

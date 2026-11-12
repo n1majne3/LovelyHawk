@@ -168,6 +168,9 @@ pub struct CommandCatalogEntry {
     pub description: &'static str,
     pub command_preview: &'static str,
     pub timeout_seconds: u64,
+    /// True for checks that briefly occupy resources or take much longer than
+    /// a listing: they never run as part of a grouped "run all".
+    pub opt_in: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -206,6 +209,7 @@ impl CommandDefinition {
                 description,
                 command_preview: command,
                 timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
+                opt_in: false,
             },
             default_command: command,
             debian_command: None,
@@ -231,6 +235,7 @@ impl CommandDefinition {
                 description,
                 command_preview: commands.default,
                 timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
+                opt_in: false,
             },
             default_command: commands.default,
             debian_command: commands.debian,
@@ -249,6 +254,13 @@ impl CommandDefinition {
 
     const fn self_checked(mut self) -> Self {
         self.checks_tools = true;
+        self
+    }
+
+    /// Marks the check as opt-in only: excluded from grouped "run all"
+    /// execution and from batch suggestions.
+    const fn opt_in(mut self) -> Self {
+        self.entry.opt_in = true;
         self
     }
 
@@ -284,7 +296,7 @@ macro_rules! portable {
 // timeout, history and result path. Nothing is installed or executed from a file
 // on the target. Limits and read failures stay in the ordinary command output.
 macro_rules! bounded_observation {
-    ($body:literal) => {
+    ($body:expr) => {
         concat!(r#"
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 LC_ALL=C
@@ -367,12 +379,12 @@ lh_tree() {
   if [ ! -e "$1" ]; then printf '# 未找到目录：%s（未检查）\n' "$1"; return 1; fi
   if [ ! -d "$1" ] || [ ! -r "$1" ] || [ ! -x "$1" ]; then lh_gap '目录不可读或类型发生变化。'; return 1; fi
   lh_paths=$({ if [ "$2" = "vcs" ]; then
-      find "$1" -xdev -maxdepth 6 \( -name .git -o -name .svn -o -name node_modules \) -prune -print0 -o -print0 2>/dev/null
+      find "$1" -xdev -maxdepth 6 \( -name .git -o -name .svn -o -name node_modules \) -prune -exec printf '%s\036' {} + -o -exec printf '%s\036' {} + 2>/dev/null
     else
-      find "$1" -xdev -maxdepth 6 -print0 2>/dev/null
+      find "$1" -xdev -maxdepth 6 -exec printf '%s\036' {} + 2>/dev/null
     fi
-    printf '\000LH_TREE_STATUS:%s\000' "$?"; } | head -c 262145 | awk '
-    BEGIN {RS="\0"}
+    printf '\036LH_TREE_STATUS:%s\036' "$?"; } | head -c 262145 | awk '
+    BEGIN {RS=sprintf("%c",30)}
     function emit(p) {
       if (p == "") return
       if (++n > 2048) {if (n == 2049) print "!limit"; return}
@@ -870,6 +882,364 @@ for lh_dir in /home/*/public_html; do
   lh_scan_dir "$lh_dir"
 done
 if [ "$lh_components" -eq 0 ]; then printf '# 未发现 ThinkPHP、phpMyAdmin、Smarty 的版本文件；自定义站点目录与其他产品未覆盖。\n'; fi
+"#
+);
+
+const CMD_FILE_ROOTKIT_SIGS: &str = bounded_observation!(concat!(
+    r#"printf '# 以 rkhunter 1.4.6 公开特征表核对已知 rootkit 文件与目录；只测存在性，未命中不能排除未知或变种。
+'
+while IFS='|' read -r lh_f lh_p; do
+  lh_step
+  for lh_x in $lh_p; do
+    [ -e "$lh_x" ] || [ -L "$lh_x" ] || continue
+    lh_hit "$lh_f | $lh_x"
+  done
+done <<'LH_SIGS'
+"#,
+    include_str!("cmd_sig_lines.inc"),
+    r#"LH_SIGS
+printf '# 与已知后门端口表比对 /proc/net 中监听或绑定的本地端口；不依赖 ss/netstat。
+'
+lh_listens=''
+for lh_f in /proc/net/tcp6 /proc/net/udp /proc/net/udp6 /proc/net/tcp; do
+  [ -r "$lh_f" ] || { lh_gap "$lh_f 不可读，端口比对不完整。"; continue; }
+  lh_more=$(awk 'NR>1 && ($4=="0A" || FILENAME ~ /udp/) {split($2,a,":"); h=a[length(a)]; n=0; for(i=1;i<=length(h);i++) n=n*16+index("0123456789ABCDEF",toupper(substr(h,i,1)))-1; print n}' "$lh_f" 2>/dev/null)
+  [ -n "$lh_more" ] && lh_listens=$(printf '%s\n%s\n' "$lh_listens" "$lh_more")
+done
+lh_port() {
+  lh_step
+  printf '%s\n' "$lh_listens" | awk -v p="$1" '$1==p{found=1} END{exit !found}' && lh_hit "端口 $1 | $2 | 在内核网络表中被监听或绑定"
+}
+"#,
+    include_str!("cmd_port_lines.inc"),
+    r#"lh_finish
+"#
+));
+
+const CMD_NETWORK_HIDDEN_PORTS: &str = bounded_observation!(
+    r#"printf '# 比对内核 /proc/net 监听表与 ss/netstat 输出；内核可见而工具未列出的端口记为关注，也可能是权限或命名空间差异。
+'
+lh_listens=''
+for lh_f in /proc/net/tcp6 /proc/net/udp /proc/net/udp6 /proc/net/tcp; do
+  [ -r "$lh_f" ] || { lh_gap "$lh_f 不可读，比对不完整。"; continue; }
+  lh_more=$(awk 'NR>1 && ($4=="0A" || FILENAME ~ /udp/) {split($2,a,":"); h=a[length(a)]; n=0; for(i=1;i<=length(h);i++) n=n*16+index("0123456789ABCDEF",toupper(substr(h,i,1)))-1; print n}' "$lh_f" 2>/dev/null)
+  [ -n "$lh_more" ] && lh_listens=$(printf '%s\n%s\n' "$lh_listens" "$lh_more")
+done
+if command -v ss >/dev/null 2>&1; then
+  lh_tool=$(ss -lntuH 2>/dev/null || ss -lntu 2>/dev/null)
+elif command -v netstat >/dev/null 2>&1; then
+  lh_tool=$(netstat -lntu 2>/dev/null)
+else
+  lh_tool=''
+fi
+if [ -z "$lh_tool" ]; then lh_gap 'ss 与 netstat 均不可用或无输出，无法与工具输出比对。'; fi
+lh_toolports=$(printf '%s\n' "$lh_tool" | awk '{for(i=1;i<=NF;i++) if($i ~ /:[0-9]+$/) {split($i,a,":"); p=a[length(a)]; if(!seen[p]++) print p; break}}')
+lh_hidden=$(printf '%s\n' "$lh_listens" | awk -v tp="$lh_toolports" 'BEGIN{n=split(tp,t,"\n"); for(i=1;i<=n;i++) have[t[i]]=1} NF && !($1 in have){print $1}' | awk '!seen[$0]++' | head -n 100)
+while IFS= read -r lh_p; do
+  [ -n "$lh_p" ] && lh_hit "内核表端口 $lh_p 处于监听或绑定状态，但未出现在 ss/netstat 输出中"
+done <<LH_HIDDEN
+$lh_hidden
+LH_HIDDEN
+lh_finish
+"#
+);
+
+const CMD_NETWORK_BIND_PROBE: &str = bounded_observation!(
+    r#"printf '# 逐端口 bind() 但不监听：每个空闲端口会被短暂占用后立即释放；EADDRINUSE 且不在内核表中的端口记为关注。
+'
+command -v python3 >/dev/null 2>&1 || { lh_gap 'python3 不可用，绑定探测未执行。'; lh_finish; exit 1; }
+python3 - <<'LH_BIND_PROBE'
+import errno, socket
+allports = set()
+try:
+    for name in ("/proc/net/tcp", "/proc/net/tcp6", "/proc/net/udp", "/proc/net/udp6"):
+        try:
+            fh = open(name)
+        except OSError:
+            continue
+        with fh:
+            for ln in fh.read().splitlines()[1:]:
+                p = ln.split()
+                if len(p) > 1:
+                    try:
+                        allports.add(int(p[1].rsplit(":", 1)[1], 16))
+                    except (ValueError, IndexError):
+                        pass
+except OSError:
+    pass
+used = 0
+denied = 0
+hidden = []
+for port in range(1, 65536):
+    inuse = False
+    for addr in ("127.0.0.1", "0.0.0.0"):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.bind((addr, port))
+        except OSError as exc:
+            if exc.errno == errno.EADDRINUSE:
+                inuse = True
+            elif exc.errno in (errno.EACCES, errno.EPERM):
+                denied += 1
+        finally:
+            s.close()
+        if inuse:
+            break
+    if inuse:
+        used += 1
+        if port not in allports:
+            hidden.append(port)
+print('# 已探测 65535 个 TCP端口；占用 %d 个；权限拒绝 %d 个。' % (used, denied))
+for port in hidden:
+    print("关注：端口 %d 被占用但未出现在内核网络表中" % port)
+LH_BIND_PROBE
+lh_finish
+"#
+);
+
+const CMD_SYSTEM_LKM: &str = bounded_observation!(concat!(
+    r#"printf '# 已知 LKM rootkit 符号、当前内核模块目录外 .ko 与模块加载痕迹；已加载模块的残留通常在重启后才消失。
+'
+if [ -r /proc/kallsyms ]; then
+  lh_kallsyms=$(awk '{print $3}' /proc/kallsyms 2>/dev/null | head -c 524288)
+  if [ -n "$lh_kallsyms" ]; then
+    lh_ksym() { printf '%s\n' "$lh_kallsyms" | awk -v s="$2" '$0==s{found=1} END{exit !found}' && lh_hit "$1 | 符号 $2 出现在 /proc/kallsyms"; }
+    lh_kpref() { printf '%s\n' "$lh_kallsyms" | awk -v s="$2" 'substr($0,1,length(s))==s{found=1} END{exit !found}' && lh_hit "$1 | 符号前缀 $2* 出现在 /proc/kallsyms"; }
+"#,
+    include_str!("cmd_ksym_lines.inc"),
+    r#"  else
+    lh_gap '/proc/kallsyms 无符号列（可能受 kptr_restrict 限制），符号比对未执行。'
+  fi
+else
+  lh_gap '/proc/kallsyms 不可读，符号比对未执行。'
+fi
+if command -v find >/dev/null 2>&1; then
+  lh_krel=$(uname -r 2>/dev/null)
+  lh_kos=$(find / -xdev \( -path /proc -o -path /sys -o -path /usr/lib/modules -o -path "/lib/modules/$lh_krel" \) -prune -o -type f -name '*.ko*' -print 2>/dev/null | head -n 200)
+  while IFS= read -r lh_ko; do
+    [ -n "$lh_ko" ] && lh_hit "模块文件位于当前内核模块目录外：$lh_ko"
+  done <<LH_KO
+$lh_kos
+LH_KO
+  printf '# 仅排除 /usr/lib/modules 与当前内核版本目录；其他版本目录中的 .ko 仍被列出，属旁证。\n'
+else
+  lh_gap 'find 不可用，.ko 扫描未执行。'
+fi
+if command -v grep >/dev/null 2>&1; then
+  lh_klog=''
+  if command -v journalctl >/dev/null 2>&1; then lh_klog=$(journalctl -k -n 2000 --no-pager 2>/dev/null); fi
+  if [ -z "$lh_klog" ] && command -v dmesg >/dev/null 2>&1; then lh_klog=$(dmesg 2>/dev/null | awk 'NR>4000{exit} {print}'); fi
+  if [ -z "$lh_klog" ]; then
+    lh_gap 'journalctl -k 与 dmesg 均不可用或不可读，模块加载痕迹未检查。'
+  else
+    lh_traces=$(printf '%s\n' "$lh_klog" | grep -iE 'out-of-tree|taints|module verification failed' | head -n 60)
+    while IFS= read -r lh_t; do
+      [ -n "$lh_t" ] && lh_hit "模块加载痕迹：$lh_t"
+    done <<LH_T
+$lh_traces
+LH_T
+  fi
+else
+  lh_gap 'grep 不可用，模块加载痕迹未检查。'
+fi
+printf '# 已加载模块的残留通常在重启后才消失；无命中不代表无内核级隐藏。\n'
+lh_finish
+"#
+));
+
+const CMD_PERM_DT_NEEDED: &str = bounded_observation!(
+    r#"printf '# 批量核对系统命令的 DT_NEEDED；RPATH/RUNPATH 与 ld.so.conf 非标准目录未完全展开，未解析到属旁证而非结论。
+'
+command -v readelf >/dev/null 2>&1 || { lh_gap 'readelf 不可用，依赖库核对未执行。'; lh_finish; exit 1; }
+command -v sed >/dev/null 2>&1 || { lh_gap 'sed 不可用，依赖库核对未执行。'; lh_finish; exit 1; }
+lh_libdirs='/lib /lib64 /usr/lib /usr/lib64'
+for lh_d in /lib/*-linux-gnu /usr/lib/*-linux-gnu /lib64/*-linux-gnu /usr/lib64/*-linux-gnu; do
+  [ -d "$lh_d" ] && lh_libdirs="$lh_libdirs $lh_d"
+done
+for lh_dir in /bin /sbin /usr/bin /usr/sbin; do
+  [ -d "$lh_dir" ] || { lh_gap "$lh_dir 不存在，未核对。"; continue; }
+  lh_seen=0
+  for lh_f in "$lh_dir"/*; do
+    [ -f "$lh_f" ] || continue
+    [ "$lh_seen" -ge 512 ] && { lh_gap "$lh_dir 超过 512 个文件，其余未核对。"; break; }
+    lh_seen=$((lh_seen+1))
+    lh_step
+    lh_needed=$(readelf -d "$lh_f" 2>/dev/null | sed -n 's/.*Shared library: \[\(.*\)\].*/\1/p' | head -n 40)
+    [ -n "$lh_needed" ] || continue
+    while IFS= read -r lh_lib; do
+      [ -n "$lh_lib" ] || continue
+      case "$lh_lib" in
+        /tmp/*|/var/tmp/*|/dev/shm/*|/home/*) lh_hit "$lh_f | 依赖库位于临时或主目录：$lh_lib"; continue;;
+      esac
+      lh_found=0
+      case "$lh_lib" in
+        /*) [ -e "$lh_lib" ] && lh_found=1;;
+        *) for lh_d2 in $lh_libdirs; do [ -e "$lh_d2/$lh_lib" ] && { lh_found=1; break; }; done;;
+      esac
+      [ "$lh_found" = 0 ] && lh_hit "$lh_f | 依赖库 $lh_lib 未在标准库目录解析到"
+    done <<LH_N
+$lh_needed
+LH_N
+  done
+done
+lh_finish
+"#
+);
+
+const CMD_FILE_COMMAND_EVIDENCE: &str = bounded_observation!(
+    r#"printf '# 固定命令清单：与同目录修改时间中位数比对并统计回连特征字节；均为旁证，不证明被替换，网络工具天然含 socket 字样。
+'
+command -v stat >/dev/null 2>&1 || { lh_gap 'stat 不可用，修改时间比对未执行。'; lh_finish; exit 1; }
+command -v sort >/dev/null 2>&1 || { lh_gap 'sort 不可用，中位数计算未执行。'; lh_finish; exit 1; }
+for lh_dir in /bin /sbin /usr/bin /usr/sbin; do
+  [ -d "$lh_dir" ] || continue
+  lh_median=$(stat -c %Y "$lh_dir"/* 2>/dev/null | sort -n | awk '{a[NR]=$1} END{if(NR) print a[int((NR+1)/2)]}')
+  [ -n "$lh_median" ] || { lh_gap "$lh_dir 无文件或 stat 失败，未比对。"; continue; }
+  for lh_name in ps ls netstat ss top lsof find login sshd passwd userdel useradd ping kill; do
+    lh_f="$lh_dir/$lh_name"
+    [ -f "$lh_f" ] || [ -L "$lh_f" ] || continue
+    lh_step
+    lh_y=$(stat -c %Y "$lh_f" 2>/dev/null)
+    if [ -n "$lh_y" ]; then
+      lh_diff=$((lh_y - lh_median)); [ "$lh_diff" -lt 0 ] && lh_diff=$((0 - lh_diff))
+      [ "$lh_diff" -gt 604800 ] && lh_hit "$lh_f | 修改时间偏离同目录中位数 $lh_diff 秒（超过 7 天）"
+    else lh_gap "$lh_f：stat 失败，未比对。"; fi
+    if command -v grep >/dev/null 2>&1; then
+      lh_n=$(grep -a -c -E 'curl|wget|socket|/bin/sh -i|/dev/tcp' "$lh_f" 2>/dev/null)
+      case "$lh_n" in ''|*[!0-9]*) lh_n=0;; esac
+      [ "$lh_n" -gt 0 ] && printf '特征：%s | %s 处回连相关字节\n' "$lh_f" "$lh_n"
+    fi
+  done
+done
+lh_finish
+"#
+);
+
+const CMD_PERSISTENCE_CHAIN: &str = bounded_observation!(
+    r#"printf '# 从 cron/init.d/rc.local 提取脚本引用并跟踪 source/./sh 二级引用（合计 64 个脚本上限）。
+'
+command -v grep >/dev/null 2>&1 || { lh_gap 'grep 不可用，内容特征检查未执行。'; }
+lh_chain_seen='' lh_chain_n=0
+lh_follow() {
+  [ "$lh_chain_n" -ge 64 ] && return
+  case " $lh_chain_seen " in *" $2 "*) return;; esac
+  lh_chain_seen="$lh_chain_seen $2"
+  lh_chain_n=$((lh_chain_n+1))
+  lh_step
+  if [ ! -f "$2" ]; then printf '链：%s → %s（不存在或非常规文件）\n' "$4" "$2"; return; fi
+  if [ ! -r "$2" ]; then printf '链：%s → %s（不可读，链路中断）\n' "$4" "$2"; lh_gap "$2 不可读，引用链未展开。"; return; fi
+  printf '链：%s → %s\n' "$4" "$2"
+  lh_read "$2" text || return
+  if command -v grep >/dev/null 2>&1; then
+    lh_sus=$(printf '%s\n' "$lh_data" | grep -nE 'curl |wget |/dev/tcp/|/dev/udp/|base64 -d|bash -i|sh -i|nc -e|ncat -e|socat |python -c|python3 -c|perl -e|php -r|nohup .*(/tmp/|/var/tmp/|/dev/shm/|/home/)' | head -n 10)
+    while IFS= read -r lh_s; do
+      [ -n "$lh_s" ] && lh_hit "$2 | 第 ${lh_s%%:*} 行含远程执行或可写目录特征"
+    done <<LH_S
+$lh_sus
+LH_S
+  fi
+  [ "$3" -ge 2 ] && return
+  lh_next=$(printf '%s\n' "$lh_data" | awk '
+    /^[ \t]*(#|$)/{next}
+    {for(i=1;i<=NF;i++){w=$i
+      if((w=="."||w=="source") && i<NF){w2=$(i+1); sub(/[;,]*$/,"",w2); print w2; next}
+      if((w=="sh"||w=="bash"||w=="dash"||w=="zsh"||w=="ash") && i<NF && $(i+1) ~ /^\//){w2=$(i+1); sub(/[;,]*$/,"",w2); print w2; next}
+      if(w ~ /^\/[^ :]*\.(sh|cron)$/){sub(/[;,]*$/,"",w); print w}}}' | awk '!seen[$0]++' | head -n 8)
+  while IFS= read -r lh_n2; do
+    [ -n "$lh_n2" ] || continue
+    case "$lh_n2" in
+      /*) ;;
+      *) lh_n2="${2%/*}/$lh_n2";;
+    esac
+    lh_follow "$1" "$lh_n2" $(($3+1)) "$4 → $2"
+  done <<LH_NEXT
+$lh_next
+LH_NEXT
+}
+lh_seed() {
+  if [ ! -r "$1" ]; then
+    [ -e "$1" ] && lh_gap "$1 不可读，链路未提取。"
+    return
+  fi
+  lh_step
+  lh_refs=$(awk 'NF && $1 !~ /^#/ {for(i=1;i<=NF;i++){w=$i; sub(/^[^=]*=/,"",w); sub(/[;,]*$/,"",w); if(w ~ /^\//) print w}}' "$1" 2>/dev/null | awk '!seen[$0]++' | head -n 16)
+  while IFS= read -r lh_r; do
+    [ -n "$lh_r" ] && lh_follow "$1" "$lh_r" 1 "$1"
+  done <<LH_R
+$lh_refs
+LH_R
+}
+for lh_f in /etc/crontab /etc/rc.local; do lh_seed "$lh_f"; done
+for lh_f in /etc/cron.d/*; do [ -f "$lh_f" ] && lh_seed "$lh_f"; done
+for lh_f in /var/spool/cron/* /var/spool/cron/crontabs/* /etc/crontabs/*; do [ -f "$lh_f" ] && lh_seed "$lh_f"; done
+for lh_f in /etc/init.d/*; do [ -f "$lh_f" ] && lh_seed "$lh_f"; done
+[ "$lh_chain_n" -ge 64 ] && lh_gap '引用链超过 64 个脚本，其余未展开。'
+lh_finish
+"#
+);
+
+const CMD_PERM_SUID_OWNERSHIP: &str = bounded_observation!(concat!(
+    r#"printf '# SUID/SGID 文件逐一核对软件包归属（dpkg/rpm）并标注 GTFOBins 提权方法；有归属不证明配置安全。
+'
+command -v find >/dev/null 2>&1 || { lh_gap 'find 不可用，SUID/SGID 枚举未执行。'; lh_finish; exit 1; }
+lh_pkgq=''
+if command -v dpkg >/dev/null 2>&1; then lh_pkgq='dpkg -S'
+elif command -v rpm >/dev/null 2>&1; then lh_pkgq='rpm -qf'
+else lh_gap '缺少 dpkg 与 rpm，软件包归属核对未执行。'; fi
+lh_owner() { [ -n "$lh_pkgq" ] && $lh_pkgq "$1" 2>/dev/null | head -n 1; }
+lh_gtfo_name() {
+  case "$1" in
+"#,
+    include_str!("cmd_gtfobins.inc"),
+    r#"    *) return 1;;
+  esac
+}
+lh_suids=$(find / -xdev \( -path /proc -o -path /sys \) -prune -o -type f \( -perm -4000 -o -perm -2000 \) -print 2>/dev/null | head -n 300)
+while IFS= read -r lh_f; do
+  [ -n "$lh_f" ] || continue
+  lh_step
+  lh_m=$(lh_gtfo_name "${lh_f##*/}")
+  lh_o=$(lh_owner "$lh_f")
+  if [ -z "$lh_o" ] && [ -n "$lh_pkgq" ]; then
+    lh_hit "$lh_f | 不归属任何软件包${lh_m:+ | GTFOBins：$lh_m}"
+  elif [ -n "$lh_m" ]; then
+    lh_hit "$lh_f | GTFOBins：$lh_m${lh_o:+ | 归属：$lh_o}"
+  elif [ -z "$lh_pkgq" ]; then
+    printf 'SUID/SGID：%s（归属未核对）\n' "$lh_f"
+  fi
+done <<LH_SU
+$lh_suids
+LH_SU
+lh_finish
+"#
+));
+
+const CMD_PERSISTENCE_UNIT_OWNER: &str = bounded_observation!(
+    r#"printf '# systemd unit 文件逐一核对软件包归属并展示 ExecStart；.wants/.requires 启用链接与指向已打包 unit 的别名不判定。
+'
+lh_pkgq=''
+if command -v dpkg >/dev/null 2>&1; then lh_pkgq='dpkg -S'
+elif command -v rpm >/dev/null 2>&1; then lh_pkgq='rpm -qf'
+else lh_gap '缺少 dpkg 与 rpm，软件包归属核对未执行。'; fi
+lh_owner() { [ -n "$lh_pkgq" ] && $lh_pkgq "$1" 2>/dev/null | head -n 1; }
+for lh_d in /etc/systemd/system /usr/lib/systemd/system /lib/systemd/system /root/.config/systemd/user /home/*/.config/systemd/user; do
+  [ -d "$lh_d" ] || continue
+  for lh_f in "$lh_d"/*; do
+    [ -f "$lh_f" ] || [ -L "$lh_f" ] || continue
+    lh_step
+    if [ -z "$lh_pkgq" ]; then printf 'unit：%s（归属未核对）\n' "$lh_f"; continue; fi
+    lh_check=$lh_f
+    if [ -L "$lh_f" ]; then
+      lh_t=$(readlink -f "$lh_f" 2>/dev/null)
+      [ -n "$lh_t" ] && lh_check=$lh_t
+    fi
+    lh_o=$(lh_owner "$lh_check")
+    [ -n "$lh_o" ] && continue
+    lh_es=$(awk -F= '/^[ \t]*ExecStart[ \t]*=/{sub(/^[ \t]*/,"",$2); print $2; exit}' "$lh_f" 2>/dev/null | head -c 200)
+    lh_hit "$lh_f | 不归属任何软件包 | ExecStart=${lh_es:-未读取到}"
+  done
+done
+lh_finish
 "#
 );
 
@@ -2162,6 +2532,94 @@ static CATALOG: &[CommandDefinition] = &[
         },
     )
     .flagging(command_findings::service_anomaly),
+    portable!(
+        "file-rootkit-signatures",
+        Files,
+        "rootkit 文件特征",
+        "以 rkhunter 1.4.6 公开特征表核对已知 rootkit 文件与目录存在性，并与已知后门端口表比对 /proc/net 监听项；未命中不能排除未知或变种。",
+        CMD_FILE_ROOTKIT_SIGS
+    )
+    .self_checked()
+    .flagging(command_findings::collection_finding),
+    portable!(
+        "network-hidden-ports",
+        Network,
+        "内核表隐藏端口",
+        "比对内核 /proc/net 监听表与 ss/netstat 输出；内核可见而工具未列出的端口记为关注，也可能是权限或命名空间差异。",
+        CMD_NETWORK_HIDDEN_PORTS
+    )
+    .self_checked()
+    .flagging(command_findings::collection_finding),
+    portable!(
+        "network-bind-probe",
+        Network,
+        "绑定探测隐藏端口",
+        "需要 python3：对每个 TCP端口 1-65535 尝试 bind() 但不监听，每个空闲端口会被短暂占用后立即释放；被占用却不在内核表中的端口记为关注。不参与整组执行。",
+        CMD_NETWORK_BIND_PROBE
+    )
+    .opt_in()
+    .self_checked()
+    .with_timeout(60)
+    .flagging(command_findings::collection_finding),
+    portable!(
+        "system-lkm",
+        System,
+        "LKM rootkit 痕迹",
+        "比对 /proc/kallsyms 中已知 rootkit 符号、当前内核模块目录外的 .ko 文件与 dmesg/journalctl 模块加载痕迹；已加载模块的残留通常在重启后才消失。",
+        CMD_SYSTEM_LKM
+    )
+    .self_checked()
+    .with_timeout(60)
+    .flagging(command_findings::collection_finding),
+    portable!(
+        "perm-dt-needed",
+        Permissions,
+        "动态依赖解析",
+        "批量核对 /bin、/sbin、/usr/bin、/usr/sbin 中 ELF 的 DT_NEEDED；位于临时或主目录的依赖记为关注，未解析到属旁证而非结论。",
+        CMD_PERM_DT_NEEDED
+    )
+    .self_checked()
+    .with_timeout(60)
+    .flagging(command_findings::collection_finding),
+    portable!(
+        "file-command-evidence",
+        Files,
+        "命令替换旁证",
+        "对固定核心命令清单比对同目录修改时间中位数离群与回连特征字节；均为旁证，不证明被替换。",
+        CMD_FILE_COMMAND_EVIDENCE
+    )
+    .self_checked()
+    .flagging(command_findings::collection_finding),
+    portable!(
+        "persistence-chain",
+        Persistence,
+        "持久化引用链",
+        "从 cron、init.d、rc.local 提取脚本引用并跟踪 source/./sh 二级引用；每个链接应用远程执行与可写目录特征判定。",
+        CMD_PERSISTENCE_CHAIN
+    )
+    .self_checked()
+    .with_timeout(60)
+    .flagging(command_findings::collection_finding),
+    portable!(
+        "perm-suid-ownership",
+        Permissions,
+        "SUID 包归属",
+        "逐一核对 SUID/SGID 文件的软件包归属（dpkg/rpm）并标注 GTFOBins 提权方法；无归属或已知提权方法记为关注。",
+        CMD_PERM_SUID_OWNERSHIP
+    )
+    .self_checked()
+    .with_timeout(60)
+    .flagging(command_findings::collection_finding),
+    portable!(
+        "persistence-unit-owner",
+        Persistence,
+        "unit 包归属",
+        "核对 systemd unit 文件的软件包归属并展示 ExecStart；用户级 unit 限定在对应主目录下。",
+        CMD_PERSISTENCE_UNIT_OWNER
+    )
+    .self_checked()
+    .with_timeout(60)
+    .flagging(command_findings::collection_finding),
 ];
 
 /// The closed, read-only catalog every frontend runs from.
@@ -3143,6 +3601,40 @@ Permission denied"
         }
         assert!(lookup("network-listen; id").is_err());
         assert!(lookup("unknown-id").is_err());
+    }
+
+    /// The wave-one detection depth entries stay read-only, bounded, and the
+    /// slow bind probe never joins a grouped run.
+    #[test]
+    fn wave_one_collectors_present_bounded_and_opt_in() {
+        for id in [
+            "file-rootkit-signatures",
+            "network-hidden-ports",
+            "network-bind-probe",
+            "system-lkm",
+            "perm-dt-needed",
+            "file-command-evidence",
+            "persistence-chain",
+            "perm-suid-ownership",
+            "persistence-unit-owner",
+        ] {
+            let definition = lookup(id).expect(id);
+            assert!(definition.checks_tools, "{id}");
+            assert!(definition.abnormal.is_some(), "{id}");
+        }
+        assert!(lookup("network-bind-probe").unwrap().entry.opt_in);
+        for definition in CATALOG {
+            if definition.entry.opt_in {
+                assert_eq!(definition.entry.id, "network-bind-probe");
+            }
+        }
+        assert!(CMD_FILE_ROOTKIT_SIGS.contains("/dev/tux/.proc"));
+        assert!(CMD_FILE_ROOTKIT_SIGS.contains("lh_port 47107"));
+        assert!(CMD_FILE_ROOTKIT_SIGS.contains("TORN"));
+        assert!(CMD_SYSTEM_LKM.contains("diamorphine"));
+        assert!(CMD_SYSTEM_LKM.contains("hacked_getdents"));
+        assert!(CMD_PERM_SUID_OWNERSHIP.contains("find -exec /bin/sh -p"));
+        assert!(CMD_PERSISTENCE_CHAIN.contains("64"));
     }
 
     /// A highlight the operator cannot explain is noise, so every rule the

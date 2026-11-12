@@ -29,6 +29,7 @@ const catalog: EmergencyCommandCatalog = {
     title: "监听端口",
     description: "只读收集监听状态。",
     timeoutSeconds: 30,
+    optIn: false,
   }],
 };
 

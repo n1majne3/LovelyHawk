@@ -41,7 +41,7 @@ const command: EmergencyCommandCatalogItem = {
   category: "network",
   title: "监听端口",
   description: "只读收集监听状态。",
-  timeoutSeconds: 30,
+  timeoutSeconds: 30, optIn: false,
 };
 
 const groups = [{ category: "network" as const, commands: [command] }];

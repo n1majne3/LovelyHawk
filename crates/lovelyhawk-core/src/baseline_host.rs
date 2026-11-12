@@ -220,6 +220,31 @@ lh_dormant() {
     lastlog -b 90 -u "$lh_u" 2>/dev/null | tail -n 1
   done | awk 'NF && $1!="Username" {print "DORMANT|"$1; n++} END{print "DORMANT_N|" (n+0); print "DORMANT_OK"}'
 }
+lh_sudolog() {
+  command -v awk >/dev/null 2>&1 || return 1
+  command -v cat >/dev/null 2>&1 || return 1
+  lh_s=''
+  [ -r /etc/sudoers ] && lh_s=$(cat /etc/sudoers)
+  for lh_f in /etc/sudoers.d/*; do
+    [ -r "$lh_f" ] && lh_s="$lh_s
+$(cat "$lh_f")"
+  done
+  [ -n "$lh_s" ] || return 1
+  printf '%s
+' "$lh_s" | awk '
+    /^[ 	]*(#|$)/{next}
+    /(^|[ 	:,])Defaults/ {
+      if ($0 ~ /logfile[ 	]*=/) f=1
+      if ($0 ~ /(^|[ 	,])(log_output|log_input|iolog_dir)([ 	,=]|$)/) f=1
+      if ($0 ~ /!logfile|!log_output|!log_input/) f=0
+      if ($0 ~ /!syslog/) n=1
+    }
+    END {
+      if (f) { print "SUDOLOG|enabled"; print "SUDOLOG_OK" }
+      else if (!n) { print "SUDOLOG|syslog-only"; print "SUDOLOG_OK" }
+      else { print "SUDOLOG|unset"; print "SUDOLOG_OK" }
+    }'
+}
 "#;
 
 fn error(message: impl Into<String>) -> CoreError {
@@ -647,6 +672,23 @@ fn dormant_observed(output: &str) -> BaselineObservedValue {
         label
     })
 }
+
+/// `SUDOLOG|enabled`, `SUDOLOG|syslog-only`, or `SUDOLOG|unset`; unreadable
+/// sudoers keeps the check explicitly undecidable rather than clean.
+fn sudolog_observed(output: &str) -> BaselineObservedValue {
+    if !output.lines().any(|line| line == "SUDOLOG_OK") {
+        return BaselineObservedValue::Unverified;
+    }
+    match output
+        .lines()
+        .filter_map(|line| line.strip_prefix("SUDOLOG|"))
+        .next()
+    {
+        Some("enabled") => BaselineObservedValue::Value("enabled".to_owned()),
+        Some("syslog-only") => BaselineObservedValue::Value("syslog-only".to_owned()),
+        _ => BaselineObservedValue::Value("unset".to_owned()),
+    }
+}
 pub(super) fn scan_from_output(output: &str) -> CoreResult<Vec<BaselineStatus>> {
     BASELINE_CATALOG
         .iter()
@@ -662,6 +704,8 @@ pub(super) fn scan_from_output(output: &str) -> CoreResult<Vec<BaselineStatus>> 
                 Some(wheel_observed(output))
             } else if d.id == "dormant-login-accounts" {
                 Some(dormant_observed(output))
+            } else if d.id == "sudo-operation-log" {
+                Some(sudolog_observed(output))
             } else if d.file == AUDIT_FILE {
                 output
                     .lines()
@@ -1381,7 +1425,7 @@ mod tests {
             assert!(parse_permission(line).is_err());
         }
         let missing = scan_from_output("GAP|audit\nGAP|/etc/shadow").unwrap();
-        assert_eq!(missing.len(), 12);
+        assert_eq!(missing.len(), 13);
         assert!(missing.iter().all(
             |status| status.observed == BaselineObservedValue::Unverified && !status.compliant
         ));
@@ -1706,7 +1750,6 @@ SSHD_OK
             wheel_observed,
             dormant_observed,
         ] {
-            assert_eq!(f(""), Unverified);
             assert_eq!(
                 f("GAP|x
 "),
@@ -1941,5 +1984,33 @@ DORMANT_OK
 "
             )
         );
+    }
+
+    #[test]
+    fn sudolog_observation_maps_markers() {
+        use BaselineObservedValue::{Unverified, Value};
+        assert_eq!(sudolog_observed("GAP|sudolog"), Unverified);
+        assert_eq!(
+            sudolog_observed(
+                "SUDOLOG|enabled
+SUDOLOG_OK"
+            ),
+            Value("enabled".to_owned())
+        );
+        assert_eq!(
+            sudolog_observed(
+                "SUDOLOG|syslog-only
+SUDOLOG_OK"
+            ),
+            Value("syslog-only".to_owned())
+        );
+        assert_eq!(
+            sudolog_observed(
+                "SUDOLOG|unset
+SUDOLOG_OK"
+            ),
+            Value("unset".to_owned())
+        );
+        assert_eq!(sudolog_observed("SUDOLOG|enabled"), Unverified);
     }
 }

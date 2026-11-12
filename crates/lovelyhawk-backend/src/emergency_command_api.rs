@@ -752,6 +752,8 @@ pub(crate) struct EmergencyCommandCatalogItemDto {
     pub(crate) title: String,
     pub(crate) description: String,
     pub(crate) timeout_seconds: u64,
+    /// Opt-in checks never join a grouped "run all" execution.
+    pub(crate) opt_in: bool,
 }
 
 /// Where a history record's check sits in the current catalogue: its handle,
@@ -807,6 +809,7 @@ struct StoredCommand {
     title: String,
     description: String,
     timeout_seconds: u64,
+    opt_in: bool,
 }
 
 impl StoredCommand {
@@ -825,6 +828,7 @@ impl StoredCommand {
             title: self.title.clone(),
             description: self.description.clone(),
             timeout_seconds: self.timeout_seconds,
+            opt_in: self.opt_in,
         }
     }
 }
@@ -1161,6 +1165,7 @@ fn build_catalog(
             title: entry.title.to_owned(),
             description: entry.description.to_owned(),
             timeout_seconds: entry.timeout_seconds,
+            opt_in: entry.opt_in,
         });
     }
     // Only containers that are running: a stopped one has no process namespace
@@ -1565,6 +1570,7 @@ mod tests {
             description: "固定只读调查用途",
             command_preview: "shell text must remain core-owned",
             timeout_seconds: 30,
+            opt_in: false,
         }
     }
 
@@ -2163,6 +2169,7 @@ mod tests {
             title: "view".to_owned(),
             description: "只读".to_owned(),
             timeout_seconds: 30,
+            opt_in: false,
         };
         let access = RunAccess {
             snapshot_handle: "opaque-snapshot".to_owned(),
@@ -2230,6 +2237,7 @@ mod tests {
             title: "SUID 可执行".to_owned(),
             description: "只读".to_owned(),
             timeout_seconds: 30,
+            opt_in: false,
         };
         let base = receipt(&command, "/tmp/one\n/tmp/two".to_owned());
         for broken in [vec![1, 1], vec![1, 0], vec![2]] {
@@ -2262,6 +2270,7 @@ mod tests {
             title: "监听端口".to_owned(),
             description: "只读".to_owned(),
             timeout_seconds: 30,
+            opt_in: false,
         };
         let access = RunAccess {
             snapshot_handle: "opaque-snapshot".to_owned(),
@@ -2380,6 +2389,7 @@ mod tests {
             title: "监听端口".to_owned(),
             description: "只读".to_owned(),
             timeout_seconds: 30,
+            opt_in: false,
         };
         let mut invalid = receipt(&command, "plain".to_owned());
         invalid.command_id = "different-private-id".to_owned();
