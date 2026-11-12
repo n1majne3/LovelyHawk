@@ -8,6 +8,7 @@ import type { PostgresqlRuntimeRequest, PostgresqlRuntimeResponse } from "./post
 import type { MySqlRuntimeRequest, MySqlRuntimeResponse } from "./mysql-runtime-contract.js";
 import type { FileEvidenceRequest, FileEvidenceResult } from "./file-evidence-contract.js";
 import type { PacketCaptureEvidenceRequest, PacketCaptureEvidenceResult } from "./packet-capture-evidence-contract.js";
+import type { PcapOfflineRequest, PcapOfflineResult } from "./pcap-offline-contract.js";
 import type { PortForward, PortForwardRequest } from "./port-forward-contract.js";
 import type { PodFileEvidenceRequest, PodFileEvidenceResult } from "./pod-file-evidence-contract.js";
 import type { ConfigVisualAnswer, ConfigVisualCopyResult, ConfigVisualProduct, ConfigVisualRequest, ConfigVisualSaveResult, ConfigVisualView } from "./config-visual-contract.js";
@@ -213,6 +214,7 @@ export * from "./emergency-command-contract.js";
 export * from "./sftp-browser-contract.js";
 export * from "./local-browser-contract.js";
 export * from "./packet-capture-live-contract.js";
+export * from "./pcap-offline-contract.js";
 export * from "./application-log-contract.js";
 export * from "./integrity-contract.js";
 
@@ -485,6 +487,8 @@ export interface LovelyHawkApi {
   /** Fetch offered target content into the local quarantine area and launch a configured local engine against it. */
   localScan(request: import("./local-scan-contract").LocalScanRequest): Promise<import("./local-scan-contract").LocalScanResult | null>;
   packetCaptureEvidence(request: PacketCaptureEvidenceRequest): Promise<PacketCaptureEvidenceResult | null>;
+  /** Offline pcap analysis: import via host dialog, saved evidence, poll, cancel, export one object. */
+  pcapOffline(request: PcapOfflineRequest): Promise<PcapOfflineResult | null>;
   /** Local SSH port forwards bound to this connection. */
   portForward(request: PortForwardRequest): Promise<PortForward | PortForward[]>;
   podFileEvidence(request: PodFileEvidenceRequest): Promise<PodFileEvidenceResult | null>;
@@ -1082,7 +1086,7 @@ export function isBootstrapResult(value: unknown): value is BootstrapResult {
     typeof value.appVersion === "string" &&
     value.protocolVersion === BACKEND_PROTOCOL &&
     Array.isArray(value.pages) &&
-    value.pages.length === 15 &&
+    value.pages.length === 16 &&
     value.pages.every(isPageDescriptor) &&
     new Set(value.pages.map((page) => page.id)).size === value.pages.length &&
     isStringArray(value.securityReferenceFavoriteIds, 512)

@@ -35,6 +35,8 @@ interface PacketCapturePageProps {
   api: PacketCaptureLiveApi;
   /** Keeping a capture as a file; without it the page offers live capture only. */
   evidenceApi?: PacketCaptureEvidenceApi | undefined;
+  /** Navigate to offline analysis for a saved evidence job. */
+  onAnalyzePcapOffline?: ((jobHandle: string) => void) | undefined;
   active?: boolean;
   /** Deterministic standalone/SSR fixture; production leaves this unset. */
   initialState?: PacketCaptureLiveState;
@@ -77,6 +79,7 @@ export function PacketCapturePage({
   bindingHandle,
   api,
   evidenceApi,
+  onAnalyzePcapOffline,
   active = true,
   initialState,
 }: PacketCapturePageProps) {
@@ -535,6 +538,7 @@ export function PacketCapturePage({
           }}
           onCancel={() => void evidence.cancel()}
           onReset={evidence.reset}
+          onAnalyzeOffline={onAnalyzePcapOffline}
         />
       ) : null}
 

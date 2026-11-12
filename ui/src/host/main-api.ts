@@ -7,6 +7,7 @@ import { isCaseLibraryRequest, matchesCaseLibraryResult, type CaseLibraryRequest
 import { isCaseWorkspaceRequest } from "../shared/case-workspace-contract.js";
 import { isFileEvidenceRequest, matchesFileEvidenceResult, type FileEvidenceRequest } from "../shared/file-evidence-contract.js";
 import { isPacketCaptureEvidenceRequest, matchesPacketCaptureEvidenceResult, type PacketCaptureEvidenceRequest } from "../shared/packet-capture-evidence-contract.js";
+import { isPcapOfflineRequest, matchesPcapOfflineResult } from "../shared/pcap-offline-contract.js";
 import { isPortForwardRequest } from "../shared/port-forward-contract.js";
 import { isPodFileEvidenceRequest, matchesPodFileEvidenceResult, type PodFileEvidenceRequest } from "../shared/pod-file-evidence-contract.js";
 import { isConfigVisualCopyResult, isConfigVisualProduct, isConfigVisualRequest, isConfigVisualSaveResult, isConfigVisualView } from "../shared/config-visual-contract.js";
@@ -262,6 +263,34 @@ export function createMainApi(transport: BackendTransport = hostBackendTransport
         refuse("抓包留证响应与本次请求不一致。");
       }
       return result;
+    },
+    pcapOffline: async (...values: unknown[]) => {
+      requireArity(values, 1, "流量分析请求无效。");
+      const request = values[0];
+      if (!isPcapOfflineRequest(request)) refuse("流量分析请求无效。");
+      if (request.action === "import") {
+        const result = await host("pcap_offline_import", {}, DIALOG_TIMEOUT_MS);
+        if (result === null) return null;
+        if (!matchesPcapOfflineResult(request, { kind: "started", started: (result as { started?: boolean }).started === true })) {
+          refuse("流量分析响应与本次请求不一致。");
+        }
+        return { kind: "started", started: (result as { started: boolean }).started };
+      }
+      if (request.action === "begin-evidence") {
+        await backend.pcapOfflineBeginEvidence(request.jobHandle);
+        return { kind: "started", started: true };
+      }
+      if (request.action === "status") return { kind: "status", status: await backend.pcapOfflineStatus() };
+      if (request.action === "cancel") {
+        await backend.pcapOfflineCancel();
+        return { kind: "cancelled" };
+      }
+      const result = await host("pcap_offline_export", { request }, DIALOG_TIMEOUT_MS);
+      if (result === null) return null;
+      const r = result as { exported?: boolean; bytes?: number };
+      const shaped = { kind: "exported", exported: r.exported === true, bytes: typeof r.bytes === "number" ? r.bytes : 0 };
+      if (!matchesPcapOfflineResult(request, shaped)) refuse("导出响应与本次请求不一致。");
+      return shaped;
     },
     podFileEvidence: async (...values: unknown[]) => {
       requireArity(values, 1, "Pod 文件留证请求无效。");

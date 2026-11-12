@@ -1159,6 +1159,79 @@ pub fn window_theme<R: Runtime>(
     Ok(applied)
 }
 
+/// Importing a pcap the operator picked in the native dialog. The path stays
+/// on the host; the page only learns that the analysis started.
+#[tauri::command]
+pub async fn pcap_offline_import<R: Runtime>(
+    window: WebviewWindow<R>,
+    host: State<'_, Host>,
+) -> CommandResult<Value> {
+    require_main(&window)?;
+    let Some(path) = local_files::choose(
+        &window,
+        "导入抓包文件",
+        DialogKind::OpenFile,
+        Some(Filter {
+            name: "抓包文件",
+            extensions: &["pcap", "pcapng", "cap", "dmp"],
+        }),
+    )
+    .await
+    else {
+        return Ok(json!({ "started": false }));
+    };
+    host.bridge
+        .call(
+            "pcap-offline.begin-path",
+            json!({ "localPath": path.to_string_lossy() }),
+        )
+        .await
+        .map_err(|_| "无法开始分析所选文件；文件可能过大或已有分析在运行。".to_owned())?;
+    Ok(json!({ "started": true }))
+}
+
+/// Exporting one extracted object to a dialog-chosen file. The content stays
+/// untrusted bytes on the host; the page picks the object by id only.
+#[tauri::command]
+pub async fn pcap_offline_export<R: Runtime>(
+    window: WebviewWindow<R>,
+    host: State<'_, Host>,
+    request: Value,
+) -> CommandResult<Value> {
+    require_main(&window)?;
+    let object_id = request
+        .get("objectId")
+        .and_then(Value::as_str)
+        .filter(|id| id.starts_with("obj-") && id.len() <= 24)
+        .ok_or_else(|| "导出请求无效。".to_owned())?;
+    let suggested = request
+        .get("fileName")
+        .and_then(Value::as_str)
+        .filter(|name| local_files::is_safe_file_name(name))
+        .unwrap_or("object.bin");
+    let Some(path) = local_files::choose(
+        &window,
+        "导出流量对象",
+        DialogKind::Save {
+            default_name: suggested,
+        },
+        None,
+    )
+    .await
+    else {
+        return Ok(json!({ "exported": false }));
+    };
+    let result = host
+        .bridge
+        .call(
+            "pcap-offline.export-object",
+            json!({ "objectId": object_id, "localPath": path.to_string_lossy() }),
+        )
+        .await
+        .map_err(|_| "导出失败：对象已不在分析结果中，或无法写入所选位置。".to_owned())?;
+    Ok(json!({ "exported": true, "bytes": result.get("bytes").cloned().unwrap_or(json!(0)) }))
+}
+
 // Every command that creates a window is async: a synchronous command runs on
 // the main thread, and creating a window there deadlocks on Windows.
 #[tauri::command]

@@ -66,6 +66,13 @@ const ICONS: Record<string, () => ReactElement> = {
       <path d="M1.4 8.6h2.8l1.7-4.6 3.4 8.4 1.9-3.8h3.4" />
     </svg>
   ),
+  "traffic-analysis": () => (
+    <svg {...ICON_PROPS}>
+      <path d="M1.6 4.6h12.8M1.6 8h8.4M1.6 11.4h10.4" />
+      <circle cx="11.6" cy="11.6" r="2.4" />
+      <path d="m13.5 13.5 1.3 1.3" />
+    </svg>
+  ),
   "check-audit": () => (
     <svg {...ICON_PROPS}>
       <rect x="3" y="2.6" width="10" height="11.6" rx="1.6" />

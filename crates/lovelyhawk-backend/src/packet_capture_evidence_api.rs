@@ -109,6 +109,9 @@ struct Job {
     remote_path: String,
     progress: FileEvidenceProgress,
     dto: PacketCaptureEvidenceDto,
+    /// The local capture.pcap after a verified save; lets offline analysis
+    /// re-read the evidence without exposing the path to the page.
+    saved_pcap: Option<PathBuf>,
     abort: Option<tokio::task::AbortHandle>,
     created: Instant,
 }
@@ -170,6 +173,18 @@ impl PacketCaptureEvidenceApi {
             ssh_api,
             jobs: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// The verified local copy of a finished capture, for offline analysis.
+    /// Only returned while the job record is retained and reports a saved
+    /// state; the caller re-checks the file still exists.
+    pub(crate) fn saved_pcap_path(&self, handle: &str) -> Option<PathBuf> {
+        let jobs = self.jobs.lock();
+        let job = jobs.get(handle)?;
+        if !matches!(job.dto.state, "completed" | "saved-unlinked") {
+            return None;
+        }
+        job.saved_pcap.clone()
     }
 
     /// Jobs end with their connection. A capture still writing on the target
@@ -370,6 +385,7 @@ impl PacketCaptureEvidenceApi {
             .map_err(|_| PacketCaptureEvidenceError::Unavailable)?;
         let mut bundle = FileEvidenceBundle::create_with_sample(&paths, &directory, SAMPLE_FILE)
             .map_err(|_| PacketCaptureEvidenceError::Unavailable)?;
+        let saved_pcap = directory.join(bundle.sample_locator());
         let destination = bundle
             .take_destination()
             .map_err(|_| PacketCaptureEvidenceError::Unavailable)?;
@@ -403,6 +419,7 @@ impl PacketCaptureEvidenceApi {
                 remote_path: plan.remote_path.clone(),
                 progress: progress.clone(),
                 dto: dto.clone(),
+                saved_pcap: Some(saved_pcap.clone()),
                 abort: None,
                 created: Instant::now(),
             },

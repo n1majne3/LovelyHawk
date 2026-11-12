@@ -9,6 +9,7 @@ import { isPostgresqlRuntimeRequest, matchesPostgresqlRuntimeResponse, type Post
 import { isMySqlRuntimeRequest, matchesMySqlRuntimeResponse, type MySqlRuntimeRequest, type MySqlRuntimeResponse } from "../shared/mysql-runtime-contract.js";
 import { isFileEvidenceRequest, matchesFileEvidenceResult, type FileEvidenceRequest, type FileEvidenceResult } from "../shared/file-evidence-contract.js";
 import { isPacketCaptureEvidenceRequest, matchesPacketCaptureEvidenceResult, type PacketCaptureEvidenceRequest, type PacketCaptureEvidenceResult } from "../shared/packet-capture-evidence-contract.js";
+import { isPcapOfflineStatus } from "../shared/pcap-offline-contract.js";
 import { isPortForward, isPortForwardList, isPortForwardRequest, type PortForward, type PortForwardRequest } from "../shared/port-forward-contract.js";
 import { isPodFileEvidenceRequest, matchesPodFileEvidenceResult, type PodFileEvidenceRequest, type PodFileEvidenceResult } from "../shared/pod-file-evidence-contract.js";
 import { isConfigVisualRequest, matchesConfigVisualResponse, type ConfigVisualAnswer, type ConfigVisualRequest, type ConfigVisualView } from "../shared/config-visual-contract.js";
@@ -742,6 +743,21 @@ export class BackendClient {
     }
     if (!isPortForward(result)) throw new Error("端口转发响应未通过校验。");
     return result;
+  }
+
+  /** Poll or cancel the running offline pcap analysis. */
+  async pcapOfflineBeginEvidence(jobHandle: string): Promise<void> {
+    await this.#request("pcap-offline.begin-evidence", { jobHandle }, 30_000);
+  }
+
+  async pcapOfflineStatus(): Promise<import("../shared/pcap-offline-contract.js").PcapOfflineStatus> {
+    const result = await this.#request("pcap-offline.status", {}, 30_000);
+    if (!isPcapOfflineStatus(result)) throw new Error("流量分析状态未通过校验。");
+    return result;
+  }
+
+  async pcapOfflineCancel(): Promise<void> {
+    await this.#request("pcap-offline.cancel", {}, 30_000);
   }
 
   /** Polling and cancelling; starting picks a folder, so the host does it. */

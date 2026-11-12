@@ -25,6 +25,7 @@ authors = ["Tokeii"]
 repository = "https://github.com/LovelyTeams/LovelyHawk"
 
 [workspace.dependencies]
+aes = "=0.8.4"
 aes-gcm = "0.10"
 alacritty_terminal = "=0.25.1"
 async-channel = "2.5"

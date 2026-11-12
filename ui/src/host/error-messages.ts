@@ -169,6 +169,12 @@ export const BACKEND_ERROR_MESSAGES: Readonly<Record<string, string>> = Object.f
   "packet-capture-timeout": "抓包操作超出时限。",
   "packet-capture-too-many": "同时运行的抓包太多。",
   "packet-capture-unavailable": "这次抓包已结束或已过期。",
+  "pcap-offline-evidence-gone": "这份抓包证据已不存在，请重新抓包或直接导入本机文件。",
+  "pcap-offline-busy": "上一次离线分析还没结束，请先取消或等待完成。",
+  "pcap-offline-too-large": "这个抓包文件超过 256 MiB 上限，请先截取需要的部分。",
+  "pcap-offline-failed": "离线分析没有完成，详细原因见应用日志。",
+  "pcap-offline-gone": "这次离线分析已结束或已过期，请重新导入。",
+  "file-exists": "目标文件已存在，程序没有覆盖它；请换一个文件名或目录。",
 
   // Containers and Kubernetes.
   "docker-binding-unavailable": "目标连接已断开或已切换，容器信息没有读取。",

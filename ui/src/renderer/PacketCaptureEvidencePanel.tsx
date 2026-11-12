@@ -11,6 +11,8 @@ interface PacketCaptureEvidencePanelProps {
   onBegin(): void;
   onCancel(): void;
   onReset(): void;
+  /** Opens the offline traffic analysis on the locally saved pcap. */
+  onAnalyzeOffline?: ((jobHandle: string) => void) | undefined;
 }
 
 /**
@@ -18,7 +20,7 @@ interface PacketCaptureEvidencePanelProps {
  * kept — the folder, the case, the digest, and whether the target's temporary
  * file is gone. tcpdump's own words appear only as quoted text.
  */
-export function PacketCaptureEvidencePanel({ view, blockedReason, onBegin, onCancel, onReset }: PacketCaptureEvidencePanelProps) {
+export function PacketCaptureEvidencePanel({ view, blockedReason, onBegin, onCancel, onReset, onAnalyzeOffline }: PacketCaptureEvidencePanelProps) {
   const result = view.result;
   const running = view.phase === "running" || view.phase === "cancelling" || view.phase === "choosing";
   return (
@@ -57,6 +59,12 @@ export function PacketCaptureEvidencePanel({ view, blockedReason, onBegin, onCan
         <p className="packet-capture-evidence-error" role="alert">{view.error}</p>
       ) : null}
       {result !== null ? <EvidenceProgress result={result} startedAt={view.startedAt} /> : null}
+      {result !== null && onAnalyzeOffline !== undefined && (result.state === "completed" || result.state === "saved-unlinked") ? (
+        <p className="packet-capture-evidence-offline">
+          <button type="button" onClick={() => onAnalyzeOffline(result.jobHandle)}
+            data-testid="packet-capture-evidence-analyze-offline">离线分析这份抓包</button>
+        </p>
+      ) : null}
       {view.phase === "done" || (view.phase === "interrupted" && result !== null) ? (
         <div className="packet-capture-evidence-actions">
           <button type="button" onClick={onReset} data-testid="packet-capture-evidence-reset">知道了</button>

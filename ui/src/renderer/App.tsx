@@ -74,6 +74,7 @@ const CheckAuditPage = lazy(async () => ({ default: (await import("./CheckAuditP
 const IntegrityPage = lazy(async () => ({ default: (await import("./IntegrityPage")).IntegrityPage }));
 const LogAnalysisPage = lazy(async () => ({ default: (await import("./LogAnalysisPage")).LogAnalysisPage }));
 const PacketCapturePage = lazy(async () => ({ default: (await import("./PacketCapturePage")).PacketCapturePage }));
+const TrafficAnalysisPage = lazy(async () => ({ default: (await import("./TrafficAnalysisPage")).TrafficAnalysisPage }));
 const JavaHotUpdatePage = lazy(async () => ({ default: (await import("./JavaHotUpdatePage")).JavaHotUpdatePage }));
 const KubernetesPage = lazy(async () => ({ default: (await import("./KubernetesPage")).KubernetesPage }));
 const DockerPage = lazy(async () => ({ default: (await import("./DockerPage")).DockerPage }));
@@ -139,6 +140,7 @@ export function App() {
   // Landing state: without an SSH target every page is a "connect first" prompt,
   // so the app opens on the welcome view until a target is bound.
   const [activePageId, setActivePageId] = useState(WELCOME_PAGE_ID);
+  const [pcapEvidenceHandle, setPcapEvidenceHandle] = useState<string | null>(null);
   const [historyRerun, setHistoryRerun] = useState<{ historyId: string; key: number } | null>(null);
   const historyRerunKeyRef = useRef(0);
   const [investigateTarget, setInvestigateTarget] =
@@ -727,6 +729,16 @@ export function App() {
               bindingHandle={activeTarget?.bindingHandle ?? null}
               api={window.lovelyhawk}
               evidenceApi={window.lovelyhawk}
+              onAnalyzePcapOffline={(jobHandle) => {
+                setPcapEvidenceHandle(jobHandle);
+                void navigateTo("traffic-analysis");
+              }}
+            />
+          ) : activePage.id === "traffic-analysis" ? (
+            <TrafficAnalysisPage
+              api={window.lovelyhawk}
+              evidenceJobHandle={pcapEvidenceHandle}
+              onEvidenceConsumed={() => setPcapEvidenceHandle(null)}
             />
           ) : activePage.id === "kubernetes" ? (
             <KubernetesPage

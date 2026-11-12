@@ -263,6 +263,8 @@ pub fn run() -> ExitCode {
             main_commands::config_visual_copy,
             main_commands::config_visual_save,
             main_commands::windows_file_save,
+            main_commands::pcap_offline_import,
+            main_commands::pcap_offline_export,
             main_commands::windows_rdp,
             main_commands::clipboard_write,
             main_commands::window_theme,

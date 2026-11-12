@@ -36,6 +36,7 @@ mod nginx_repair_api;
 mod notes_api;
 mod packet_capture_evidence_api;
 mod packet_capture_live_api;
+mod pcap_offline_api;
 mod port_forward_api;
 mod postgresql_runtime_api;
 mod settings_api;
@@ -116,6 +117,7 @@ use crate::{
     packet_capture_live_api::{
         PacketCaptureLiveApi, PacketCaptureLiveApiError, PacketCaptureStartInput,
     },
+    pcap_offline_api::{PcapOfflineApi, PcapOfflineError},
     port_forward_api::{PortForwardApi, PortForwardApiError},
     postgresql_runtime_api::{PostgresqlRuntimeApi, PostgresqlRuntimeRequest},
     settings_api::{
@@ -240,6 +242,7 @@ pub struct BackendState {
     java_hot_update: JavaHotUpdateApi,
     note_replays: parking_lot::Mutex<HashMap<String, NoteReplayEntry>>,
     packet_capture_evidence: PacketCaptureEvidenceApi,
+    pcap_offline: PcapOfflineApi,
     packet_capture_live: PacketCaptureLiveApi,
     port_forward: PortForwardApi,
     ssh: Arc<SshApi>,
@@ -357,6 +360,7 @@ impl BackendState {
         );
         let packet_capture_evidence =
             PacketCaptureEvidenceApi::new(services.clone(), Arc::clone(&ssh));
+        let pcap_offline = PcapOfflineApi::new(packet_capture_evidence.clone());
         let packet_capture_live = PacketCaptureLiveApi::new(services.clone(), Arc::clone(&ssh));
         let port_forward = PortForwardApi::new(services.clone(), Arc::clone(&ssh));
         let settings = SettingsApi::new(&services);
@@ -401,6 +405,7 @@ impl BackendState {
             java_hot_update,
             note_replays: parking_lot::Mutex::new(HashMap::new()),
             packet_capture_evidence,
+            pcap_offline,
             packet_capture_live,
             port_forward,
             ssh,
@@ -2343,6 +2348,46 @@ impl BackendState {
                     Err(failure) => Err(failure),
                 }
             }
+            RpcMethod::PcapOfflineBeginEvidence => {
+                match parse_params::<PcapOfflineBeginEvidenceParams>(request.params) {
+                    Ok(params) => self
+                        .pcap_offline
+                        .begin_evidence(&params.job_handle)
+                        .map(|_| to_value(serde_json::json!({"ok": true})))
+                        .map_err(pcap_offline_failure),
+                    Err(failure) => Err(failure),
+                }
+            }
+            RpcMethod::PcapOfflineStatus => parse_params::<EmptyParams>(request.params)
+                .map(|_| to_value(self.pcap_offline.status())),
+            RpcMethod::PcapOfflineCancel => {
+                parse_params::<EmptyParams>(request.params).and_then(|_| {
+                    self.pcap_offline
+                        .cancel()
+                        .map(|_| to_value(serde_json::json!({"ok": true})))
+                        .map_err(pcap_offline_failure)
+                })
+            }
+            RpcMethod::PcapOfflineBeginPath => {
+                match parse_params::<PcapOfflineBeginPathParams>(request.params) {
+                    Ok(params) => self
+                        .pcap_offline
+                        .begin_path(std::path::Path::new(&params.local_path))
+                        .map(|_| to_value(serde_json::json!({"ok": true})))
+                        .map_err(pcap_offline_failure),
+                    Err(failure) => Err(failure),
+                }
+            }
+            RpcMethod::PcapOfflineExportObject => {
+                match parse_params::<PcapOfflineExportObjectParams>(request.params) {
+                    Ok(params) => self
+                        .pcap_offline
+                        .export_object(&params.object_id, std::path::Path::new(&params.local_path))
+                        .map(|bytes| to_value(serde_json::json!({"bytes": bytes})))
+                        .map_err(pcap_offline_failure),
+                    Err(failure) => Err(failure),
+                }
+            }
             RpcMethod::PacketCaptureInterfacesList => {
                 match parse_params::<PacketCaptureBindingParams>(request.params) {
                     Ok(params) => self
@@ -3409,6 +3454,16 @@ enum RpcMethod {
     PortForwardList,
     #[serde(rename = "port-forward.stop")]
     PortForwardStop,
+    #[serde(rename = "pcap-offline.begin-evidence")]
+    PcapOfflineBeginEvidence,
+    #[serde(rename = "pcap-offline.status")]
+    PcapOfflineStatus,
+    #[serde(rename = "pcap-offline.cancel")]
+    PcapOfflineCancel,
+    #[serde(rename = "pcap-offline.begin-path")]
+    PcapOfflineBeginPath,
+    #[serde(rename = "pcap-offline.export-object")]
+    PcapOfflineExportObject,
     #[serde(rename = "packet-capture.interfaces.list")]
     PacketCaptureInterfacesList,
     #[serde(rename = "packet-capture.start")]
@@ -4263,6 +4318,28 @@ struct PortForwardListParams {
 struct PortForwardStopParams {
     binding_handle: String,
     forward_handle: String,
+}
+
+/// An evidence job handle from a completed packet-capture save.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PcapOfflineBeginEvidenceParams {
+    job_handle: String,
+}
+
+/// Host-only: the local path comes from the native dialog, never the page.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PcapOfflineBeginPathParams {
+    local_path: String,
+}
+
+/// Host-only: object id plus the dialog-chosen destination path.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PcapOfflineExportObjectParams {
+    object_id: String,
+    local_path: String,
 }
 
 /// A replacement class file for Java hot update. Host-only, like the SFTP
@@ -5190,6 +5267,52 @@ fn config_failure(error: CoreError) -> RpcFailure {
         public_message,
         error,
     )
+}
+
+fn pcap_offline_failure(error: PcapOfflineError) -> RpcFailure {
+    let (operation, code, public_message) = match error {
+        PcapOfflineError::Invalid => (
+            "validate pcap-offline request",
+            "invalid-params",
+            "The offline-analysis request is invalid.",
+        ),
+        PcapOfflineError::EvidenceGone => (
+            "resolve pcap evidence",
+            "pcap-offline-evidence-gone",
+            "The saved capture is no longer available locally.",
+        ),
+        PcapOfflineError::Busy => (
+            "start pcap analysis",
+            "pcap-offline-busy",
+            "An offline analysis is already running.",
+        ),
+        PcapOfflineError::TooLarge => (
+            "validate pcap file",
+            "pcap-offline-too-large",
+            "The capture file exceeds the size limit.",
+        ),
+        PcapOfflineError::Unavailable => (
+            "run pcap analysis",
+            "pcap-offline-failed",
+            "The offline analysis could not be completed.",
+        ),
+        PcapOfflineError::NotFound => (
+            "resolve pcap analysis",
+            "pcap-offline-gone",
+            "There is no analysis or object matching that request.",
+        ),
+        PcapOfflineError::Exists => (
+            "export pcap object",
+            "file-exists",
+            "A file already exists at the chosen location.",
+        ),
+    };
+    RpcFailure {
+        operation,
+        code,
+        public_message,
+        source: None,
+    }
 }
 
 fn port_forward_failure(error: PortForwardApiError) -> RpcFailure {
@@ -7279,6 +7402,17 @@ fn page_descriptors() -> Vec<PageDescriptor> {
             migration_state: Pending,
         },
         PageDescriptor {
+            id: "traffic-analysis",
+            group: Investigation,
+            title: "流量分析",
+            icon: "≋",
+            capability: LocalWorkspace,
+            summary: "离线解析本机抓包文件或已保存的抓包证据：会话、HTTP 事务、提取对象与可疑流量线索。",
+            primary_action: "导入抓包文件",
+            sections: &["概要", "会话与 HTTP", "对象与线索", "菜刀回显"],
+            migration_state: Pending,
+        },
+        PageDescriptor {
             id: "packet-capture",
             group: Investigation,
             title: "网络抓包",
@@ -7788,6 +7922,327 @@ mod tests {
             response.error.as_ref().unwrap().code,
             "system-info-binding-unavailable"
         );
+    }
+
+    /// Offline-pcap params are closed too. `localPath` only ever comes from a
+    /// host dialog — a page trying to send one through the public methods
+    /// hits deny_unknown_fields, and the host-only methods still reject
+    /// anything outside their exact shape.
+    #[test]
+    fn pcap_offline_params_reject_unknown_fields_and_bad_values() {
+        for raw in [
+            r#"{"jobHandle":"abc","localPath":"/x"}"#,
+            r#"{"job_handle":"abc"}"#,
+            r#"{"jobHandle":42}"#,
+            r#"{"jobHandle":"abc","extra":true}"#,
+            r#"{}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<PcapOfflineBeginEvidenceParams>(raw).is_err(),
+                "{raw}"
+            );
+        }
+        assert!(
+            serde_json::from_str::<PcapOfflineBeginEvidenceParams>(r#"{"jobHandle":"job-1"}"#)
+                .is_ok()
+        );
+        for raw in [
+            r#"{"localPath":"/x","extra":1}"#,
+            r#"{"local_path":"/x"}"#,
+            r#"{"localPath":5}"#,
+            r#"{}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<PcapOfflineBeginPathParams>(raw).is_err(),
+                "{raw}"
+            );
+        }
+        for raw in [
+            r#"{"objectId":"obj-1","localPath":"/x","sha256":"x"}"#,
+            r#"{"objectId":"obj-1"}"#,
+            r#"{"localPath":"/x"}"#,
+            r#"{"objectId":1,"localPath":"/x"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<PcapOfflineExportObjectParams>(raw).is_err(),
+                "{raw}"
+            );
+        }
+        assert!(
+            serde_json::from_str::<PcapOfflineExportObjectParams>(
+                r#"{"objectId":"obj-1","localPath":"/x"}"#
+            )
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn pcap_offline_rpc_rejects_forged_paths_and_dead_handles() {
+        let root = TestRoot::new();
+        let state = BackendState::open(root.0.clone()).unwrap();
+        let forged = "renderer-forged-path-marker";
+
+        // A forged localPath on the page-facing evidence method is rejected at
+        // parse — the path must never cross the RPC boundary from a page.
+        let response = handle_frame(
+            &state,
+            &request(
+                "pcap-offline.begin-evidence",
+                &serde_json::json!({ "jobHandle": "job-1", "localPath": forged }).to_string(),
+            ),
+        )
+        .await;
+        assert!(!response.ok);
+        assert_eq!(response.error.as_ref().unwrap().code, "invalid-params");
+        assert!(!serde_json::to_string(&response).unwrap().contains(forged));
+
+        // A well-formed handle that never was a saved evidence job resolves to
+        // the evidence lookup failure, not a parse failure.
+        let response = handle_frame(
+            &state,
+            &request(
+                "pcap-offline.begin-evidence",
+                &serde_json::json!({ "jobHandle": "job-never-saved" }).to_string(),
+            ),
+        )
+        .await;
+        assert!(!response.ok);
+        assert_eq!(
+            response.error.as_ref().unwrap().code,
+            "pcap-offline-evidence-gone"
+        );
+
+        // begin-path exists for the host dialog; a missing file is refused.
+        let response = handle_frame(
+            &state,
+            &request(
+                "pcap-offline.begin-path",
+                &serde_json::json!({ "localPath": "d:/nonexistent/never.pcap" }).to_string(),
+            ),
+        )
+        .await;
+        assert!(!response.ok);
+        assert_eq!(response.error.as_ref().unwrap().code, "invalid-params");
+
+        // Cancelling with nothing running reports the empty registry.
+        let response = handle_frame(
+            &state,
+            &request("pcap-offline.cancel", &serde_json::json!({}).to_string()),
+        )
+        .await;
+        assert!(!response.ok);
+        assert_eq!(response.error.as_ref().unwrap().code, "pcap-offline-gone");
+
+        // Exporting an object from a non-existent analysis is refused.
+        let response = handle_frame(
+            &state,
+            &request(
+                "pcap-offline.export-object",
+                &serde_json::json!({ "objectId": "obj-0", "localPath": "d:/x.bin" }).to_string(),
+            ),
+        )
+        .await;
+        assert!(!response.ok);
+        assert_eq!(response.error.as_ref().unwrap().code, "pcap-offline-gone");
+
+        // Status is always answerable and hides paths entirely.
+        let response = handle_frame(
+            &state,
+            &request("pcap-offline.status", &serde_json::json!({}).to_string()),
+        )
+        .await;
+        assert!(response.ok);
+        assert_eq!(response.result.as_ref().unwrap()["state"], "idle");
+    }
+
+    /// A real fixture end-to-end through the RPC: read, analyze, object export
+    /// refuses overwrites, cancel-after-done is refused.
+    #[tokio::test]
+    async fn pcap_offline_rpc_runs_a_real_fixture_and_exports_once() {
+        let root = TestRoot::new();
+        let state = BackendState::open(root.0.clone()).unwrap();
+        let fixture = root.0.join("fixture.pcap");
+        fs::write(&fixture, minimal_pcap_with_http_object()).unwrap();
+
+        let response = handle_frame(
+            &state,
+            &request(
+                "pcap-offline.begin-path",
+                &serde_json::json!({ "localPath": fixture.to_string_lossy() }).to_string(),
+            ),
+        )
+        .await;
+        assert!(response.ok);
+
+        let mut status = serde_json::Value::Null;
+        for _ in 0..200 {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            let response = handle_frame(
+                &state,
+                &request("pcap-offline.status", &serde_json::json!({}).to_string()),
+            )
+            .await;
+            assert!(response.ok);
+            status = response.result.unwrap_or_default();
+            if status["state"] == "done" || status["state"] == "failed" {
+                break;
+            }
+        }
+        assert_eq!(status["state"], "done", "{status}");
+        assert_eq!(status["source"], "import");
+        assert!(!status["result"]["objects"].as_array().unwrap().is_empty());
+        // No path ever leaks into the status DTO.
+        assert!(!status.to_string().contains("fixture.pcap"));
+
+        // Export to an existing file is refused and the file is untouched.
+        let dest = root.0.join("object.bin");
+        fs::write(&dest, b"occupied").unwrap();
+        let response = handle_frame(
+            &state,
+            &request(
+                "pcap-offline.export-object",
+                &serde_json::json!({
+                    "objectId": status["result"]["objects"][0]["id"],
+                    "localPath": dest.to_string_lossy()
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+        assert!(!response.ok);
+        assert_eq!(response.error.as_ref().unwrap().code, "file-exists");
+        assert_eq!(fs::read(&dest).unwrap(), b"occupied");
+
+        let dest2 = root.0.join("object2.bin");
+        let response = handle_frame(
+            &state,
+            &request(
+                "pcap-offline.export-object",
+                &serde_json::json!({
+                    "objectId": status["result"]["objects"][0]["id"],
+                    "localPath": dest2.to_string_lossy()
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+        assert!(response.ok, "{:?}", response.error);
+        assert!(response.result.as_ref().unwrap()["bytes"].as_u64().unwrap() > 0);
+
+        // An invented object id is refused, and cancel after done is invalid.
+        let response = handle_frame(
+            &state,
+            &request(
+                "pcap-offline.export-object",
+                &serde_json::json!({ "objectId": "obj-9999", "localPath": "d:/nope.bin" })
+                    .to_string(),
+            ),
+        )
+        .await;
+        assert!(!response.ok);
+        assert_eq!(response.error.as_ref().unwrap().code, "pcap-offline-gone");
+
+        let response = handle_frame(
+            &state,
+            &request("pcap-offline.cancel", &serde_json::json!({}).to_string()),
+        )
+        .await;
+        assert!(!response.ok);
+        assert_eq!(response.error.as_ref().unwrap().code, "invalid-params");
+    }
+
+    /// Classic-pcap bytes: one HTTP request with a body and its 200 response,
+    /// so the analyzer produces a stored object to export.
+    fn minimal_pcap_with_http_object() -> Vec<u8> {
+        let req = b"POST /up.php HTTP/1.1\r\nHost: 10.0.0.5\r\nContent-Type: application/octet-stream\r\nContent-Length: 4\r\n\r\nABCD";
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nHELLO";
+        let mut out = Vec::new();
+        out.extend_from_slice(&0xa1b2c3d4u32.to_be_bytes());
+        out.extend_from_slice(&2u16.to_be_bytes());
+        out.extend_from_slice(&4u16.to_be_bytes());
+        out.extend_from_slice(&0i32.to_be_bytes());
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(&65535u32.to_be_bytes());
+        out.extend_from_slice(&1u32.to_be_bytes()); // LINKTYPE_ETHERNET
+        let mut seq_a = 1000u32;
+        let mut seq_b = 5000u32;
+        for (ts, (i, payload)) in
+            (1_700_000_000u32..).zip([req.as_slice(), resp.as_slice()].iter().enumerate())
+        {
+            let (src, dst, sport, dport, seq, ack) = if i == 0 {
+                (
+                    [10u8, 0, 0, 1],
+                    [10u8, 0, 0, 5],
+                    40000u16,
+                    80u16,
+                    seq_a,
+                    seq_b,
+                )
+            } else {
+                (
+                    [10u8, 0, 0, 5],
+                    [10u8, 0, 0, 1],
+                    80u16,
+                    40000u16,
+                    seq_b,
+                    seq_a,
+                )
+            };
+            let pkt = tcp_ipv4_packet(&src, &dst, sport, dport, seq, ack, payload);
+            out.extend_from_slice(&ts.to_be_bytes());
+            out.extend_from_slice(&0u32.to_be_bytes());
+            out.extend_from_slice(&(pkt.len() as u32).to_be_bytes());
+            out.extend_from_slice(&(pkt.len() as u32).to_be_bytes());
+            out.extend_from_slice(&pkt);
+            if i == 0 {
+                seq_a += payload.len() as u32;
+            } else {
+                seq_b += payload.len() as u32;
+            }
+        }
+        out
+    }
+
+    fn tcp_ipv4_packet(
+        src: &[u8; 4],
+        dst: &[u8; 4],
+        sport: u16,
+        dport: u16,
+        seq: u32,
+        ack: u32,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let ip_len = 20 + 20 + payload.len();
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&[0u8; 12]); // dst+src mac
+        frame.extend_from_slice(&0x0800u16.to_be_bytes());
+        frame.push(0x45);
+        frame.push(0);
+        frame.extend_from_slice(&(ip_len as u16).to_be_bytes());
+        frame.extend_from_slice(&[0, 0, 0, 0]);
+        frame.push(64);
+        frame.push(6); // TCP
+        frame.extend_from_slice(&[0, 0]); // checksum (parser ignores)
+        frame.extend_from_slice(src);
+        frame.extend_from_slice(dst);
+        let mut sum = 0u32;
+        for chunk in frame[14..14 + 20].as_chunks::<2>().0 {
+            sum += u16::from_be_bytes(*chunk) as u32;
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        frame[24..26].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+        frame.extend_from_slice(&sport.to_be_bytes());
+        frame.extend_from_slice(&dport.to_be_bytes());
+        frame.extend_from_slice(&seq.to_be_bytes());
+        frame.extend_from_slice(&ack.to_be_bytes());
+        frame.push(0x50); // data offset 5
+        frame.push(0x18); // PSH|ACK
+        frame.extend_from_slice(&[0, 0, 0, 0]);
+        frame.extend_from_slice(&[0, 0]);
+        frame.extend_from_slice(payload);
+        frame
     }
     use lovelyhawk_core::investigation::AddAiHistory;
     use tracing_subscriber::prelude::*;
@@ -8726,7 +9181,7 @@ mod tests {
         assert!(response.ok);
         let result = response.result.unwrap();
         assert_eq!(result["protocolVersion"], PROTOCOL_VERSION);
-        assert_eq!(result["pages"].as_array().unwrap().len(), 15);
+        assert_eq!(result["pages"].as_array().unwrap().len(), 16);
         assert!(result.get("dataRoot").is_none());
         assert_eq!(
             result["pages"]
