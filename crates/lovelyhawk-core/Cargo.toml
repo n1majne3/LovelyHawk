@@ -38,4 +38,4 @@ tracing.workspace = true
 url.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
-sha-crypt = "0.6.0"
+sha-crypt.workspace = true

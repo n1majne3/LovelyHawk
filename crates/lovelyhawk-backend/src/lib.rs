@@ -10724,9 +10724,12 @@ mod tests {
             .unwrap();
         let initializer = ["let docker_read = ", "Arc::new(DockerReadApi::new"].concat();
         assert_eq!(open.matches(&initializer).count(), 1);
+        // Two consumers share the one registry: the mutation side resolves its
+        // container handles through it, and local-scan maps engine hits back to
+        // containers through the same snapshot set.
         assert_eq!(
             open.matches(&["Arc::clone(&docker_read)"].concat()).count(),
-            1
+            2
         );
         let params_start = ["struct Docker", "BindingParams"].concat();
         let params = source

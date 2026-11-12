@@ -91,7 +91,7 @@ export function EmergencyCommandsPage({ bindingHandle, api, writeClipboard, reru
   const [evidence, setEvidence] = useState<{ offer: EmergencyCommandPathOffer; binding: string; api: FileEvidenceApi; returnFocus: HTMLElement | null } | null>(null);
   const [localScan, setLocalScan] = useState<{ offer: EmergencyCommandPathOffer; binding: string; api: LocalScanApi; returnFocus: HTMLElement | null } | null>(null);
   // Handles picked for the batch dialog. A target switch or a new bridge
-  // must not carry a selection minted for another host.
+  // must not carry a selection minted for another target.
   const [batchHandles, setBatchHandles] = useState<readonly string[] | null>(null);
   useEffect(() => { setEvidence(null); setLocalScan(null); setBatchHandles(null); }, [api, bindingHandle]);
   const [state, dispatch] = useReducer(emergencyCommandReducer, undefined, createEmergencyCommandState);

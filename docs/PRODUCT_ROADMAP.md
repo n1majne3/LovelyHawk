@@ -4,7 +4,7 @@
 
 对照本机外部材料逐项核对现有代码后确认以下缺口。材料来源：运维竞赛 writeup（运维1.5、运维2、运维3）、培训课件与笔记（Day1/Day2/课件1/课件2）、`sec_baseline_check.sh`（约 2580 行的基线与后门狩猎脚本）、LinuxIR 整合包（LinuxCheck_plus + unhide 三件套 + rkhunter 1.4.6）、D 盾（闭源 Windows 工具，仅参考使用方式）与 `tunnel_key.sh`；材料在本机 `tmp/` 下，不入库。基础排查面（进程、网络、账号、cron、systemd、init.d/rc 文件、`ld.so.preload`、authorized_keys、SUID 白名单判定、高危 capability 判定、挖矿、反弹 shell、iptables 只读、SSH 爆破统计、直接读取 cron spool、账号锁定/删除、容器内排查与文件编辑）已由 `detection.rs`、`command_workbench.rs`、`command_findings.rs`、`system_info.rs`、`file_analysis.rs` 覆盖，不在此重复；包完整性与隐藏进程只有基础实现，深度缺口见下文。清单按建议优先级排列，不代表全覆盖；每项实施时仍按 core → backend → DTO → 宿主 → UI 链路补拒绝测试与真实环境验证。
 
-### 实施进度（2026-11-10，本地未推送）
+### 实施进度（2026-11-10 起，更新至 2026-11-13）
 
 逐项进度同步到 GitHub issue #1–#11（n1majne3/LovelyHawk）。以下已实现并通过所列验证；“不纳入范围”外的其余条目继续按优先级推进。
 
@@ -25,97 +25,104 @@
 
 ### 处置闭环（最高）
 
-- 封禁 IP 的防火墙写入：现有 iptables/nft/firewalld 能力全部只读（`detection.rs:956`、`system_info.rs:9039` 的规则枚举与按 IP 检索），处置 C2 地址与爆破来源是所有 writeup 的固定动作，需按计划、确认、回读、可恢复链路补规则写入。
-- capability 修复（`setcap`）：`perm-capabilities` 已按 `DANGEROUS_CAPABILITIES`（`command_findings.rs:118`）判定高危能力，但没有写入能力；被替换命令还原后（如 ping）需补 `setcap cap_net_raw+ep`，否则普通用户不可用（`cp` 不带 `--preserve=xattr` 会丢失 capability）。
-- 系统命令还原一条龙：留证 → 按备份残留还原 → 包校验复核 → 功能验证。还原链路已接通：紧急命令路径操作新增“按残留还原”（core `command_restore.rs`、后端 `restore-residue`、页面确认对话框），经绑定 SSH 探测 `.bak`/`.orig`/`.old`/`~`/点号副本/`.dpkg-old`/`.dpkg-new`/`.dpkg-bak`/`*dpkgbak` 及 `psd`/`lsd` 等已知变体，唯一安全来源才放行，先留证再就地写回并复核摘要与功能，结果记操作日志、可撤销；包校验与功能检查只作观察，不宣称主机干净。检测脚本（`command_workbench.rs` `file-binary-changed`）已补 `.dpkg-*`/`*dpkgbak` 残留发现。仍缺：`ping` 等命令恢复后丢 `security.capability` 需上一行的 `setcap` 配套；真实环境证据待实验室跑批，本轮未经真实容器验证。
-- 包校验在 Debian/Ubuntu 上的回退：`file-package-verify` 的 Debian 分支只用 debsums，未安装即只输出“debsums 未安装”（`command_workbench.rs:1943`），不回退系统自带的 `dpkg --verify`（writeup 正是用 `dpkg -V`；主机全景行操作里已有单包 `dpkg --verify`，`system_info.rs:6638`）。dpkg 自身被替换时（运维1.5 第 5 题）需不经 dpkg 二进制、直接比对 `/var/lib/dpkg/info/*.md5sums`。
+- ~~封禁 IP 的防火墙写入~~（已完成，见上方进度区；core `firewall_block.rs`，`probe-ui-firewall-block.mjs`）。
+- ~~capability 修复（`setcap`）~~（已完成，见上方进度区；core `capability_strip.rs`，`probe-emergency-path-capability.mjs`）。
+- ~~系统命令还原一条龙~~：留证 → 按备份残留还原 → 包校验复核 → 功能验证。还原链路已接通：紧急命令路径操作新增“按残留还原”（core `command_restore.rs`、后端 `restore-residue`、页面确认对话框），经绑定 SSH 探测 `.bak`/`.orig`/`.old`/`~`/点号副本/`.dpkg-old`/`.dpkg-new`/`.dpkg-bak`/`*dpkgbak` 及 `psd`/`lsd` 等已知变体，唯一安全来源才放行，先留证再就地写回并复核摘要与功能，结果记操作日志、可撤销；包校验与功能检查只作观察，不宣称主机干净。检测脚本（`command_workbench.rs` `file-binary-changed`）已补 `.dpkg-*`/`*dpkgbak` 残留发现。恢复后丢 `security.capability` 的配套由上方 `setcap` 项提供；真实容器证据已有（`probe-command-restore.mjs` 等）。包校验与功能检查仍只作观察，不宣称主机干净。
+- ~~包校验在 Debian/Ubuntu 上的回退~~：已实现（无 debsums 时用 `dpkg --verify`，并先以 `dpkg.md5sums` 核对 dpkg 自身，不经可能已被替换的 dpkg 二进制）。
 - ~~账号口令修改~~（已完成，见上方进度区）。仍缺的配套：只检查用户录入的连接口令强度，不对目标做字典尝试（锁定风险且越过只读默认）。删除账号依赖目标 `userdel`，被替换时（运维2）复核能报告失败，但不提示命令可能被替换、也不提供替代路径。
 - ~~普通业务进程按原样重启~~（已完成，见上方进度区）。环境变量与已打开文件/网络连接不还原，systemd 托管进程仍走服务操作。
 
 ### Rootkit 检测深度
 
-- rootkit 签名库：rkhunter 1.4.6 内嵌约 70 个家族、350+ 文件/目录特征与 21 条后门端口映射；现有 Rootcheck 仅 3 项轻量启发（`system_info.rs:9054`）。
-- 隐藏端口检测（unhide-tcp 思路：逐端口 `bind()` 探测与 netstat 输出对比）：未实现。
-- LKM 专项：`/proc/kallsyms` 特定符号、标准模块目录外 `.ko`、kill -64 信号触发探测（Diamorphine 类）未实现；lsmod、内核 taint、eBPF 程序清单已有。
-- 自隐藏模块：`/sys/module` 与 `/proc/modules` 差集比对未实现（运维1.5 的 lkmh 在 lsmod 中不可见、`/sys/module` 中仍在）；`system-modules` 只跑 lsmod（`command_workbench.rs:975`）。还需提示“已加载模块的残留需重启才能消失”。
-- 模块复活点：`REMOTE_EXECUTION`（`command_findings.rs:414`）不含 `insmod`/`modprobe`，shell 启动文件中加载模块的行不会被标出；dmesg 中的模块加载痕迹也未检查。
-- 隐藏进程深度：`process-hidden`（`command_workbench.rs:1268`）只比较 `/proc` 目录列表与目标上的 `ps`；钩住 readdir 的 rootkit 会让两边同时隐藏，`ps` 被替换时结果也不可信。缺 unhide 式按 PID 直接访问 `/proc/N` 的暴力探测。
-- 系统命令依赖库注入：批量检查系统命令的 `DT_NEEDED` 是否异常（运维1.5 的 ls 被注入 `libzio.so`）未实现；现在只能对单个文件看 `readelf -d`（`file_analysis.rs:366`）。
+- ~~rootkit 签名库~~：第一批已实现（`command_workbench.rs` `file-rootkit-signatures` + 内置 `cmd_sig_lines.inc` 文件/目录特征、`cmd_port_lines.inc` 后门端口映射）。剩余缺口：覆盖面仍小于 rkhunter 全量家族库，真实 rootkit 命中矩阵未跑（NOT_RUN）。
+- ~~隐藏端口检测~~：已实现（`network-hidden-ports`/`network-bind-probe`，逐端口 `bind()` 探测与监听表对比，opt-in 不随组合运行）。
+- ~~LKM 专项~~：已实现（`system-lkm` + `cmd_ksym_lines.inc`：`/proc/kallsyms` 已知 rootkit 符号、标准模块目录外 `.ko`、dmesg/journalctl 模块加载痕迹）。决策（默认，用户可改）：不做 Diamorphine 的 kill -63/-64 信号探测——发送信号会改变攻击者状态，检测改经 kallsyms 与 `/sys/module` 差集。
+- ~~自隐藏模块~~：已实现（`system-modules` 增加 `/sys/module` 与 `/proc/modules` 差集、`/proc/kallsyms` 模块标签比对，并提示已加载模块残留需重启才消失）。
+- ~~模块复活点~~：已实现（shell 启动文件与 init 脚本中的 `insmod`/`modprobe` 由判定规则标出；dmesg/journalctl 加载痕迹经 `system-lkm`）。
+- ~~隐藏进程深度~~：已实现（两次 `/proc` 目录列表 + 按 PID 直接探测，上限 65536，排除自身子进程与瞬时进程）。容器不能伪造隐藏进程，真实命中仍需 VM/实机（NOT_RUN）。
+- ~~系统命令依赖库注入~~：已实现（`perm-dt-needed` 批量核对系统命令 `DT_NEEDED`）。
 - 命令被替换的旁证：与同目录其他命令修改时间不一致、`strings` 中出现 curl/socket/`/bin/sh` 等网络或回连特征，未实现。
-- 可信工具（待决策）：工作台全部依赖目标上的 `ps`/`ls`/`find`/`dpkg`，命令被替换时结果整体不可信。LinuxIR 用自带静态 unhide 绕开；是否提供“确认后上传静态工具到临时目录执行、用完清理”的路线，与“默认不在目标上安装工具”的规范冲突，需产品决定。
+- 可信工具（待决策）：工作台全部依赖目标上的 `ps`/`ls`/`find`/`dpkg`，命令被替换时结果整体不可信。LinuxIR 用自带静态 unhide 绕开；是否提供“确认后上传静态工具到临时目录执行、用完清理”的路线，与“默认不在目标上安装工具”的规范冲突，需产品决定。决策（默认，用户可改）：维持不上传静态工具，保持 待决策。
 
 ### 持久化与后门判定深度
 
-- 持久化链条跟踪：cron 调用 `www_bak.sh`、它再 `source vmtools.sh`（运维1.5）这类链条只看 cron 行本身发现不了；init.d 中 `nohup /home/cmcc/windows` 这类非标准路径程序也不一定命中现有特征。
-- xinetd 后门：`persistence-inetd`（`command_workbench.rs:1465`）只原样输出配置，判定规则不含 `server = /bin/bash` 类特征。
-- alias / 同名函数 / trap：`persistence-alias`（`command_workbench.rs:1501`）收集 alias 与 function，但只按远程执行特征判定；`sudo()`/`ssh()` 同名函数、`trap DEBUG`，以及运维2 中“每执行一次 whoami 就写出一个木马文件”的 alias 都不会被标出。
-- SSH 软链接后门：`/tmp/su` 指向 sshd、经 `pam_rootok` 任意密码登录（运维2）。`process-exe-path`（`command_workbench.rs:1311`）看的是 `/proc/PID/exe`，解析后就是真 sshd，不会命中；代码中无 `pam_rootok`。需判定：命令行第一个参数不是 sshd 的 sshd 进程、配置端口以外仍在监听的 sshd、可写目录中指向 sshd 的软链接。
-- 其他隐蔽持久化点：Python `.pth`、`.git/hooks`、`/etc/hosts.allow` 的 spawn、`pam_exec.so`、`pam_unix.so` 二进制被篡改，代码中均无检查。
-- 可疑进程规则：Web/数据库账号（www-data、mysql 等）派生的 shell、名称伪装成 `[kworker]` 却有磁盘程序文件的进程，未找到对应规则。
+- ~~持久化链条跟踪~~：已实现第一版（`persistence-chain`：cron/init 条目引用的脚本再追一层）。剩余缺口：链深与间接引用仍有限，跨用户引用可能漏。
+- ~~xinetd 后门~~：已实现（判定规则加入 `server = /bin/bash` 类 shell 服务与 `spawn`/`twist` 特征）。
+- ~~alias / 同名函数 / trap~~：已实现（判定规则覆盖 `sudo()`/`ssh()` 同名函数、`trap DEBUG` 与执行即落盘的 alias 劫持）。
+- ~~SSH 软链接后门~~：已实现（argv0 非 sshd 的 sshd 进程、配置外端口仍监听的 sshd、可写目录指向 sshd 的软链接与 `pam_rootok` 提示）。
+- ~~其他隐蔽持久化点~~：已实现（Python `.pth`、`.git/hooks`、`hosts.allow`/`hosts.deny` 的 `spawn`/`twist`、`pam_exec.so` 与 `pam_unix.so` 包校验均已覆盖）。
+- ~~可疑进程规则~~：已实现（Web/数据库账号派生 shell、伪装内核线程名却有磁盘程序文件的进程）。
 
 ### 溯源
 
-- 爆破后登录成功关联：同一 IP 多次失败后又成功登录的判定未实现；`log_analysis.rs` 只统计爆破次数（`brute_force_count`）。
-- IOC 自动提取：从排查结果（crontab、被替换的程序 strings）中提取 IP/域名并汇总（运维3 的 `hacker_ip.txt`）。存储结构 `CaseIoc`（`investigation.rs:832`）仍在，但案件页已移除，也没有自动提取。
+- ~~爆破后登录成功关联~~：已实现（同一来源失败 ≥5 次后首次成功记为高威胁线索）。
+- ~~IOC 自动提取~~：已实现（`ioc_extract.rs` 从排查结果提取 IP/域名/URL 汇总为工作台「线索汇总」，支持明文与 defanged 复制；`probe-command-iocs.mjs`）。决策（默认，用户可改）：IOC 与本机扫描结果不绑定案件记录——案件页已移除。
 
 ### 数据库应急（入侵排查视角，非配置基线）
 
 - ~~MySQL/MariaDB 运行实例在线检查与日志溯源~~：已实现 `mysql_instance.rs` 只读实例审查 + backend `mysql.runtime` `inspect` 动作——账号目录复核（匿名账号、`root@'%'` 类远程 root、空口令、`File_priv`/SUPER/GRANT、锁定态，MySQL `mysql.user` 与 MariaDB `mysql.global_priv` 双 schema）、`mysql.func` UDF 行、风险相关全局变量（`general_log`/`general_log_file`/`log_output`/`local_infile`/`secure_file_priv`），以及 general_log 有界尾部溯源（`Access denied` 来源统计、`INTO OUTFILE`/`CREATE FUNCTION` 写马语句命中）；所有结论分级为线索而非定性，变量缺失/非 FILE 日志/日志不可读以缺口明示。MySQL 8.0.46 与 MariaDB 11.8.9 一次性容器端到端验证（探针夹具覆盖全部发现类别，64/64）。
-- 数据库账号口令修改（运维2 用 `SET PASSWORD` 加固 MySQL root 弱口令）：现无此功能，桌面端只能编辑 LovelyHawk 自己保存的连接口令；PostgreSQL 原生连接强制只读（`postgresql_native.rs:214`）；core 遗留的通用 `plan_mutation`（`database.rs:1507`，任意 SQL）未接线，按 `UNWIRED_FEATURES.md` 不作为此功能的实现路径。需按产品分别实现固定语句（PostgreSQL `ALTER ROLE … PASSWORD`、MySQL/MariaDB `ALTER USER 'u'@'host' IDENTIFIED BY`，区分 host 部分），新口令只在 core 内处理、不进 DTO/日志/审计原文；确认时说明业务应用配置中的旧口令会失效，执行后用新口令独立登录复核，并提示更新应用配置与已保存的连接口令。MySQL 依赖先补原生连接。
-- MSSQL 日志审计：ERRORLOG/log.trc、18454/18456 事件、`xp_cmdshell`/`sp_OACreate` 与 `xplog70.dll` 等存储过程恢复痕迹。未实现；Windows 侧 16 类事件日志查询是现成载体。
+- ~~数据库账号口令修改~~（已完成，见上方进度区：PostgreSQL `ALTER ROLE` 与 MySQL/MariaDB `ALTER USER` 固定语句、执行后独立登录复核、限时恢复与已存口令放回）。
+- ~~MSSQL 日志审计~~：已实现（`windows_incident/mssql_audit.rs`：注册表实例发现、ERRORLOG 有界尾部、Application 18454/18456 按来源+账户聚合、`xp_cmdshell`/Ole Automation/`xplog70.dll`/`odsole70.dll`/`sp_addextendedproc` 线索、`log.trc` 只报路径与大小；win-dvc `MSSQL_AUDIT` 固定只读脚本）。剩余缺口：真实 SQL Server 实例验证不可用（本机无 MSSQL，仅夹具与本机脚本回读，NOT_RUN）。
 
 ### Web 应急：一键 Webshell 扫描与 Web 日志规则
 
 - 一键 Webshell 扫描（“D 盾扫 www”式工作流）：`WEBSHELL_SCAN_COMMAND`（`detection.rs`）已覆盖 Web 根自动发现（nginx/apache/tomcat 配置指令 + `nginx -T` + 常见目录）、扩展后缀集（php/php3-7/phtml/pht/phar/jspx/asp/aspx/asa/cer/ashx）、图片马（图片内嵌 `<?php`）、配置型后门（`.htaccess`/`AddType`、`./user.ini`/`auto_prepend_file`）、隐藏脚本与特征分级（确证/疑似，单行 base64 长串与解码链标为需人工核对）。扫描器已统一为收集器契约：命中行 `关注：<path> | <类别>，第 N 行：<摘录>` 使工作台 `file-webshell-hint` 直接展示同一结果，命中行经 `command_paths` 提供路径句柄，接通既有“下载留证”（file_evidence）与“隔离/去执行位”（emergency_path 计划-确认-执行-复核-恢复链路）；不可解析/歧义路径仅展示不提供操作。单测 9 项 + 真实 Debian 容器实跑验证。剩余缺口：
-  - 批量处置带范围预览（现为逐命中行操作）。
+  - ~~批量处置带范围预览~~：已实现（路径句柄命中可批量去执行位/隔离，单次预览+确认，逐项结果与撤销；`probe-path-batch.mjs`）。
   - 容器 Web 根一键扫描：选中容器后发现 Web 根，容器内直接扫或整目录拉出扫后回定位容器文件。
   - `detection.rs` 结构化 `WebshellScan`/`DetectionService` 尚未接 RPC（工作台为桌面可见入口）。
   - ~~外部扫描器编排~~：已实现「取回本机扫描」（路径菜单 → `local.scan` 动作链 `engines/configure/fetch/inspect/run/reveal/discard`）：远端固定形状探测 + `tar -T` 打 tar 包（`find` 限普通文件/目录、单文件 4MiB、2 万成员、256MiB 上限），经既有证据通道下载（SFTP 或 SCP 回退，双读+stat+SHA-256 核对），本机自研 tar 解包器落隔离目录（拒绝链接/设备/穿越/保留名/尾部点号，去除执行权限并写 MOTW 网络标记），manifest 绑定目标标签/来源路径/摘要/传输方式，30 分钟 TTL 与按绑定清理。引擎配置仅存校验过的绝对路径+类型+argv（程序路径由宿主系统对话框注入，页面不送本机路径）：图形界面引擎（D 盾类）拉起并在提示中给隔离目录，命令行引擎限时 120s 捕获输出（64KiB 截断）。真实 Dropbear（无 SFTP 子系统）端到端 18/18：单文件/整目录取回、隐藏文件与符号链接处理、manifest 复核、cli/gui 双引擎、拒绝路径与丢弃清理。剩余缺口：
-    - 外部引擎输出解析：当前原样回显有界输出，未解析 D盾/其他引擎的命中结构，未与留证/案件记录关联。
+    - 外部引擎输出解析：CLI 引擎输出现可按取回 manifest 回映远端路径（本机扫描命中映射，`probe-local-scan.mjs`）；D盾等结构化命中解析未做，按决策不与案件记录关联（案件页已移除）。
     - 本机安全软件会实时检查取回内容（实验已验证 Defender 拦截 webshell 读取），属固有面已在 manifest 与界面说明。
     - 取回过程非原子快照，目标侧内容在打包与下载间变化时以 stat 核对失败为界。
 - ~~Web 日志攻击特征内置规则~~：已实现固定内置特征集（`log_analysis.rs` `builtin_log_rules`，7 条：union select SQL 注入、路径穿越/`%2e%2e`、`${jndi:` JNDI 注入、ThinkPHP 利用路径、webshell 参数访问、扫描器 UA、IFS/`/dev/tcp` 反弹特征），经 `rules_for_matching` 在匹配点与自定义规则合并（自定义优先、内置不可删改列，`match` 命中带 `builtin` 来源标记与 `builtinRuleCount`），并按行内来源地址聚合 `sources` 攻击源统计（按命中数排序、上限 16 源/8 特征，回环与缺源不计），全部为排查线索而非定性。core 单测 7 项（签名命中/大小写/聚合排序/上限/共存/净日志不误报）；backend RPC 与契约同步扩展。剩余缺口：特征覆盖面仍小（无 LFI/RFI 与序列化利用、无更多国产框架与组件特征、无 XSS 线索），`log-web-trace` 的逐行 URI 尚未自动喂给匹配，攻击源仅限行内可解析 IPv4。
-- 访问日志反查文件：运维2 的免杀马 D 盾扫不出，是从 apache 访问日志找到的。`log-web-trace`（`command_workbench.rs`）已覆盖第一版：读取 nginx/apache 访问日志尾部与 .1 轮转，提取点号隐藏段、样本内仅 POST、疑似随机命名、含 `..` 或 PUT/DELETE/TRACE/CONNECT 的脚本路径，并把前 20 条 URI 拼到常见站点根核对存在性，全部为需人工核对的线索。剩余缺口：自定义日志位置与 vhost 日志目录、压缩轮转文件、URL 编码与路径规范化带来的漏判，以及对命中文件的进一步特征深查（可结合 `file-webshell-hint`）。
-- Web 根内的站点打包与敏感文件：`file-credential` 只在文件名含 backup/dump/bak 时才标出压缩包（`command_workbench.rs:644`），运维2 的 `www.zip` 不会命中；`composer.json`、`.git/config` 与云凭证文件（`.aws/credentials` 等）均无检查（站点内 `.env.*` 已覆盖）。
-- Web 根内的隐藏文件：`file-hidden`（`command_workbench.rs:919`）只查 `/tmp`、`/var/tmp`、`/dev/shm`、`/home`、`/root`，不含 Web 根（运维2 的 `.a.php`、`.dont_delete_me.php`）。
-- Web 组件版本识别与已知漏洞：`file-web-version`（`command_workbench.rs`）已覆盖第一版：在常见站点根（含 `/usr/share/phpmyadmin`、`/home/*/public_html`）内定位 ThinkPHP（`base.php`、`library/think/App.php`、`thinkphp.php`、`topthink/framework`）、phpMyAdmin（`doc/html/index.html`、`README`、`ChangeLog`、`libraries/classes/Version.php`）与 Smarty（`Smarty.class.php`）的版本文件并解析版本，命中 ThinkPHP 5.0.x/5.1.x、phpMyAdmin <4.9、Smarty <3.1.45 历史风险区间时标为需人工核对的版本线索（非 CVE 确证）。剩余缺口：其他产品与自定义站点目录、更多版本证据来源、按精确补丁版本比对漏洞库。
-- 模板编译缓存污染：Smarty `templates_c` 被写入后即使修补 WAF 仍可利用（运维3），发现与清理未实现。
+- ~~访问日志反查文件~~：运维2 的免杀马 D 盾扫不出，是从 apache 访问日志找到的。`log-web-trace`（`command_workbench.rs`）已覆盖第一版：读取 nginx/apache 访问日志尾部与 .1 轮转，提取点号隐藏段、样本内仅 POST、疑似随机命名、含 `..` 或 PUT/DELETE/TRACE/CONNECT 的脚本路径，并把前 20 条 URI 拼到常见站点根核对存在性，全部为需人工核对的线索。剩余缺口：自定义日志位置与 vhost 日志目录、压缩轮转文件、URL 编码与路径规范化带来的漏判，以及对命中文件的进一步特征深查（可结合 `file-webshell-hint`）。
+- ~~Web 根内的站点打包与敏感文件~~：已实现（判定规则覆盖 Web 根内任意压缩包、依赖/认证清单、`.git`/`.svn`、云与集群凭据文件）。
+- ~~Web 根内的隐藏文件~~：已实现（判定规则已含 Web 根隐藏脚本）。
+- ~~Web 组件版本识别与已知漏洞~~：第一版已实现——`file-web-version`（`command_workbench.rs`）在常见站点根（含 `/usr/share/phpmyadmin`、`/home/*/public_html`）内定位 ThinkPHP（`base.php`、`library/think/App.php`、`thinkphp.php`、`topthink/framework`）、phpMyAdmin（`doc/html/index.html`、`README`、`ChangeLog`、`libraries/classes/Version.php`）与 Smarty（`Smarty.class.php`）的版本文件并解析版本，命中 ThinkPHP 5.0.x/5.1.x、phpMyAdmin <4.9、Smarty <3.1.45 历史风险区间时标为需人工核对的版本线索（非 CVE 确证）。剩余缺口：其他产品与自定义站点目录、更多版本证据来源、按精确补丁版本比对漏洞库。
+- 模板编译缓存污染：发现已实现（`file-smarty-templates-c` 在站点目录定位 `templates_c`/`compile_dir`，核对编译产物的执行特征与可疑请求变量）。剩余缺口：清理动作未实现。
 
 ### 传输能力：整目录上传/下载与批量传输
 
 - SFTP 单文件上传/下载、变更集原语已齐（`sftp.rs:244` 起的 `SftpMutation`，含 `CreateArchive`、`UploadStaged` 与 `ExtractedDirectory` 恢复令牌）；缺：
-  - 整目录递归上传/下载的接线：远端 `CreateArchive` 打包后下载压缩包、上传侧暂存+解压恢复；配目录树选择、文件数/容量上限、取消与背压。用途是把 `/var/www/html` 整目录拉回本地深扫（与一键 Webshell 扫描组合成完整工作流）以及工具包/补丁目录整体上传。
-  - 批量多文件传输队列（逐项进度、部分失败可见、重试）。
-  - 双主机中转传输（失陷机 → 本地 → 分析机，两条连接分别授权，凭据不交叉）。
-  - 大文件断点续传与分段限速（文件证据单文件上限 512 MiB，`file_evidence.rs` 现为非递归单文件；超大文件目前只能放弃）。
-- ~~SCP 协议回退~~：已实现第一版并经真实 Dropbear 靶机（无 `Subsystem sftp`、无 sftp-server）验证。core 内嵌经典 SCP 协议（`scp.rs`，T/C 行握手与 ACK，不调用本机 ssh/scp 二进制）；`sftp_on_handle` 在子系统请求/握手失败且判定为"子系统缺失"时对 `DownloadNew`/`UploadNew`/`CollectFileEvidence` 回退，其余变体保留原始错误。回退侧远端 `scp` 存在性探测走白名单解析；`collect_scp_file` 复刻 SFTP 留证的双读+stat 一致性+SHA-256 核对，canonical 路径经 `readlink` 标记核对；上传要求绝对路径、父目录存在且拒绝覆盖既有路径（对齐 SFTP `EXCLUDE` 语义），失败清理远端半成品。证据 manifest 记 `transport: "scp"` 并附 SCP 版限制说明；无 SFTP 时报错明确告知浏览/修改不可用、留证仍可走 SCP。验证：`tools/lab/probe-scp-fallback.mjs` 8/8（连接、SFTP 面如实失败、路径句柄、留证字节与摘要一致、manifest 标记）。已知缺口：交互式文件浏览器仍需 SFTP 列表无法在此类目标打开（exec 版降级列表未做，rename/chmod/目录递归无对应语义），DownloadNew/UploadNew 传输层已就绪但目前仅有 Java 热更新等少数调用方可达，连接预检的 SFTP 可用性探测与界面降级说明未做。
+  - ~~整目录递归上传/下载~~：已实现（下载：远端 tar 拉回或逐文件落本地目录，`probe-sftp-dir-download.mjs`；上传：宿主打 tar 后经 `UploadStaged` + `ExtractedDirectory` 恢复令牌，`probe-sftp-dir-upload.mjs` 19/19；均有上限、预览确认与取消）。
+  - ~~批量多文件传输队列~~：已实现（每绑定队列、并发 2、排队/进行/完成/失败/取消逐项可见、单项重试与全部取消，`probe-sftp-queue.mjs`）。
+  - ~~双主机中转传输~~：已实现（宿主临时目录中转，两腿各用自身绑定句柄、凭据不交叉，EXCLUDE 语义与逐腿进度/取消，`probe-sftp-relay.mjs` 16/16）。
+  - ~~大文件断点续传与分段限速~~：已实现于普通 SFTP 下载（`.part` 断点续传仅在远端大小与 mtime 不变时继续、KiB/s 限速、完成后 `sha256sum` 核对，`probe-sftp-queue.mjs`）。剩余缺口：SCP 下载不能续传（界面明示）；文件证据通道仍是单文件 512 MiB、非递归。
+- ~~SCP 协议回退~~：已实现第一版并经真实 Dropbear 靶机（无 `Subsystem sftp`、无 sftp-server）验证。core 内嵌经典 SCP 协议（`scp.rs`，T/C 行握手与 ACK，不调用本机 ssh/scp 二进制）；`sftp_on_handle` 在子系统请求/握手失败且判定为"子系统缺失"时对 `DownloadNew`/`UploadNew`/`CollectFileEvidence` 回退，其余变体保留原始错误。回退侧远端 `scp` 存在性探测走白名单解析；`collect_scp_file` 复刻 SFTP 留证的双读+stat 一致性+SHA-256 核对，canonical 路径经 `readlink` 标记核对；上传要求绝对路径、父目录存在且拒绝覆盖既有路径（对齐 SFTP `EXCLUDE` 语义），失败清理远端半成品。证据 manifest 记 `transport: "scp"` 并附 SCP 版限制说明；无 SFTP 时报错明确告知浏览/修改不可用、留证仍可走 SCP。验证：`tools/lab/probe-scp-fallback.mjs` 8/8（连接、SFTP 面如实失败、路径句柄、留证字节与摘要一致、manifest 标记）。已知缺口收窄：exec+SCP 只读浏览已实现（固定 BusyBox 兼容命令列目录 + SCP 传输，界面横幅明示 rename/chmod/删除/递归不可用，`probe-scp-fallback.mjs`）；写操作与目录递归在此类目标仍无对应语义。
 
 ### 流量分析
 
-- pcap 离线解析：会话重组、TCP/HTTP 流追踪、HTTP 对象导出、传输文件提取（菜刀 `X@Y` 修剪类）。现有能力仅实时 tcpdump 行解析（`packet_capture.rs:732`），抓包留证后无法回放分析。
-- 恶意流量特征：冰蝎 4（固定 Accept 头、默认密钥 md5 前 16 位、密文长度 16 整数倍）、菜刀、CS 心跳、frp 握手、SQLmap、ICMP 隧道、stratum 矿池协议；进程与文件侧 stratum 特征已有，流量特征未实现。TLS keylog 解密为后续项。
+- ~~pcap 离线解析~~：已实现（`pcap_offline.rs` 全自研：pcap/pcapng 容器、Ethernet/VLAN/raw/SLL/SLL2、IPv4/IPv6/TCP/UDP/ICMP、按四元组与方向的 TCP 重组与缺口标记、HTTP/1.x 含管道化/chunked/gzip、对象 SHA-256 导出、菜刀 `X@Y` 与 `->|`/`|<-` 回显；页面「流量分析」六视图；`probe-pcap-offline.mjs` 含真实容器抓包验证）。
+- ~~恶意流量特征~~：已实现（冰蝎默认密钥 AES-128 强线索、菜刀、SQLmap、CS 周期心跳、frp 登录、ICMP 隧道、Stratum；均为线索+规则说明，不作定性）。决策（默认，用户可改）：TLS keylog 解密按议题推迟未做；冰蝎 v4 默认头模式因无可靠出处未纳入判定。
 
 ### Windows 侧
 
-- 登录事件链分析：4624/4625/4776/4648/4672 关联、登录类型（2/3/5/8/10）判读、远控工具登录指纹（IPC 一次 type3、PSEXEC 3+2、WMIC 四次 type3、SharpRDP 3+10）还原横向移动路径；现有仅“开启 4624/4625 审计”基线项（`windows_incident/baseline.rs:96`）。
-- PowerShell 4104 脚本内容与 WinRM/RDP 四个远程管理通道日志：对照现有 28 条命令预设（`win-ir-command-presets.ts`）补缺。
+- ~~登录事件链分析~~：已实现（`windows_incident/logon_chain.rs`：4624/4625/4776/4648/4672/4634/4647 + System 7045 固定采集，按来源+账户 10 分钟链内分组，IPC/PsExec/WMIC/SharpRDP/爆破后成功五种指纹线索；win-dvc `LOGON_CHAIN`；本机 PowerShell 真实回读 31 条事件）。剩余缺口：真实 RDP 目标端到端采集（NOT_RUN）。
+- ~~PowerShell 4104 与 WinRM/RDP 通道日志~~：已实现（`logs()` 新增 `winrm` 类别 6/91/168，`rdp` 类别含 RemoteConnectionManager 1149、LocalSessionManager 21/22/24/25 并新增 RdpCoreTS 131；PowerShell 4103/4104 经既有 powershell 类别与组合采集）。剩余缺口：真实 RDP 目标采集（NOT_RUN）。
 
 ### 基线小项（短期易补）
 
-- SSH 加密算法白名单（ciphers/macs/kex 禁 arcfour/3des/cbc/sha1）：`baseline.rs` 无对应项。
-- SUID 包归属与 GTFOBins 标注：标准 SUID 白名单与非标准目录判定已有（`command_findings.rs:244`），writeup 中的 `/bin/hack`、带 SUID 的 find/id 会被标出；缺 `dpkg -S`/`rpm -qf` 包归属核对与按 GTFOBins 标注提权方式。
-- systemd 自定义 unit 属主校验（`rpm -qf`/`dpkg -S` 查不到属主的自定义 service/timer）：现有仅按时间的 recent-units。
-- SFTP 子系统引导修复：按基线修改链路写入 `Subsystem sftp`、`sshd -t` 检查后重载（运维2）；现有基线项中没有。
-- Day1 课件对照、按配置名在 `baseline.rs` 未搜到的项：
-  - 系统：TMOUT 空闲超时、`pam_pwhistory` remember、`pam_wheel` 限制 su、sudo 操作日志、SSH AllowUsers/AllowGroups、90 天未登录的休眠账号。
-  - Apache：Indexes、server-status、运行用户、超时与请求大小、模块精简。
-  - Tomcat：manager/host-manager、AJP 8009、以 root 运行、目录列表、会话超时。
-  - MySQL：匿名账号与 test 库、root 远程登录、口令策略、登录失败锁定（需连接实例，与“数据库应急”节的 MySQL 原生连接一起做）。
-- 攻击与隧道工具名单扩充（frp/nps/gost/earthworm/reGeorg 等）：现有 `command_findings.rs:876` 附近仅 chisel/frpc 等少数。
+- ~~SSH 加密算法白名单~~：已实现（`baseline.rs` SSH 弱算法项按 `sshd -T` 生效值判定）。
+- ~~SUID 包归属与 GTFOBins 标注~~：已实现（`perm-suid-ownership` 包归属核对 + `cmd_gtfobins.inc` 提权方式标注）。
+- ~~systemd 自定义 unit 属主校验~~：已实现（`persistence-unit-owner`）。
+- ~~SFTP 子系统引导修复~~：已实现（`ssh-sftp-subsystem` 经基线写入链补 `Subsystem sftp internal-sftp`，`sshd -t` 检查后重载；`probe-baseline-sftp.mjs`）。
+- ~~Day1 课件对照~~：系统项（TMOUT、`pam_pwhistory` remember、`pam_wheel` 限制 su、sudo 操作日志、SSH AllowUsers/AllowGroups、90 天未登录账号）、Apache 六项（Indexes、server-status、运行用户、超时与请求大小、模块精简）、Tomcat 五项（manager/host-manager、AJP 8009、以 root 运行、目录列表、会话超时）已实现为只读基线项；MySQL 四项（匿名账号与 test 库、root 远程登录、口令策略、登录失败锁定）经 `mysql_instance.rs` 实例审查覆盖。均为检查不提供写入（SFTP 子系统除外，单独成项）。
+- ~~攻击与隧道工具名单扩充~~：已实现（精确 basename 隧道工具名单，含 frp/nps/gost/earthworm/reGeorg 等；另在账号删除/锁定失败疑似命令被替换时给出工具可疑提示）。
 
 ### 连接辅助
 
-- SSH 本地端口转发：把远端 docker 发布端口转到本机，用于修复后从工作机验证容器化 Web 业务（writeup 中 `tunnel_key.sh` 的用途）。未实现；涉及宿主侧监听端口，设计时需核对授权边界与默认关闭原则。
+- ~~SSH 本地端口转发~~：已实现（`port_forward.rs` + russh `direct-tcpip`；监听只绑 127.0.0.1，目的地限目标回环或当前 LISTEN 表内地址、需确认对话框明示本机可达性；8 转发/32 并发上限、可取消、随绑定关闭；`probe-port-forward.mjs` 18/18）。
+
+### 本轮保留的决策与 NOT_RUN（2026-11-13）
+
+以下为本轮采用的默认决策，可按需要改变：
+
+- 不向目标上传静态工具（与“默认不在目标上安装工具”一致），可信工具路线保持 待决策。
+- 不做 Diamorphine 的 kill -63/-64 信号探测（会改变攻击者状态），检测经 kallsyms 与 `/sys/module` 差集。
+- TLS keylog 解密按议题推迟，未实现也不暗示支持。
+- 冰蝎 v4 默认 Accept/Content-Type 头模式无可靠出处，未纳入判定。
+- IOC 与本机扫描结果不绑定案件记录（案件页已移除）。
+- 仍为 NOT_RUN：真实 RDP 目标端到端采集、真实 SQL Server 实例、VM/实机的隐藏模块/隐藏进程真实命中、以及本波新页面中未进 CDP 巡页的截图。
 
 ### 不纳入范围
 
