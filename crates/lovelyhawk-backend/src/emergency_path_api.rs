@@ -1435,7 +1435,7 @@ impl EmergencyPathApi {
             EmergencyPathAction::Quarantine => {
                 let metadata = timeout(
                     INSPECT_DEADLINE,
-                    self.services.sftp().metadata(&session, path, false),
+                    self.services.sftp().metadata(session, path, false),
                 )
                 .await
                 .map_err(|_| EmergencyPathApiError::Deadline)?
@@ -1448,7 +1448,7 @@ impl EmergencyPathApi {
                 if metadata.kind == SftpFileKind::File && metadata.size <= MAX_EDIT_BYTES {
                     let content = timeout(
                         INSPECT_DEADLINE,
-                        self.services.sftp().read_file(&session, path),
+                        self.services.sftp().read_file(session, path),
                     )
                     .await
                     .map_err(|_| EmergencyPathApiError::Deadline)?

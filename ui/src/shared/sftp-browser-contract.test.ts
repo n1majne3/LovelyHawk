@@ -23,6 +23,7 @@ const directory: SftpDirectorySnapshot = {
   observedEntryCount: 4,
   displayedEntryCount: 4,
   truncated: false,
+  degradedSftp: false,
   entries: [
     { entryHandle: "opaque-dir", name: "etc", nameTruncated: false,
       kind: "directory", action: "browse", sizeBytes: "4096", modifiedAt: "2026-08-24T10:00:00+00:00", mode: "0755", ownerId: 0, groupId: 0 },
@@ -87,6 +88,9 @@ describe("sftp browser standalone contract", () => {
     const invalidDate = structuredClone(directory);
     invalidDate.entries[0]!.modifiedAt = "not-a-date";
     expect(isSftpDirectorySnapshot(invalidDate)).toBe(false);
+    expect(isSftpDirectorySnapshot({ ...directory, degradedSftp: "yes" })).toBe(false);
+    expect(isSftpDirectorySnapshot({ ...directory, degradedSftp: undefined })).toBe(false);
+    expect(isSftpDirectorySnapshot({ ...directory, degradedSftp: true })).toBe(true);
     expect(isSftpDirectorySnapshot({ ...directory, entries: Array.from({ length: 129 }, (_, index) => ({
       ...directory.entries[1]!, entryHandle: `opaque-${index}`,
     })), displayedEntryCount: 129, observedEntryCount: 129 })).toBe(false);

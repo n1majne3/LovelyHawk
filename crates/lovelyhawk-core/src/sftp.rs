@@ -169,6 +169,14 @@ pub enum SftpFileKind {
     Other,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SftpTransport {
+    Sftp,
+    /// No `Subsystem sftp` on the target: listings run over an exec channel
+    /// and transfers over the `scp` wire protocol.
+    ExecFallback,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SftpMetadata {
     pub size: u64,
@@ -509,6 +517,28 @@ impl SftpService {
                     .collect()
             }
             response => Err(unexpected_response("list", response)),
+        }
+    }
+
+    /// Whether this session is speaking real SFTP or has degraded to the
+    /// exec/SCP fallback on a target without the subsystem. Probed with a
+    /// one-shot request; on a missing subsystem the first failed open is
+    /// remembered, so the probe itself costs little afterwards.
+    pub async fn transport(&self, session: &BoundSftpSession) -> CoreResult<SftpTransport> {
+        match self
+            .request(
+                session,
+                SftpRequest::Exists {
+                    path: "/".to_owned(),
+                },
+            )
+            .await
+        {
+            Ok(_) => Ok(SftpTransport::Sftp),
+            Err(error) if crate::ssh::sftp_subsystem_missing(&error) => {
+                Ok(SftpTransport::ExecFallback)
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -2137,6 +2167,10 @@ const OPERATION_FAILURE_ADVICE: &[(&[&str], &str)] = &[
     (
         &[TRANSFER_CANCELLED],
         "传输已取消，写到一半的文件已经删除，没有留下不完整的文件。",
+    ),
+    (
+        &["request SFTP subsystem"],
+        "目标没有 SFTP 子系统：无法改名、调整权限、删除或做递归操作；列目录经命令回退完成，文件下载上传经 SCP 通道完成。",
     ),
     (
         // Two different machines, two different complaints, one next step: a

@@ -18,7 +18,7 @@ use lovelyhawk_core::{
     path_guard::PathGuard,
     sftp::{
         ArchiveFormat, BoundSftpSession, MAX_DIRECTORY_ENTRIES, RemotePath, SftpEntry,
-        SftpFileKind, SftpMutation, SftpPlannedOperation, SftpTransferCancel,
+        SftpFileKind, SftpMutation, SftpPlannedOperation, SftpTransferCancel, SftpTransport,
     },
     ssh::{BoundSshSession, SFTP_HANDSHAKE_OPERATION},
     target::TargetGuard,
@@ -166,6 +166,7 @@ impl SftpBrowserApi {
         let _permit = self.begin_open(&scope)?;
         let session = self.bind_sftp(&scope).await?;
         self.validate_binding(&scope)?;
+        let degraded_sftp = self.sftp_degraded(&session).await?;
         let root = RemotePath::new("/").map_err(|_| SftpBrowserApiError::InvalidListing)?;
         let entries = timeout(LIST_DEADLINE, self.services.sftp().list(&session, &root))
             .await
@@ -174,7 +175,9 @@ impl SftpBrowserApi {
         validate_sftp_session(&scope, &session)?;
 
         let now = Instant::now();
-        let (browser, dto) = BrowserSnapshot::from_root(scope.clone(), entries, now)?;
+        let (mut browser, mut dto) = BrowserSnapshot::from_root(scope.clone(), entries, now)?;
+        browser.degraded_sftp = degraded_sftp;
+        dto.degraded_sftp = degraded_sftp;
         ensure_serialized_bound(&dto, MAX_DIRECTORY_RESPONSE_BYTES)?;
         let browser_handle = browser.browser_handle.clone();
         let browser_token = browser.token;
@@ -194,6 +197,17 @@ impl SftpBrowserApi {
             revision,
         )?;
         Ok(dto)
+    }
+
+    /// True when the target has no SFTP subsystem and file features run
+    /// through the exec/SCP fallback instead.
+    async fn sftp_degraded(&self, session: &BoundSftpSession) -> Result<bool, SftpBrowserApiError> {
+        Ok(matches!(
+            timeout(LIST_DEADLINE, self.services.sftp().transport(session))
+                .await
+                .map_err(|_| SftpBrowserApiError::Deadline)??,
+            SftpTransport::ExecFallback
+        ))
     }
 
     /// Used only after a domain snapshot authorizes this exact file. It creates
@@ -250,6 +264,7 @@ impl SftpBrowserApi {
         let parent = RemotePath::new(if parent.is_empty() { "/" } else { parent })
             .map_err(|_| SftpBrowserApiError::EntryUnavailable)?;
         let name = name.to_owned();
+        let degraded_sftp = self.sftp_degraded(&session).await?;
         let now = Instant::now();
         let (mut browser, dto) = BrowserSnapshot::from_directory(
             scope.clone(),
@@ -262,6 +277,7 @@ impl SftpBrowserApi {
             now,
         )?;
         browser.editor_only = true;
+        browser.degraded_sftp = degraded_sftp;
         let entry = dto
             .entries
             .first()
@@ -297,6 +313,7 @@ impl SftpBrowserApi {
         let session = self.bind_sftp(&scope).await?;
         self.validate_binding(&scope)?;
         self.verify_operation(&access)?;
+        let degraded_sftp = self.sftp_degraded(&session).await?;
         let entries = timeout(
             LIST_DEADLINE,
             self.services.sftp().list(&session, &access.node.path),
@@ -309,7 +326,7 @@ impl SftpBrowserApi {
 
         let receipt = {
             let mut registry = self.lock_registry()?;
-            registry.apply_listing(&access, entries, Instant::now())?
+            registry.apply_listing(&access, entries, degraded_sftp, Instant::now())?
         };
         if ensure_serialized_bound(&receipt.dto, MAX_DIRECTORY_RESPONSE_BYTES).is_err() {
             self.invalidate_browser(&access.browser_handle);
@@ -626,8 +643,14 @@ impl From<CoreError> for SftpBrowserApiError {
         }
         // Worth its own answer: "this target does not offer SFTP" is something
         // an operator can act on, and it is nothing like "the browser broke".
-        if matches!(&error, CoreError::Ssh { operation, .. } if *operation == SFTP_HANDSHAKE_OPERATION)
-        {
+        // The exec/SCP fallback surfaces the absent subsystem under the
+        // request operation name for everything it cannot answer.
+        if matches!(
+            &error,
+            CoreError::Ssh { operation, .. }
+                if *operation == SFTP_HANDSHAKE_OPERATION
+                    || *operation == "request SFTP subsystem"
+        ) {
             return Self::SubsystemUnavailable;
         }
         Self::Core
@@ -691,6 +714,10 @@ pub(crate) struct SftpDirectoryDto {
     pub(crate) displayed_entry_count: u32,
     pub(crate) truncated: bool,
     pub(crate) entries: Vec<SftpBrowserEntryDto>,
+    /// True when the target has no SFTP subsystem and this listing was read
+    /// through the exec/SCP fallback: read-only browsing plus plain transfers,
+    /// no rename, chmod, delete or recursive operations.
+    pub(crate) degraded_sftp: bool,
 }
 
 #[derive(Serialize)]
@@ -836,6 +863,7 @@ struct BrowserSnapshot {
     last_used_at: Instant,
     stored_bytes: usize,
     editor_only: bool,
+    degraded_sftp: bool,
 }
 
 impl BrowserSnapshot {
@@ -888,6 +916,7 @@ impl BrowserSnapshot {
             last_used_at: now,
             stored_bytes: 0,
             editor_only: false,
+            degraded_sftp: false,
         };
         let dto = browser.refresh_directory(&root_handle, entries, now)?;
         Ok((browser, dto))
@@ -1033,6 +1062,7 @@ impl BrowserSnapshot {
             observed_entry_count,
             displayed_entry_count,
             truncated,
+            degraded_sftp: self.degraded_sftp,
             entries: entries.into_iter().map(StoredNode::dto).collect(),
         })
     }
@@ -1398,6 +1428,7 @@ impl SftpBrowserRegistry {
         &mut self,
         access: &OperationAccess,
         entries: Vec<SftpEntry>,
+        degraded_sftp: bool,
         now: Instant,
     ) -> Result<DirectoryReceipt, SftpBrowserApiError> {
         self.verify_operation(access, now)?;
@@ -1407,6 +1438,7 @@ impl SftpBrowserRegistry {
             .cloned()
             .ok_or(SftpBrowserApiError::BrowserStale)?;
         let mut candidate = current.clone();
+        candidate.degraded_sftp = degraded_sftp;
         let dto = candidate.refresh_directory(&access.node.handle, entries, now)?;
         let projected_total = self
             .total_bytes()
@@ -2760,6 +2792,7 @@ mod tests {
             .apply_listing(
                 &access,
                 vec![entry("/etc", "config", SftpFileKind::File)],
+                false,
                 now + Duration::from_millis(1),
             )
             .unwrap();
@@ -2781,6 +2814,7 @@ mod tests {
             .apply_listing(
                 &access,
                 vec![entry("/etc", "config", SftpFileKind::File)],
+                false,
                 now + Duration::from_millis(3),
             )
             .unwrap();

@@ -44,6 +44,7 @@ const root: SftpDirectorySnapshot = {
   observedEntryCount: entries.length,
   displayedEntryCount: entries.length,
   truncated: false,
+  degradedSftp: false,
   entries,
 };
 

@@ -6167,7 +6167,7 @@ fn sftp_browser_failure(error: SftpBrowserApiError) -> RpcFailure {
         SftpBrowserApiError::SubsystemUnavailable => RpcFailure {
             operation: "start the SFTP subsystem on the target",
             code: "sftp-browser-subsystem-unavailable",
-            public_message: "The target did not complete the SFTP handshake.",
+            public_message: "The target has no SFTP subsystem: directory listing and SCP transfers work, but rename, chmod, delete and recursive operations are unavailable.",
             source: None,
         },
         SftpBrowserApiError::Deadline => RpcFailure {

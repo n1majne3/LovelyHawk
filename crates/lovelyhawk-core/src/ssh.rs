@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -2264,6 +2265,9 @@ impl fmt::Debug for SessionHandle {
 struct SftpChannelCache {
     idle: Mutex<Option<SftpSession>>,
     cancellation: CancellationToken,
+    /// Set the first time the subsystem open fails with the absent-subsystem
+    /// shape; later requests skip the doomed open and fall back directly.
+    subsystem_missing: AtomicBool,
 }
 
 impl fmt::Debug for SftpChannelCache {
@@ -2299,6 +2303,7 @@ impl SessionData {
             sftp: Arc::new(SftpChannelCache {
                 idle: Mutex::new(None),
                 cancellation: cancellation.token(),
+                subsystem_missing: AtomicBool::new(false),
             }),
             cancellation,
             pending: Arc::new(Semaphore::new(SESSION_OPERATION_CAPACITY)),
@@ -3157,12 +3162,25 @@ async fn sftp_on_handle(
                 .take();
             let sftp = match cached {
                 Some(sftp) => sftp,
-                None => match open_sftp(&handle).await {
-                    Ok(sftp) => sftp,
-                    Err(error) => {
-                        return scp_fallback_on_handle(&handle, error, Box::new(request)).await;
+                None => {
+                    if cache.subsystem_missing.load(Ordering::SeqCst) {
+                        return scp_fallback_on_handle(
+                            &handle,
+                            CoreError::ssh("request SFTP subsystem", "subsystem unavailable"),
+                            Box::new(request),
+                        )
+                        .await;
                     }
-                },
+                    match open_sftp(&handle).await {
+                        Ok(sftp) => sftp,
+                        Err(error) => {
+                            if sftp_subsystem_missing(&error) {
+                                cache.subsystem_missing.store(true, Ordering::SeqCst);
+                            }
+                            return scp_fallback_on_handle(&handle, error, Box::new(request)).await;
+                        }
+                    }
+                }
             };
             let result = sftp_request(&sftp, request).await;
             if result.is_ok()
@@ -4171,7 +4189,7 @@ async fn open_sftp(handle: &Handle<ClientHandler>) -> CoreResult<SftpSession> {
 
 /// Whether the failed subsystem open is the absence-of-SFTP shape that the
 /// fallback answers, as opposed to a dead session or a refused channel.
-fn sftp_subsystem_missing(error: &CoreError) -> bool {
+pub(crate) fn sftp_subsystem_missing(error: &CoreError) -> bool {
     matches!(
         error,
         CoreError::Ssh { operation, .. }
@@ -4490,11 +4508,295 @@ async fn scp_fallback_on_handle(
         } => scp_collect_evidence(handle, &remote_path, destination, progress)
             .await
             .map(SftpResponse::FileEvidence),
+        SftpRequest::List {
+            path,
+            maximum_entries,
+        } => exec_list_directory(handle, &path, maximum_entries)
+            .await
+            .map(SftpResponse::Entries),
+        SftpRequest::Metadata {
+            path,
+            follow_symlink,
+        } => exec_metadata(handle, &path, follow_symlink)
+            .await
+            .map(SftpResponse::Metadata),
         _ => Err(CoreError::ssh(
             "request SFTP subsystem",
-            "目标没有 SFTP 子系统：目录浏览与文件修改不可用；应急留证采集仍可通过 SCP 通道完成",
+            "目标没有 SFTP 子系统：无法改名、调整权限、删除或做递归操作；列目录经命令回退完成，文件下载上传经 SCP 通道完成",
         )),
     }
+}
+
+/// How long one exec-channel listing or stat may run before it is given up.
+const EXEC_LISTING_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The fixed script behind the exec listing. The only variable is the
+/// directory, passed through the shell-escape boundary. GNU `ls` answers with
+/// `--full-time`; everything else — BusyBox included — walks a `stat -c`
+/// loop that prints one `LH`-tagged record per entry. Every line the parser
+/// does not recognise is treated as stderr noise and skipped.
+fn exec_listing_command(path: &str) -> String {
+    format!(
+        "d={}; if [ ! -d \"$d\" ]; then echo 'LH-NOTDIR'; exit 3; fi; \
+         out=$(ls -la --full-time -- \"$d\" 2>/dev/null) && {{ echo 'LH-LS'; printf '%s\\n' \"$out\"; }} || \
+         for f in \"$d\"/.[!.]* \"$d\"/..?* \"$d\"/*; do \
+         [ -e \"$f\" ] || [ -L \"$f\" ] || continue; \
+         m=$(stat -c '%f %s %Y %u %g' -- \"$f\" 2>/dev/null) || continue; \
+         printf 'LH %s %s\\n' \"$m\" \"${{f#$d/}}\"; \
+         done",
+        crate::shell_escape::shq(path)
+    )
+}
+
+async fn exec_list_directory(
+    handle: &Handle<ClientHandler>,
+    path: &str,
+    maximum_entries: usize,
+) -> CoreResult<Vec<SftpRawEntry>> {
+    let output = execute_command(handle, exec_listing_command(path), EXEC_LISTING_TIMEOUT).await?;
+    if output.timed_out {
+        return Err(CoreError::ssh(
+            "exec directory listing",
+            "目标命令超时，目录列表不可用",
+        ));
+    }
+    parse_exec_listing(path, &output.output, maximum_entries)
+}
+
+fn exec_metadata_command(path: &str, follow_symlink: bool) -> String {
+    let option = if follow_symlink { "-L " } else { "" };
+    format!(
+        "stat {option}-c 'LH %f %s %Y %u %g' -- {}",
+        crate::shell_escape::shq(path)
+    )
+}
+
+async fn exec_metadata(
+    handle: &Handle<ClientHandler>,
+    path: &str,
+    follow_symlink: bool,
+) -> CoreResult<SftpRawMetadata> {
+    let output = execute_command(
+        handle,
+        exec_metadata_command(path, follow_symlink),
+        EXEC_LISTING_TIMEOUT,
+    )
+    .await?;
+    if output.timed_out {
+        return Err(CoreError::ssh(
+            "exec metadata",
+            "目标命令超时，文件属性不可用",
+        ));
+    }
+    for line in output.output.lines() {
+        if let Some(record) = line.strip_prefix("LH ") {
+            let (metadata, _) = parse_stat_record(record)?;
+            return Ok(metadata);
+        }
+    }
+    Err(CoreError::ssh(
+        "exec metadata",
+        format!("目标上没有该路径或 stat 不可用：{}", output.output.trim()),
+    ))
+}
+
+/// `LH <raw-mode-hex> <size> <mtime-epoch> <uid> <gid> [name]`
+fn parse_stat_record(record: &str) -> CoreResult<(SftpRawMetadata, &str)> {
+    let mut fields = record.splitn(6, ' ');
+    let raw_mode = u32::from_str_radix(next_field(&mut fields, "stat mode")?, 16)
+        .map_err(|_| invalid_stat("mode"))?;
+    let size = next_field(&mut fields, "stat size")?
+        .parse::<u64>()
+        .map_err(|_| invalid_stat("size"))?;
+    let mtime = next_field(&mut fields, "stat mtime")?
+        .parse::<u32>()
+        .map_err(|_| invalid_stat("mtime"))?;
+    let uid = next_field(&mut fields, "stat uid")?
+        .parse::<u32>()
+        .map_err(|_| invalid_stat("uid"))?;
+    let gid = next_field(&mut fields, "stat gid")?
+        .parse::<u32>()
+        .map_err(|_| invalid_stat("gid"))?;
+    let name = fields.next().unwrap_or_default();
+    const FILE_TYPE: u32 = 0o170000;
+    let metadata = SftpRawMetadata {
+        size,
+        permissions: Some(raw_mode & 0o7777),
+        uid: Some(uid),
+        gid: Some(gid),
+        modified_unix_seconds: Some(mtime),
+        is_file: raw_mode & FILE_TYPE == 0o100000,
+        is_directory: raw_mode & FILE_TYPE == 0o040000,
+        is_symlink: raw_mode & FILE_TYPE == 0o120000,
+    };
+    Ok((metadata, name))
+}
+
+fn invalid_stat(field: &'static str) -> CoreError {
+    CoreError::ssh(
+        "exec directory listing",
+        format!("unparseable stat field: {field}"),
+    )
+}
+
+fn next_field<'a>(
+    fields: &mut impl Iterator<Item = &'a str>,
+    subject: &'static str,
+) -> CoreResult<&'a str> {
+    fields
+        .next()
+        .filter(|field| !field.is_empty())
+        .ok_or_else(|| invalid_stat(subject))
+}
+
+/// One `ls -la --full-time` row: permissions, links, owner, group, size,
+/// `YYYY-MM-DD`, `HH:MM:SS.fffffffff`, timezone, then the name — which may
+/// itself contain spaces, so it is the remainder after eight fields.
+fn parse_gnu_ls_entry(path: &str, line: &str) -> CoreResult<Option<SftpRawEntry>> {
+    const FIXED_FIELDS: usize = 8;
+    let mut fields = Vec::with_capacity(FIXED_FIELDS);
+    let mut start = 0_usize;
+    for _ in 0..FIXED_FIELDS {
+        let rest = &line[start..];
+        let lead = rest.len() - rest.trim_start().len();
+        let token_start = start + lead;
+        let token_end = line[token_start..]
+            .find(char::is_whitespace)
+            .map(|offset| token_start + offset)
+            .unwrap_or(line.len());
+        fields.push(&line[token_start..token_end]);
+        start = token_end;
+    }
+    let name = line[start..].trim();
+    if fields.len() < FIXED_FIELDS || name.is_empty() {
+        return Ok(None);
+    }
+    let permissions = fields[0];
+    if permissions.len() < 10 {
+        return Ok(None);
+    }
+    let name = name
+        .rsplit_once(" -> ")
+        .map_or(name, |(name, _)| name)
+        .trim_end_matches('/');
+    let kind = permissions
+        .chars()
+        .next()
+        .ok_or_else(|| invalid_stat("type"))?;
+    let mode = parse_perm_string(&permissions[..10])?;
+    let size = fields[4].parse::<u64>().unwrap_or(0);
+    let modified = DateTime::parse_from_str(
+        &format!("{} {} {}", fields[5], fields[6], fields[7]),
+        "%Y-%m-%d %H:%M:%S%.f %z",
+    )
+    .ok()
+    .and_then(|moment| u32::try_from(moment.timestamp()).ok());
+    let uid = fields[2].parse::<u32>().ok();
+    let gid = fields[3].parse::<u32>().ok();
+    let entry_path = if path == "/" {
+        format!("/{name}")
+    } else {
+        format!("{path}/{name}")
+    };
+    Ok(Some(SftpRawEntry {
+        name: name.to_owned(),
+        path: entry_path,
+        metadata: SftpRawMetadata {
+            size,
+            permissions: Some(mode),
+            uid,
+            gid,
+            modified_unix_seconds: modified,
+            is_file: kind == '-',
+            is_directory: kind == 'd',
+            is_symlink: kind == 'l',
+        },
+    }))
+}
+
+/// `-rwxr-sr-t` style permission strings, including suid/sgid/sticky letters.
+fn parse_perm_string(text: &str) -> CoreResult<u32> {
+    let chars = text.chars().collect::<Vec<_>>();
+    if chars.len() != 10 {
+        return Err(invalid_stat("permissions"));
+    }
+    let mut mode = 0_u32;
+    for (index, &character) in chars.iter().enumerate().skip(1) {
+        let group = (index - 1) / 3;
+        let position = (index - 1) % 3;
+        let shift = (2 - group) * 3;
+        mode |= match (position, character) {
+            (0, 'r') => 0o4 << shift,
+            (1, 'w') => 0o2 << shift,
+            (2, 'x') => 0o1 << shift,
+            (2, 's' | 'S') if group < 2 => {
+                let special = if group == 0 { 0o4000 } else { 0o2000 };
+                special | (u32::from(character == 's') << shift)
+            }
+            (2, 't' | 'T') if group == 2 => 0o1000 | u32::from(character == 't'),
+            _ => 0,
+        };
+    }
+    Ok(mode)
+}
+
+fn parse_exec_listing(
+    path: &str,
+    output: &str,
+    maximum_entries: usize,
+) -> CoreResult<Vec<SftpRawEntry>> {
+    let mut entries = Vec::new();
+    for line in output.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() || line.starts_with("total ") || line == "LH-LS" {
+            continue;
+        }
+        if line == "LH-NOTDIR" {
+            return Err(CoreError::validation(
+                "SFTP directory path",
+                "must be a non-symlink directory",
+            ));
+        }
+        let entry = if let Some(record) = line.strip_prefix("LH ") {
+            let (metadata, name) = parse_stat_record(record)?;
+            if name.is_empty() || name.contains('/') || name.chars().any(char::is_control) {
+                continue;
+            }
+            SftpRawEntry {
+                name: name.to_owned(),
+                path: if path == "/" {
+                    format!("/{name}")
+                } else {
+                    format!("{path}/{name}")
+                },
+                metadata,
+            }
+        } else if matches!(
+            line.chars().next(),
+            Some('-' | 'd' | 'l' | 'p' | 's' | 'c' | 'b')
+        ) {
+            match parse_gnu_ls_entry(path, line)? {
+                Some(entry)
+                    if !entry.name.chars().any(char::is_control)
+                        && entry.name != "."
+                        && entry.name != ".." =>
+                {
+                    entry
+                }
+                _ => continue,
+            }
+        } else {
+            continue;
+        };
+        if entries.len() >= maximum_entries {
+            return Err(CoreError::validation(
+                "SFTP directory",
+                format!("contains more than {maximum_entries} entries"),
+            ));
+        }
+        entries.push(entry);
+    }
+    Ok(entries)
 }
 
 async fn sftp_request(sftp: &SftpSession, request: SftpRequest) -> CoreResult<SftpResponse> {
@@ -8329,5 +8631,91 @@ mod tests {
         drop(ssh);
         let _ = std::fs::remove_dir_all(local_root);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod exec_listing_tests {
+    use super::*;
+
+    const GNU_LISTING: &str = "LH-LS\ntotal 16\n\
+        drwxr-xr-x  2 root root 4096 2026-11-12 08:38:12.123456789 +0000 etc\n\
+        -rwxr-xr-x  1 1000 staff   42 2026-01-01 00:00:00.000000000 +0000 a file.sh\n\
+        lrwxrwxrwx  1 root root    7 2026-06-30 23:59:59.000000000 +0000 latest -> target\n";
+
+    const BUSYBOX_LISTING: &str = "LH 41ed 4096 1763000000 0 0 etc\n\
+        LH 81f4 42 1700000000 1000 1000 a file.sh\n\
+        LH a1ff 7 1750000000 0 0 latest\n";
+
+    #[test]
+    fn gnu_full_time_rows_parse_into_entries() {
+        let entries = parse_exec_listing("/data", GNU_LISTING, 128).unwrap();
+        assert_eq!(entries.len(), 3);
+        let dir = &entries[0];
+        assert_eq!((dir.name.as_str(), dir.path.as_str()), ("etc", "/data/etc"));
+        assert!(dir.metadata.is_directory && !dir.metadata.is_file && !dir.metadata.is_symlink);
+        assert_eq!(dir.metadata.permissions, Some(0o755));
+        assert!(dir.metadata.modified_unix_seconds.is_some());
+        let file = &entries[1];
+        assert_eq!(file.name, "a file.sh");
+        assert_eq!(file.metadata.size, 42);
+        assert_eq!(file.metadata.uid, Some(1000));
+        assert_eq!(file.metadata.permissions, Some(0o755));
+        assert!(file.metadata.is_file);
+        let link = &entries[2];
+        assert_eq!(link.name, "latest");
+        assert!(link.metadata.is_symlink);
+        assert_eq!(link.metadata.permissions, Some(0o777));
+    }
+
+    #[test]
+    fn busybox_stat_rows_parse_into_entries() {
+        let entries = parse_exec_listing("/data", BUSYBOX_LISTING, 128).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert!(entries[0].metadata.is_directory && entries[0].metadata.permissions == Some(0o755));
+        assert_eq!(entries[1].name, "a file.sh");
+        assert!(entries[2].metadata.is_symlink);
+        assert_eq!(entries[2].metadata.gid, Some(0));
+        let root_entries = parse_exec_listing("/", "LH 41ed 4096 1763000000 0 0 etc", 128).unwrap();
+        assert_eq!(root_entries[0].path, "/etc");
+    }
+
+    #[test]
+    fn noise_and_missing_directory_are_not_entries() {
+        assert!(parse_exec_listing("/data", "LH-NOTDIR", 128).is_err());
+        let entries = parse_exec_listing(
+            "/data",
+            "stat: can't stat 'x': No such file or directory\nLH 81a4 5 1700000000 0 0 ok",
+            128,
+        )
+        .unwrap();
+        assert_eq!(entries.len(), 1);
+        // A hostile name carrying a newline or slash can never become an entry.
+        let hostile = "LH 81a4 5 1700000000 0 0 bad\nLH 81a4 5 1700000000 0 0 ../escape\nLH 81a4 5 1700000000 0 0 sub/file";
+        assert_eq!(parse_exec_listing("/data", hostile, 128).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_entry_cap_is_enforced() {
+        assert!(parse_exec_listing("/data", BUSYBOX_LISTING, 2).is_err());
+    }
+
+    #[test]
+    fn permission_strings_cover_special_bits() {
+        assert_eq!(parse_perm_string("-rwxr-xr-x").unwrap(), 0o755);
+        assert_eq!(parse_perm_string("drwsr-sr-t").unwrap(), 0o7755);
+        assert_eq!(parse_perm_string("-rwSr-----").unwrap(), 0o4640);
+        assert!(parse_perm_string("-rwxr-xr-").is_err());
+    }
+
+    #[test]
+    fn exec_listing_command_quotes_the_directory_and_nothing_else() {
+        let command = exec_listing_command("/tmp/it's-a dir");
+        assert!(
+            command.contains(&crate::shell_escape::shq("/tmp/it's-a dir")),
+            "{command}"
+        );
+        assert!(command.contains("stat -c"));
+        assert!(command.contains("ls -la --full-time"));
     }
 }

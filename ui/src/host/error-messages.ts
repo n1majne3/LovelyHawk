@@ -215,7 +215,7 @@ export const BACKEND_ERROR_MESSAGES: Readonly<Record<string, string>> = Object.f
   "sftp-browser-invalid": "文件管理请求不正确，操作没有执行。",
   "sftp-browser-invalid-response": "目标返回的文件信息格式异常，已丢弃。",
   "sftp-browser-operation-failed": "文件操作没有完成，详细原因见应用日志。",
-  "sftp-browser-subsystem-unavailable": "目标主机没有完成 SFTP 握手，可能未启用 SFTP。",
+  "sftp-browser-subsystem-unavailable": "目标没有 SFTP 子系统：可以浏览目录并通过 SCP 下载或上传，但无法改名、调整权限、删除或做递归操作。",
   "sftp-browser-timeout": "文件操作超出时限，请刷新后核对结果。",
   "sftp-browser-cancelled": "传输已取消，写到一半的文件已经删除，没有留下不完整的文件。",
   "sftp-browser-unavailable": "这个目录或文件入口已过期，请刷新。",

@@ -802,6 +802,9 @@ export function SftpBrowserPage({
               </footer>
             </section>
           </div>
+          {directory.degradedSftp && <p className="sftp-browser-warning sftp-browser-degraded" role="status" data-testid="sftp-degraded-banner">
+            目标没有 SFTP 子系统，文件管理为只读降级模式：可以浏览目录，并通过 SCP 通道下载或上传文件；改名、权限调整、删除与递归操作不可用。
+          </p>}
           {directory.truncated && <p className="sftp-browser-warning" role="status">
             目录共有 {directory.observedEntryCount} 项，当前只显示前 {directory.displayedEntryCount} 项。
           </p>}

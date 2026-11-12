@@ -30,6 +30,8 @@ export interface SftpDirectorySnapshot {
   displayedEntryCount: number;
   truncated: boolean;
   entries: SftpBrowserEntry[];
+  /** The target has no SFTP subsystem: read-only exec listing, SCP transfers. */
+  degradedSftp: boolean;
 }
 
 export interface SftpTextPreview {
@@ -270,7 +272,7 @@ export function isSftpDirectorySnapshot(value: unknown): value is SftpDirectoryS
   if (!record(value) || !exact(value, [
     "browserHandle", "directoryHandle", "parentDirectoryHandle", "directoryLabel",
     "directoryLabelTruncated", "expiresInSeconds", "observedEntryCount",
-    "displayedEntryCount", "truncated", "entries",
+    "displayedEntryCount", "truncated", "entries", "degradedSftp",
   ]) || !isSftpBrowserOpaqueHandle(value.browserHandle) ||
     !isSftpBrowserOpaqueHandle(value.directoryHandle) ||
     !(value.parentDirectoryHandle === null || isSftpBrowserOpaqueHandle(value.parentDirectoryHandle)) ||
@@ -279,6 +281,7 @@ export function isSftpDirectorySnapshot(value: unknown): value is SftpDirectoryS
     !unsigned(value.expiresInSeconds, 300) || value.expiresInSeconds === 0 ||
     !unsigned(value.observedEntryCount, 50_000) || !unsigned(value.displayedEntryCount, 128) ||
     typeof value.truncated !== "boolean" || !Array.isArray(value.entries) ||
+    typeof value.degradedSftp !== "boolean" ||
     value.entries.length !== value.displayedEntryCount || !value.entries.every(entry) ||
     value.displayedEntryCount > value.observedEntryCount ||
     value.truncated !== (value.observedEntryCount > value.displayedEntryCount) ||

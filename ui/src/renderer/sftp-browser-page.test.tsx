@@ -99,6 +99,15 @@ describe("SftpBrowserPage", () => {
     expect(empty).toContain("目录为空");
   });
 
+  it("shows the degraded read-only banner only when the snapshot marks it", () => {
+    const source = readFileSync(new URL("./SftpBrowserPage.tsx", import.meta.url), "utf8");
+    expect(source).toContain("directory.degradedSftp");
+    expect(source).toContain("sftp-degraded-banner");
+    expect(source).toContain("目标没有 SFTP 子系统，文件管理为只读降级模式");
+    // The banner is rendered only inside the directory view, behind the flag.
+    expect(source).toContain("directory.degradedSftp &&");
+  });
+
   it("renders hostile preview content as escaped pre text without hiding anything", () => {
     const html = renderToStaticMarkup(<SftpTextPreviewView preview={preview} />);
     expect(html).toContain("&lt;/pre&gt;&lt;script&gt;steal()&lt;/script&gt;");

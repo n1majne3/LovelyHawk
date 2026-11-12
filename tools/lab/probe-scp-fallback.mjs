@@ -60,8 +60,43 @@ try {
   const binding = connected.bindingHandle;
   check("connects to a host with no SFTP subsystem", true);
 
-  const browser = await sidecar.call("sftp-browser.open", { bindingHandle: binding }).then(() => "opened", (error) => String(error.message ?? error));
-  check("sftp browser still reports the subsystem gap honestly", browser !== "opened");
+  const browser = await sidecar.call("sftp-browser.open", { bindingHandle: binding });
+  check("browser opens degraded on a host with no SFTP subsystem", browser.degradedSftp === true);
+  const rootDir = (browser.entries ?? []).find((e) => e.name === "root" && e.kind === "directory");
+  check("root listing arrives through the exec fallback", Boolean(rootDir));
+
+  const rootList = await sidecar.call("sftp-browser.directory.list",
+    { bindingHandle: binding, browserHandle: browser.browserHandle, directoryHandle: rootDir.entryHandle });
+  check("degraded listing stays degraded inside /root", rootList.degradedSftp === true);
+  const sampleEntry = (rootList.entries ?? []).find((e) => e.name === "scp-evidence.bin");
+  check("exec listing finds the planted file with its mode", sampleEntry?.kind === "file" && sampleEntry.mode === "4700");
+
+  const downloadPath = path.join(exportsRoot, "scp-download.bin");
+  await sidecar.call("sftp-browser.download",
+    { bindingHandle: binding, browserHandle: browser.browserHandle, fileHandle: sampleEntry.entryHandle, localPath: downloadPath });
+  check("browser download moves the bytes over scp", fs.readFileSync(downloadPath).equals(sample));
+
+  const uploadPath = path.join(dataRoot, "scp-upload.txt");
+  fs.writeFileSync(uploadPath, "scp upload payload\n");
+  const staged = await sidecar.call("sftp-browser.upload.stage",
+    { bindingHandle: binding, localPath: uploadPath, name: "scp-upload.txt" });
+  const uploadPlan = await sidecar.call("sftp-browser.operation.plan",
+    { bindingHandle: binding, browserHandle: browser.browserHandle, kind: "upload",
+      entryHandles: [rootList.directoryHandle], stagedHandle: staged.stagedHandle, name: "scp-uploaded.txt" });
+  await sidecar.call("sftp-browser.operation.confirm", { bindingHandle: binding, planHandle: uploadPlan.planHandle });
+  await sidecar.call("sftp-browser.operation.execute", { bindingHandle: binding, planHandle: uploadPlan.planHandle });
+  check("browser upload lands over scp", onHost("cat", "/root/scp-uploaded.txt") === "scp upload payload");
+
+  const renamePlan = await sidecar.call("sftp-browser.operation.plan",
+    { bindingHandle: binding, browserHandle: browser.browserHandle, kind: "rename",
+      entryHandles: [sampleEntry.entryHandle], name: "renamed.bin" });
+  await sidecar.call("sftp-browser.operation.confirm", { bindingHandle: binding, planHandle: renamePlan.planHandle });
+  const renameReceipt = await sidecar.call("sftp-browser.operation.execute",
+    { bindingHandle: binding, planHandle: renamePlan.planHandle }).then((receipt) => receipt, (error) => String(error.message ?? error));
+  console.log(`rename receipt: ${JSON.stringify(renameReceipt)}`);
+  check("rename is refused with the degraded-mode message",
+    renameReceipt.passed === false && String(renameReceipt.detail).includes("没有 SFTP 子系统"));
+  check("no rename side effect happened", onHost("sh", "-c", "test ! -e /root/renamed.bin && test -f /root/scp-evidence.bin && echo STAYED") === "STAYED");
 
   const catalog = await sidecar.call("emergency-command.catalog.load", { bindingHandle: binding });
   const suid = catalog.commands.find((c) => c.title === "SUID 可执行");
