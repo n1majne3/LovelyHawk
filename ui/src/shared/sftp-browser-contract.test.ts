@@ -12,6 +12,9 @@ import {
   isSftpOperationUndoResult,
   isSftpQueueEnqueueResult,
   isSftpQueueItem,
+  isSftpRelay,
+  isSftpRelayTarget,
+  isSftpRelayTargetList,
   isSftpTransferCancelResult,
   isSftpTransferQueue,
   isSftpTextPreview,
@@ -278,7 +281,7 @@ describe("sftp browser standalone contract", () => {
     expect(isSftpOperationUndoResult({ ...undone, path: "/etc/passwd" })).toBe(false);
   });
 
-  it("keeps the public surface at exactly twenty-four finite methods", () => {
+  it("keeps the public surface at exactly twenty-eight finite methods", () => {
     const source = readFileSync(new URL("./sftp-browser-contract.ts", import.meta.url), "utf8");
     const api = source.split("export interface SftpBrowserApi")[1]!.split("\n}")[0]!;
     expect([...api.matchAll(/^\s{2}([A-Za-z0-9]+)\(/gmu)].map((match) => match[1])).toEqual([
@@ -289,7 +292,9 @@ describe("sftp browser standalone contract", () => {
       "prepareSftpDirectoryUpload", "runSftpDirectoryUpload", "discardSftpDirectoryUpload",
       "cancelSftpTransfer",
       "queueSftpDownload", "queueSftpUpload", "pollSftpQueue", "cancelSftpQueue",
-      "retrySftpQueueItem", "setUnsavedChanges", "onBeforeClose",
+      "retrySftpQueueItem",
+      "listSftpRelayTargets", "startSftpRelay", "pollSftpRelay", "cancelSftpRelay",
+      "setUnsavedChanges", "onBeforeClose",
       "stageSftpUpload", "openFileEditor",
       "openDirectoryTerminal",
     ]);
@@ -342,5 +347,42 @@ describe("transfer queue contract", () => {
     expect(isSftpQueueEnqueueResult({ queued: true, queue: null })).toBe(false);
     expect(isSftpQueueEnqueueResult({ queued: false, queue })).toBe(false);
     expect(isSftpQueueEnqueueResult({ queued: true, queue, localPath: "/x" })).toBe(false);
+  });
+});
+
+describe("dual-host relay contract", () => {
+  const target = { connectionId: "conn-b", label: "root@10.0.0.2:22" };
+  const relay = {
+    relayHandle: "opaque-relay",
+    state: "running",
+    leg: "download",
+    doneBytes: "1024",
+    totalBytes: "4096",
+    detail: "正在取回本机。",
+  };
+
+  it("accepts a well-formed target list and relay state", () => {
+    expect(isSftpRelayTarget(target)).toBe(true);
+    expect(isSftpRelayTargetList([target])).toBe(true);
+    expect(isSftpRelayTargetList([])).toBe(true);
+    expect(isSftpRelay(relay)).toBe(true);
+    for (const state of ["running", "done", "failed", "cancelled"]) {
+      expect(isSftpRelay({ ...relay, state })).toBe(true);
+    }
+    for (const leg of ["", "download", "upload"]) {
+      expect(isSftpRelay({ ...relay, leg })).toBe(true);
+    }
+  });
+
+  it("rejects unknown fields, bad states and non-relay values", () => {
+    expect(isSftpRelayTarget({ ...target, localPath: "/x" })).toBe(false);
+    expect(isSftpRelayTarget({ ...target, credential: "pw" })).toBe(false);
+    expect(isSftpRelayTargetList(Array.from({ length: 33 }, () => target))).toBe(false);
+    expect(isSftpRelayTargetList([target, { connectionId: 7, label: "x" }])).toBe(false);
+    expect(isSftpRelay({ ...relay, state: "stalled" })).toBe(false);
+    expect(isSftpRelay({ ...relay, leg: "sideways" })).toBe(false);
+    expect(isSftpRelay({ ...relay, tempPath: "/tmp/x" })).toBe(false);
+    expect(isSftpRelay({ ...relay, doneBytes: -1 })).toBe(false);
+    expect(isSftpRelay({ ...relay, detail: "x".repeat(2048) })).toBe(false);
   });
 });

@@ -224,6 +224,8 @@ fn lane_for(method: &str) -> Lane {
         || method == "sftp-browser.queue.poll"
         || method == "sftp-browser.queue.cancel-all"
         || method == "sftp-browser.queue.retry"
+        || method == "sftp-browser.relay.poll"
+        || method == "sftp-browser.relay.cancel"
     {
         // Queue control cannot wait behind the transfers it steers.
         Lane::Control
@@ -341,6 +343,10 @@ mod tests {
             "sftp-browser.queue.poll",
             "sftp-browser.queue.cancel-all",
             "sftp-browser.queue.retry",
+            "sftp-browser.relay.targets",
+            "sftp-browser.relay.start",
+            "sftp-browser.relay.poll",
+            "sftp-browser.relay.cancel",
             "java.hot-update.class.stage",
             "application-log.export.prepare",
             "ai-history.export",

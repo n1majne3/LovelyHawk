@@ -14,16 +14,17 @@ use std::{
 
 use lovelyhawk_core::{
     BackendServices, CoreError,
+    connections::ConnectionConfig,
     local_pack::DIRECTORY_UPLOAD_TAR_OVERHEAD_BYTES,
     operations::{DangerousConfirmation, OperationState, VerificationResult},
     path_guard::PathGuard,
     sftp::{
         ArchiveFormat, BoundSftpSession, MAX_ARCHIVE_DOWNLOAD_BYTES, MAX_ARCHIVE_DOWNLOAD_FILES,
         MAX_DIRECTORY_ENTRIES, RemotePath, SftpDownloadOptions, SftpEntry, SftpFileKind,
-        SftpMutation, SftpPlannedOperation, SftpTransferCancel, SftpTransport,
+        SftpMutation, SftpPlannedOperation, SftpService, SftpTransferCancel, SftpTransport,
     },
-    ssh::{BoundSshSession, SFTP_HANDSHAKE_OPERATION},
-    target::TargetGuard,
+    ssh::{BoundSshSession, SFTP_HANDSHAKE_OPERATION, SshConnectAuthorization},
+    target::{TargetContext, TargetGuard, TargetIdentity},
 };
 use serde::Serialize;
 use tokio::time::timeout;
@@ -1059,6 +1060,16 @@ impl SftpBrowserApi {
             for queue in dead_queues {
                 queue.cancel_all();
             }
+            // Relays are scoped to the source binding; losing it throws the
+            // switch on both legs and drops the entry.
+            registry.relays.retain(|_, relay| {
+                if relay.scope.binding_handle == binding_handle {
+                    relay.cancel.cancel();
+                    false
+                } else {
+                    true
+                }
+            });
         }
     }
 
@@ -1068,6 +1079,14 @@ impl SftpBrowserApi {
             if let Some(queue) = registry.queues.remove(browser_handle) {
                 queue.cancel_all();
             }
+            registry.relays.retain(|_, relay| {
+                if relay.browser_handle == browser_handle {
+                    relay.cancel.cancel();
+                    false
+                } else {
+                    true
+                }
+            });
         }
     }
 
@@ -1684,6 +1703,8 @@ struct SftpBrowserRegistry {
     transfers: HashMap<Uuid, ActiveTransfer>,
     /// One batch transfer queue per browser window.
     queues: HashMap<String, Arc<TransferQueue>>,
+    /// File relays in flight, keyed by their opaque handle.
+    relays: HashMap<String, Arc<Relay>>,
 }
 
 impl SftpBrowserRegistry {
@@ -2204,6 +2225,16 @@ impl SftpBrowserRegistry {
                 active.insert(handle.as_str());
             }
         }
+        for relay in self.relays.values() {
+            let running = relay
+                .state
+                .lock()
+                .map(|state| state.status == RelayStatus::Running)
+                .unwrap_or(false);
+            if running {
+                active.insert(relay.browser_handle.as_str());
+            }
+        }
         self.browsers
             .retain(|handle, browser| browser.expires_at > now || active.contains(handle.as_str()));
         self.prune_operations(now);
@@ -2568,6 +2599,31 @@ pub(crate) struct SftpTransferCancelDto {
     pub(crate) cancelled: u32,
 }
 
+/// One saved connection the relay dialog may offer, minus the binding this
+/// browser is attached to.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SftpRelayTargetDto {
+    pub connection_id: String,
+    /// Display label plus host identity, e.g. "web-a（root@10.0.0.2:22）".
+    pub label: String,
+}
+
+/// A file relay between two SSH targets through a managed host temp file.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SftpRelayDto {
+    pub relay_handle: String,
+    /// running | done | failed | cancelled.
+    pub state: String,
+    /// download | upload, empty before the first leg starts.
+    pub leg: String,
+    pub done_bytes: String,
+    pub total_bytes: String,
+    /// Reason for a failed relay; the verification note for a done one.
+    pub detail: String,
+}
+
 /// What an undo did: put back and read back, or refused with the reason.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -2605,6 +2661,7 @@ struct StagedUpload {
 
 /// The most items one browser's transfer queue may hold.
 const MAX_QUEUE_ITEMS: usize = 64;
+const MAX_RELAY_TARGETS: usize = 32;
 
 /// What the page sends for each host-picked file in a queue upload.
 #[derive(Debug, Clone)]
@@ -2715,6 +2772,91 @@ fn queue_item_update(queue: &Arc<TransferQueue>, id: u64, update: impl FnOnce(&m
         && let Some(item) = items.iter_mut().find(|item| item.id == id)
     {
         update(item);
+    }
+}
+
+/// Which side of a relay is copying; the progress line names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayLeg {
+    Download,
+    Upload,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayStatus {
+    Running,
+    Done,
+    Failed,
+    Cancelled,
+}
+
+enum RelayOutcome {
+    Done,
+    Failed(String),
+    Cancelled,
+}
+
+struct RelayState {
+    status: RelayStatus,
+    leg: Option<RelayLeg>,
+    done_bytes: u64,
+    total_bytes: u64,
+    detail: String,
+}
+
+/// A single-file relay between the browser's binding and a saved peer
+/// connection. LovelyHawk keeps exactly one SSH binding at a time, so the
+/// peer side is not a binding: the relay establishes its own session for the
+/// transfer and tears it down on every outcome. The peer guard lives in a
+/// private target context, so a relay can never disturb the active target
+/// epoch — and the active epoch can never validate the peer.
+struct Relay {
+    scope: BindingScope,
+    browser_handle: String,
+    cancel: SftpTransferCancel,
+    state: Mutex<RelayState>,
+    /// The managed temp file the first leg writes; its length is the
+    /// download progress number.
+    temp_path: Mutex<Option<PathBuf>>,
+    /// The remote destination the second leg grows; its size is the upload
+    /// progress number, read through the peer session pair stored here.
+    remote_dest: Mutex<Option<RemotePath>>,
+    peer: Mutex<Option<(SftpService, BoundSftpSession)>>,
+}
+
+/// The peer-side paths the second leg checks and writes: the directory the
+/// operator picked and the exact file inside it.
+struct RelayDestination {
+    dir: RemotePath,
+    remote: RemotePath,
+}
+
+impl Drop for Relay {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+/// The managed temp file a relay leaves behind on no outcome at all.
+struct RelayTempFile(PathBuf);
+
+impl Drop for RelayTempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn relay_target_label(config: &ConnectionConfig) -> String {
+    let host = if config.host.contains(':') {
+        format!("[{}]", config.host)
+    } else {
+        config.host.clone()
+    };
+    let identity = format!("{}@{}:{}", config.username, host, config.port);
+    if config.name.is_empty() {
+        identity
+    } else {
+        format!("{}（{}）", config.name, identity)
     }
 }
 
@@ -3825,6 +3967,479 @@ impl SftpBrowserApi {
             degraded: queue.degraded,
             items,
         })
+    }
+
+    /// The browser must exist and belong to this scope for the relay entry
+    /// point to be callable at all.
+    fn require_browser(
+        &self,
+        scope: &BindingScope,
+        browser_handle: &str,
+    ) -> Result<(), SftpBrowserApiError> {
+        let mut registry = self.lock_registry()?;
+        registry.prune(Instant::now());
+        let live = registry
+            .browsers
+            .get(browser_handle)
+            .is_some_and(|browser| &browser.scope == scope);
+        if !live {
+            return Err(SftpBrowserApiError::BrowserStale);
+        }
+        Ok(())
+    }
+
+    /// Other saved connections this browser's file could be relayed to. The
+    /// peer is a connection record, not a live binding — only one binding
+    /// ever exists — so the relay opens the peer session itself.
+    pub(crate) fn relay_targets(
+        &self,
+        binding_handle: &str,
+        browser_handle: &str,
+    ) -> Result<Vec<SftpRelayTargetDto>, SftpBrowserApiError> {
+        let (_, scope) = self.capture_binding(binding_handle)?;
+        self.require_browser(&scope, browser_handle)?;
+        let views = self
+            .services
+            .connections()
+            .list()
+            .map_err(|_| SftpBrowserApiError::RegistryUnavailable)?;
+        let mut targets = views
+            .into_iter()
+            .filter(|view| view.config.id != scope.connection_id)
+            .map(|view| SftpRelayTargetDto {
+                connection_id: view.config.id.clone(),
+                label: relay_target_label(&view.config),
+            })
+            .collect::<Vec<_>>();
+        targets.sort_by(|a, b| a.label.cmp(&b.label));
+        targets.truncate(MAX_RELAY_TARGETS);
+        Ok(targets)
+    }
+
+    /// Starts a single-file relay: download through this browser's binding
+    /// into a managed temp file, then upload to the destination on a session
+    /// the relay opens against the chosen connection. EXCLUDE semantics: an
+    /// existing destination refuses before any byte moves.
+    pub(crate) async fn relay_start(
+        &self,
+        binding_handle: &str,
+        browser_handle: &str,
+        file_handle: &str,
+        connection_id: &str,
+        dest_dir: &str,
+    ) -> Result<SftpRelayDto, SftpBrowserApiError> {
+        validate_handle(file_handle)?;
+        if connection_id.is_empty() || connection_id.len() > 256 {
+            return Err(SftpBrowserApiError::InvalidHandle);
+        }
+        let dest_dir = RemotePath::new(dest_dir).map_err(|_| SftpBrowserApiError::InvalidHandle)?;
+        let (_, scope) = self.capture_binding(binding_handle)?;
+        if connection_id == scope.connection_id {
+            return Err(SftpBrowserApiError::InvalidHandle);
+        }
+        let node = {
+            let mut registry = self.lock_registry()?;
+            registry.prune(Instant::now());
+            registry.queue_entry(
+                &scope,
+                browser_handle,
+                file_handle,
+                EntryAction::Preview,
+                Instant::now(),
+            )?
+        };
+        if node.kind != SftpBrowserEntryKind::File {
+            return Err(SftpBrowserApiError::EntryUnavailable);
+        }
+        let remote_dest = dest_dir
+            .child(&node.display_name)
+            .map_err(|_| SftpBrowserApiError::InvalidHandle)?;
+        let total_bytes = node.size_bytes.parse::<u64>().unwrap_or(0);
+        let relay_handle = Uuid::new_v4().to_string();
+        let relay = Arc::new(Relay {
+            scope,
+            browser_handle: browser_handle.to_owned(),
+            cancel: SftpTransferCancel::new(),
+            state: Mutex::new(RelayState {
+                status: RelayStatus::Running,
+                leg: None,
+                done_bytes: 0,
+                total_bytes,
+                detail: String::new(),
+            }),
+            temp_path: Mutex::new(None),
+            remote_dest: Mutex::new(None),
+            peer: Mutex::new(None),
+        });
+        {
+            let mut registry = self.lock_registry()?;
+            registry
+                .relays
+                .insert(relay_handle.clone(), Arc::clone(&relay));
+        }
+        let api = self.cloned_for_task();
+        let task_relay = Arc::clone(&relay);
+        let connection_id = connection_id.to_owned();
+        tokio::spawn(async move {
+            api.run_relay(task_relay, node.path, connection_id, dest_dir, remote_dest)
+                .await;
+        });
+        self.relay_snapshot(&relay_handle, &relay).await
+    }
+
+    /// Finds a relay only when the caller holds the exact binding and
+    /// browser it was started under.
+    fn relay_lookup(
+        &self,
+        scope: &BindingScope,
+        browser_handle: &str,
+        relay_handle: &str,
+    ) -> Result<Option<Arc<Relay>>, SftpBrowserApiError> {
+        let relay = {
+            let registry = self.lock_registry()?;
+            registry.relays.get(relay_handle).map(Arc::clone)
+        };
+        match relay {
+            Some(relay) if relay.scope == *scope && relay.browser_handle == browser_handle => {
+                Ok(Some(relay))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Polls one relay; the handle answers only on the binding and browser
+    /// that started it.
+    pub(crate) async fn relay_poll(
+        &self,
+        binding_handle: &str,
+        browser_handle: &str,
+        relay_handle: &str,
+    ) -> Result<Option<SftpRelayDto>, SftpBrowserApiError> {
+        let (_, scope) = self.capture_binding(binding_handle)?;
+        match self.relay_lookup(&scope, browser_handle, relay_handle)? {
+            Some(relay) => self.relay_snapshot(relay_handle, &relay).await.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Throws the switch on both legs of one relay.
+    pub(crate) async fn relay_cancel(
+        &self,
+        binding_handle: &str,
+        browser_handle: &str,
+        relay_handle: &str,
+    ) -> Result<Option<SftpRelayDto>, SftpBrowserApiError> {
+        let (_, scope) = self.capture_binding(binding_handle)?;
+        match self.relay_lookup(&scope, browser_handle, relay_handle)? {
+            Some(relay) => {
+                relay.cancel.cancel();
+                self.relay_snapshot(relay_handle, &relay).await.map(Some)
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Builds the public state, refreshing the progress number from wherever
+    /// the active leg is writing.
+    async fn relay_snapshot(
+        &self,
+        relay_handle: &str,
+        relay: &Arc<Relay>,
+    ) -> Result<SftpRelayDto, SftpBrowserApiError> {
+        let (status, leg, mut done_bytes, total_bytes, detail) = {
+            let state = relay
+                .state
+                .lock()
+                .map_err(|_| SftpBrowserApiError::RegistryUnavailable)?;
+            (
+                state.status,
+                state.leg,
+                state.done_bytes,
+                state.total_bytes,
+                state.detail.clone(),
+            )
+        };
+        if status == RelayStatus::Running {
+            match leg {
+                Some(RelayLeg::Download) => {
+                    if let Ok(temp) = relay.temp_path.lock()
+                        && let Some(path) = temp.as_ref()
+                        && let Ok(meta) = std::fs::metadata(path)
+                    {
+                        done_bytes = if total_bytes > 0 {
+                            meta.len().min(total_bytes)
+                        } else {
+                            meta.len()
+                        };
+                    }
+                }
+                Some(RelayLeg::Upload) => {
+                    let peer = relay.peer.lock().ok().and_then(|peer| peer.clone());
+                    let dest = relay.remote_dest.lock().ok().and_then(|dest| dest.clone());
+                    if let (Some((peer_sftp, peer_session)), Some(dest)) = (peer, dest)
+                        && let Ok(Ok(meta)) = timeout(
+                            LIST_DEADLINE,
+                            peer_sftp.metadata(&peer_session, &dest, false),
+                        )
+                        .await
+                    {
+                        done_bytes = if total_bytes > 0 {
+                            meta.size.min(total_bytes)
+                        } else {
+                            meta.size
+                        };
+                    }
+                }
+                None => {}
+            }
+        }
+        Ok(SftpRelayDto {
+            relay_handle: relay_handle.to_owned(),
+            state: match status {
+                RelayStatus::Running => "running",
+                RelayStatus::Done => "done",
+                RelayStatus::Failed => "failed",
+                RelayStatus::Cancelled => "cancelled",
+            }
+            .to_owned(),
+            leg: match leg {
+                Some(RelayLeg::Download) => "download",
+                Some(RelayLeg::Upload) => "upload",
+                None => "",
+            }
+            .to_owned(),
+            done_bytes: done_bytes.to_string(),
+            total_bytes: total_bytes.to_string(),
+            detail,
+        })
+    }
+
+    /// The relay's whole lifecycle: peer session up, directory and EXCLUDE
+    /// checks, both legs, then teardown of the temp file and the peer
+    /// session on every outcome.
+    async fn run_relay(
+        &self,
+        relay: Arc<Relay>,
+        source: RemotePath,
+        connection_id: String,
+        dest_dir: RemotePath,
+        remote_dest: RemotePath,
+    ) {
+        let finish = |status: RelayStatus, detail: String| {
+            if let Ok(mut state) = relay.state.lock() {
+                state.status = status;
+                state.detail = detail;
+            }
+        };
+        if self.validate_binding(&relay.scope).is_err() {
+            finish(RelayStatus::Failed, "当前连接已失效，未能发送。".to_owned());
+            return;
+        }
+        let a_session = match self.bind_sftp(&relay.scope).await {
+            Ok(session) => session,
+            Err(_) => {
+                finish(RelayStatus::Failed, "无法连接当前主机。".to_owned());
+                return;
+            }
+        };
+        // The peer session is opened by the relay itself. A host key the
+        // operator never confirmed refuses loudly instead of silently
+        // trusting on first use.
+        let status_b = match self
+            .services
+            .ssh()
+            .connect_authorized(&connection_id, SshConnectAuthorization::default())
+            .await
+        {
+            Ok(status) => status,
+            Err(CoreError::SshHostKeyConfirmationRequired { .. }) => {
+                finish(
+                    RelayStatus::Failed,
+                    "目标主机的密钥尚未确认过：请先在主界面连接该主机一次。".to_owned(),
+                );
+                return;
+            }
+            Err(_) => {
+                finish(RelayStatus::Failed, "无法连接目标主机。".to_owned());
+                return;
+            }
+        };
+        let peer_session_id = status_b.session_id.clone();
+        let outcome = self
+            .relay_transfer(
+                &relay,
+                &a_session,
+                &source,
+                &connection_id,
+                &peer_session_id,
+                &RelayDestination {
+                    dir: dest_dir,
+                    remote: remote_dest,
+                },
+            )
+            .await;
+        let _ = self.services.ssh().disconnect(&peer_session_id).await;
+        match outcome {
+            RelayOutcome::Done => finish(RelayStatus::Done, "已送达并通过完整性核对。".to_owned()),
+            RelayOutcome::Failed(detail) => finish(RelayStatus::Failed, detail),
+            RelayOutcome::Cancelled => finish(RelayStatus::Cancelled, "已取消。".to_owned()),
+        }
+    }
+
+    async fn relay_transfer(
+        &self,
+        relay: &Arc<Relay>,
+        a_session: &BoundSftpSession,
+        source: &RemotePath,
+        connection_id: &str,
+        peer_session_id: &str,
+        destination: &RelayDestination,
+    ) -> RelayOutcome {
+        // The peer guard lives in a target context nothing else shares, so
+        // the active target epoch is untouched while every peer operation is
+        // still epoch-validated internally.
+        let peer_target = Arc::new(TargetContext::new());
+        let identity = match TargetIdentity::new(connection_id.to_owned()) {
+            Ok(identity) => identity,
+            Err(_) => return RelayOutcome::Failed("目标身份无效。".to_owned()),
+        };
+        let guard = match peer_target.activate(identity) {
+            Ok(guard) => guard,
+            Err(_) => return RelayOutcome::Failed("无法登记目标身份。".to_owned()),
+        };
+        let peer_sftp = SftpService::new(
+            self.services.ssh().clone(),
+            peer_target,
+            self.services.operation_journal().clone(),
+        );
+        let b_session = match peer_sftp.bind_session(guard, peer_session_id).await {
+            Ok(session) => session,
+            Err(_) => return RelayOutcome::Failed("无法建立目标主机的文件会话。".to_owned()),
+        };
+        if let Ok(mut peer) = relay.peer.lock() {
+            *peer = Some((peer_sftp.clone(), b_session.clone()));
+        }
+        match timeout(
+            LIST_DEADLINE,
+            peer_sftp.metadata(&b_session, &destination.dir, false),
+        )
+        .await
+        {
+            Ok(Ok(meta)) if meta.kind == SftpFileKind::Directory => {}
+            Ok(Ok(_)) => {
+                return RelayOutcome::Failed("目标路径不是目录。".to_owned());
+            }
+            _ => {
+                return RelayOutcome::Failed("目标目录不存在或无法读取。".to_owned());
+            }
+        }
+        // EXCLUDE: anything answering metadata under the destination name
+        // refuses the relay before a byte moves; the upload mutation itself
+        // refuses a name that appears after this check.
+        if let Ok(Ok(_)) = timeout(
+            LIST_DEADLINE,
+            peer_sftp.metadata(&b_session, &destination.remote, false),
+        )
+        .await
+        {
+            return RelayOutcome::Failed("目标目录已有同名文件，未覆盖。".to_owned());
+        }
+        let temp = self
+            .paths
+            .managed_upload_root()
+            .join(format!("lovelyhawk-relay-{}", Uuid::new_v4().simple()));
+        if let Ok(mut temp_path) = relay.temp_path.lock() {
+            *temp_path = Some(temp.clone());
+        }
+        let _temp = RelayTempFile(temp.clone());
+        if let Ok(mut state) = relay.state.lock() {
+            state.leg = Some(RelayLeg::Download);
+            state.done_bytes = 0;
+        }
+        let download = self.services.sftp().download_with_options(
+            a_session,
+            &self.paths,
+            source,
+            &temp,
+            SftpDownloadOptions {
+                resume_from: 0,
+                rate_limit_bytes_per_second: 0,
+                keep_partial: false,
+            },
+            &relay.cancel,
+        );
+        match run_transfer(download, &relay.cancel, TRANSFER_DEADLINE).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                if lovelyhawk_core::sftp::is_transfer_cancelled(&error)
+                    || relay.cancel.is_cancelled()
+                {
+                    return RelayOutcome::Cancelled;
+                }
+                return RelayOutcome::Failed("下载阶段失败，未送达。".to_owned());
+            }
+            Err(_) => {
+                if relay.cancel.is_cancelled() {
+                    return RelayOutcome::Cancelled;
+                }
+                return RelayOutcome::Failed("下载阶段超时或已中断。".to_owned());
+            }
+        }
+        if let Ok(mut state) = relay.state.lock() {
+            state.leg = Some(RelayLeg::Upload);
+            state.done_bytes = 0;
+        }
+        if let Ok(mut dest) = relay.remote_dest.lock() {
+            *dest = Some(destination.remote.clone());
+        }
+        let mut upload =
+            match peer_sftp.plan_upload(&b_session, &self.paths, &temp, destination.remote.clone())
+            {
+                Ok(upload) => upload,
+                Err(_) => {
+                    return RelayOutcome::Failed("目标主机拒绝了这次上传。".to_owned());
+                }
+            };
+        if upload
+            .confirm(DangerousConfirmation::approve(upload.definition()))
+            .is_err()
+        {
+            return RelayOutcome::Failed("上传计划未能确认。".to_owned());
+        }
+        let op_cancel = upload.transfer_cancel();
+        enum LegOutcome {
+            CancelledByOperator,
+            Finished(Result<Result<VerificationResult, CoreError>, SftpBrowserApiError>),
+        }
+        let outcome = tokio::select! {
+            () = relay.cancel.cancelled() => {
+                op_cancel.cancel();
+                LegOutcome::CancelledByOperator
+            }
+            result = run_transfer(upload.execute_and_verify(), &op_cancel, TRANSFER_DEADLINE) => {
+                LegOutcome::Finished(result)
+            }
+        };
+        match outcome {
+            LegOutcome::CancelledByOperator => RelayOutcome::Cancelled,
+            LegOutcome::Finished(Ok(Ok(_))) => RelayOutcome::Done,
+            LegOutcome::Finished(Ok(Err(error))) => {
+                if lovelyhawk_core::sftp::is_transfer_cancelled(&error)
+                    || relay.cancel.is_cancelled()
+                {
+                    RelayOutcome::Cancelled
+                } else {
+                    RelayOutcome::Failed("上传阶段未完成，目标文件未写入。".to_owned())
+                }
+            }
+            LegOutcome::Finished(Err(_)) => {
+                if relay.cancel.is_cancelled() {
+                    RelayOutcome::Cancelled
+                } else {
+                    RelayOutcome::Failed("上传阶段超时或已中断。".to_owned())
+                }
+            }
+        }
     }
 
     /// Drops a plan the operator decided against.
@@ -5130,7 +5745,14 @@ mod tests {
             // Local `.part`/staged sizing for progress and the upload total.
             .replace("std::fs::metadata(&part)", "")
             .replace("std::fs::metadata(part)", "")
-            .replace("std::fs::metadata(&staged_path)", "");
+            .replace("std::fs::metadata(&staged_path)", "")
+            // The relay stats its host temp for download progress, and asks
+            // the peer for the destination directory, the EXCLUDE check and
+            // upload progress — all through the peer's own core service.
+            .replace("std::fs::metadata(path)", "")
+            .replace(".metadata(&peer_session, &dest, false)", "")
+            .replace(".metadata(&b_session, &destination.dir, false)", "")
+            .replace(".metadata(&b_session, &destination.remote, false)", "");
         assert!(production.contains(".sftp()\n                .bind_session("));
         assert!(production.contains("self.services.sftp().list("));
         assert!(production.contains("self.services.sftp().read_text("));

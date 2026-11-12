@@ -245,6 +245,25 @@ export interface SftpBrowserApi {
   /** Requeues one failed or cancelled queue item. */
   retrySftpQueueItem(browserHandle: string, itemId: number): Promise<unknown>;
   /**
+   * Saved connections a file could be relayed to, minus this binding's own.
+   * A relay opens its own session to the peer; credentials never cross.
+   */
+  listSftpRelayTargets(browserHandle: string): Promise<unknown>;
+  /**
+   * Starts a single-file relay to `destDir` on the peer connection; the
+   * destination must not already exist.
+   */
+  startSftpRelay(
+    browserHandle: string,
+    fileHandle: string,
+    connectionId: string,
+    destDir: string,
+  ): Promise<unknown>;
+  /** Live relay state for the poll loop; null when the handle is gone. */
+  pollSftpRelay(browserHandle: string, relayHandle: string): Promise<unknown>;
+  /** Throws the switch on both legs of one relay. */
+  cancelSftpRelay(browserHandle: string, relayHandle: string): Promise<unknown>;
+  /**
    * Reports whether the window holds unfinished work, so closing it from
    * outside the page waits for `onBeforeClose` to answer first.
    */
@@ -634,4 +653,44 @@ export function isSftpQueueEnqueueResult(value: unknown): value is SftpQueueEnqu
   if (!record(value) || typeof value.queued !== "boolean") return false;
   if (!value.queued) return exact(value, ["queued", "queue"]) && value.queue === null;
   return exact(value, ["queued", "queue"]) && isSftpTransferQueue(value.queue);
+}
+
+/** A saved connection the relay dialog may offer, label plus host identity. */
+export interface SftpRelayTarget {
+  connectionId: string;
+  label: string;
+}
+
+const relayStates = new Set(["running", "done", "failed", "cancelled"]);
+const relayLegs = new Set(["", "download", "upload"]);
+
+export function isSftpRelayTarget(value: unknown): value is SftpRelayTarget {
+  return record(value) && exact(value, ["connectionId", "label"]) &&
+    safeName(value.connectionId, false, 256) && planText(value.label, 512);
+}
+
+export function isSftpRelayTargetList(value: unknown): value is SftpRelayTarget[] {
+  return Array.isArray(value) && value.length <= 32 && value.every(isSftpRelayTarget);
+}
+
+/** One relay between two targets through a managed host temp file. */
+export interface SftpRelay {
+  relayHandle: string;
+  /** running | done | failed | cancelled. */
+  state: string;
+  /** download | upload, empty before the first leg starts. */
+  leg: string;
+  doneBytes: string;
+  totalBytes: string;
+  detail: string;
+}
+
+export function isSftpRelay(value: unknown): value is SftpRelay {
+  return record(value) && exact(value, [
+    "relayHandle", "state", "leg", "doneBytes", "totalBytes", "detail",
+  ]) && safeName(value.relayHandle, false, 128) &&
+    typeof value.state === "string" && relayStates.has(value.state) &&
+    typeof value.leg === "string" && relayLegs.has(value.leg) &&
+    u64String(value.doneBytes) && u64String(value.totalBytes) &&
+    planText(value.detail, 1_024);
 }

@@ -977,6 +977,111 @@ pub async fn sftp_queue_retry<R: Runtime>(
         .await
 }
 
+/// The saved connections a file on this window's target could be relayed to.
+#[tauri::command]
+pub async fn sftp_relay_targets<R: Runtime>(
+    window: WebviewWindow<R>,
+    host: State<'_, Host>,
+    browser_handle: String,
+) -> CommandResult<Value> {
+    let scope = scope(&window, &host)?;
+    if !opaque(&browser_handle) {
+        return Err("Invalid SFTP relay request.".to_owned());
+    }
+    host.bridge
+        .call(
+            "sftp-browser.relay.targets",
+            json!({
+                "bindingHandle": scope.binding_handle,
+                "browserHandle": browser_handle,
+            }),
+        )
+        .await
+}
+
+/// Starts a single-file relay to a saved peer connection. `dest_dir` is a
+/// remote directory on the peer the operator typed; the backend validates
+/// it and never shows it back.
+#[tauri::command]
+pub async fn sftp_relay_start<R: Runtime>(
+    window: WebviewWindow<R>,
+    host: State<'_, Host>,
+    browser_handle: String,
+    file_handle: String,
+    connection_id: String,
+    dest_dir: String,
+) -> CommandResult<Value> {
+    let scope = scope(&window, &host)?;
+    if !opaque(&browser_handle)
+        || !opaque(&file_handle)
+        || !opaque(&connection_id)
+        || dest_dir.is_empty()
+        || dest_dir.len() > 4096
+    {
+        return Err("Invalid SFTP relay request.".to_owned());
+    }
+    host.bridge
+        .call(
+            "sftp-browser.relay.start",
+            json!({
+                "bindingHandle": scope.binding_handle,
+                "browserHandle": browser_handle,
+                "fileHandle": file_handle,
+                "connectionId": connection_id,
+                "destDir": dest_dir,
+            }),
+        )
+        .await
+}
+
+/// Relay snapshot for the page's poll loop; null when the handle is gone.
+#[tauri::command]
+pub async fn sftp_relay_poll<R: Runtime>(
+    window: WebviewWindow<R>,
+    host: State<'_, Host>,
+    browser_handle: String,
+    relay_handle: String,
+) -> CommandResult<Value> {
+    let scope = scope(&window, &host)?;
+    if !opaque(&browser_handle) || !opaque(&relay_handle) {
+        return Err("Invalid SFTP relay request.".to_owned());
+    }
+    host.bridge
+        .call(
+            "sftp-browser.relay.poll",
+            json!({
+                "bindingHandle": scope.binding_handle,
+                "browserHandle": browser_handle,
+                "relayHandle": relay_handle,
+            }),
+        )
+        .await
+}
+
+/// Throws the switch on both legs of one relay.
+#[tauri::command]
+pub async fn sftp_relay_cancel<R: Runtime>(
+    window: WebviewWindow<R>,
+    host: State<'_, Host>,
+    browser_handle: String,
+    relay_handle: String,
+) -> CommandResult<Value> {
+    let scope = scope(&window, &host)?;
+    if !opaque(&browser_handle) || !opaque(&relay_handle) {
+        return Err("Invalid SFTP relay request.".to_owned());
+    }
+    host.bridge
+        .call(
+            "sftp-browser.relay.cancel",
+            json!({
+                "bindingHandle": scope.binding_handle,
+                "browserHandle": browser_handle,
+                "relayHandle": relay_handle,
+            }),
+        )
+        .await
+}
+
 /// One SFTP change as the browser pane describes it. The backend takes the
 /// fields flat beside the handles, with absent options as nulls.
 #[derive(serde::Deserialize)]

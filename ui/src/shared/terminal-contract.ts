@@ -133,6 +133,22 @@ export interface TerminalApi {
   cancelSftpQueue(browserHandle: string): Promise<unknown>;
   /** Requeues one failed or cancelled queue item. */
   retrySftpQueueItem(browserHandle: string, itemId: number): Promise<unknown>;
+  /** The other saved connections a file may be relayed to. */
+  listSftpRelayTargets(browserHandle: string): Promise<unknown>;
+  /**
+   * Sends one listed file to a dir on another connection: it downloads to a
+   * managed host temp on this binding, then uploads on the peer's own.
+   */
+  startSftpRelay(
+    browserHandle: string,
+    fileHandle: string,
+    connectionId: string,
+    destDir: string,
+  ): Promise<unknown>;
+  /** Live relay state; null when the handle is gone. */
+  pollSftpRelay(browserHandle: string, relayHandle: string): Promise<unknown>;
+  /** Cancels a running relay; both legs stop. */
+  cancelSftpRelay(browserHandle: string, relayHandle: string): Promise<unknown>;
   cancelSftpTransfer(browserHandle: string): Promise<unknown>;
   stageSftpUpload(): Promise<unknown>;
   /** The operator's own machine, addressed by opaque directory handles. */

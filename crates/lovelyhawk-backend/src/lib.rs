@@ -2244,6 +2244,63 @@ impl BackendState {
                     Err(failure) => Err(failure),
                 }
             }
+            RpcMethod::SftpBrowserRelayTargets => {
+                match parse_params::<SftpBrowserTransferParams>(request.params) {
+                    Ok(params) => self
+                        .sftp_browser
+                        .relay_targets(&params.binding_handle, &params.browser_handle)
+                        .map(to_value)
+                        .map_err(sftp_browser_failure),
+                    Err(failure) => Err(failure),
+                }
+            }
+            RpcMethod::SftpBrowserRelayStart => {
+                match parse_params::<SftpBrowserRelayStartParams>(request.params) {
+                    Ok(params) => self
+                        .sftp_browser
+                        .relay_start(
+                            &params.binding_handle,
+                            &params.browser_handle,
+                            &params.file_handle,
+                            &params.connection_id,
+                            &params.dest_dir,
+                        )
+                        .await
+                        .map(to_value)
+                        .map_err(sftp_browser_failure),
+                    Err(failure) => Err(failure),
+                }
+            }
+            RpcMethod::SftpBrowserRelayPoll => {
+                match parse_params::<SftpBrowserRelayParams>(request.params) {
+                    Ok(params) => self
+                        .sftp_browser
+                        .relay_poll(
+                            &params.binding_handle,
+                            &params.browser_handle,
+                            &params.relay_handle,
+                        )
+                        .await
+                        .map(to_value)
+                        .map_err(sftp_browser_failure),
+                    Err(failure) => Err(failure),
+                }
+            }
+            RpcMethod::SftpBrowserRelayCancel => {
+                match parse_params::<SftpBrowserRelayParams>(request.params) {
+                    Ok(params) => self
+                        .sftp_browser
+                        .relay_cancel(
+                            &params.binding_handle,
+                            &params.browser_handle,
+                            &params.relay_handle,
+                        )
+                        .await
+                        .map(to_value)
+                        .map_err(sftp_browser_failure),
+                    Err(failure) => Err(failure),
+                }
+            }
             RpcMethod::PacketCaptureInterfacesList => {
                 match parse_params::<PacketCaptureBindingParams>(request.params) {
                     Ok(params) => self
@@ -3296,6 +3353,14 @@ enum RpcMethod {
     SftpBrowserQueueCancelAll,
     #[serde(rename = "sftp-browser.queue.retry")]
     SftpBrowserQueueRetry,
+    #[serde(rename = "sftp-browser.relay.targets")]
+    SftpBrowserRelayTargets,
+    #[serde(rename = "sftp-browser.relay.start")]
+    SftpBrowserRelayStart,
+    #[serde(rename = "sftp-browser.relay.poll")]
+    SftpBrowserRelayPoll,
+    #[serde(rename = "sftp-browser.relay.cancel")]
+    SftpBrowserRelayCancel,
     #[serde(rename = "packet-capture.interfaces.list")]
     PacketCaptureInterfacesList,
     #[serde(rename = "packet-capture.start")]
@@ -4104,6 +4169,27 @@ struct SftpBrowserQueueItemParams {
     binding_handle: String,
     browser_handle: String,
     item_id: u64,
+}
+
+/// One file relay between the browser's binding and a saved peer
+/// connection; `destDir` is a remote directory on the peer the operator
+/// typed, validated by core.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SftpBrowserRelayStartParams {
+    binding_handle: String,
+    browser_handle: String,
+    file_handle: String,
+    connection_id: String,
+    dest_dir: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SftpBrowserRelayParams {
+    binding_handle: String,
+    browser_handle: String,
+    relay_handle: String,
 }
 
 /// A replacement class file for Java hot update. Host-only, like the SFTP

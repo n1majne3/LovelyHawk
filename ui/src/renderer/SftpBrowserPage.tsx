@@ -1,6 +1,7 @@
 import { TransientNotice } from "./NotificationCenter";
 import { DialogHost } from "./DialogHost";
 import { useConfirmDialog } from "./use-confirm-dialog";
+import { useModalScrim } from "./modal-scrim";
 import { useEffect, useReducer, useRef, useState, type MouseEvent } from "react";
 
 import { errorText } from "./error-text";
@@ -20,7 +21,11 @@ import {
   isSftpTransferResult,
   isSftpTransferCancelResult,
   isSftpQueueEnqueueResult,
+  isSftpRelay,
+  isSftpRelayTargetList,
   isSftpTransferQueue,
+  type SftpRelay,
+  type SftpRelayTarget,
   type SftpTransferQueue,
   type SftpOperationInput,
   type SftpOperationPlan,
@@ -124,6 +129,10 @@ export function SftpBrowserPage({
   // The batch queue this window's transfers run in; null before the first
   // enqueue and after the target changed.
   const [queue, setQueue] = useState<SftpTransferQueue | null>(null);
+  // The relay picker: which file, which saved connection, which remote dir.
+  const [relayPick, setRelayPick] = useState<RelayPick | null>(null);
+  // The relay this window started; its last state stays until dismissed.
+  const [relay, setRelay] = useState<(SftpRelay & { browserHandle: string }) | null>(null);
   const [queueCancelling, setQueueCancelling] = useState(false);
   // Optional download rate limit in KiB/s; blank means unlimited.
   const [rateLimitInput, setRateLimitInput] = useState("");
@@ -231,11 +240,19 @@ export function SftpBrowserPage({
 
   // A running queue holds the window open in the close handshake: closing
   // cancels every item first, then lets the window go.
-  const queueRef = useRef<{ active: boolean; browserHandle: string | null } | null>(null);
-  queueRef.current = { active: queue?.active === true, browserHandle: currentBrowserHandle };
+  const queueRef = useRef<{
+    active: boolean;
+    browserHandle: string | null;
+    relayHandle: string | null;
+  } | null>(null);
+  queueRef.current = {
+    active: queue?.active === true || relay?.state === "running",
+    browserHandle: currentBrowserHandle,
+    relayHandle: relay?.state === "running" ? relay.relayHandle : null,
+  };
   useEffect(() => {
-    void api.setUnsavedChanges(queue?.active === true).catch(() => undefined);
-  }, [api, queue?.active]);
+    void api.setUnsavedChanges(queueRef.current?.active === true).catch(() => undefined);
+  }, [api, queue?.active, relay?.state]);
   useEffect(() => {
     return api.onBeforeClose(async () => {
       const current = queueRef.current;
@@ -246,10 +263,45 @@ export function SftpBrowserPage({
           // The window is going away anyway; the backend drops the queue
           // with the browser regardless of what the cancel answered.
         }
+        if (current.relayHandle !== null) {
+          try {
+            await api.cancelSftpRelay(current.browserHandle, current.relayHandle);
+          } catch {
+            // Same: a closed window drops the relay on the backend anyway.
+          }
+        }
       }
       return true;
     });
   }, [api]);
+
+  // A running relay polls until it settles; the interval doubles as the
+  // progress display refresh for both legs.
+  useEffect(() => {
+    if (relay?.state !== "running") return;
+    const browserHandle = relay.browserHandle;
+    const relayHandle = relay.relayHandle;
+    let stop = false;
+    let timer = 0;
+    const tick = async () => {
+      if (stop) return;
+      try {
+        const value = await api.pollSftpRelay(browserHandle, relayHandle);
+        if (!stop && isSftpRelay(value)) setRelay({ ...value, browserHandle });
+      } catch {
+        // A closed binding clears the relay backend-side; the next poll is
+        // likely pointless, so stop here rather than spamming errors.
+        stop = true;
+        return;
+      }
+      if (!stop) timer = window.setTimeout(() => void tick(), 500);
+    };
+    timer = window.setTimeout(() => void tick(), 400);
+    return () => {
+      stop = true;
+      window.clearTimeout(timer);
+    };
+  }, [api, relay?.state, relay?.relayHandle, relay?.browserHandle]);
 
   useEffect(() => {
     if (!enabled || scope === null || state.scope !== scope) return;
@@ -587,6 +639,62 @@ export function SftpBrowserPage({
     }
   }
 
+  /** 发送到其他主机…: list the other saved connections for the picked file. */
+  async function openRelay(entry: SftpBrowserEntry) {
+    const browserHandle = visibleState.directory?.browserHandle ?? null;
+    if (browserHandle === null || relayPick?.busy === true) return;
+    setRelayPick({ entry, targets: [], connectionId: null, destDir: "/tmp", busy: true, error: null });
+    try {
+      const value = await api.listSftpRelayTargets(browserHandle);
+      if (!isSftpRelayTargetList(value)) throw new Error();
+      setRelayPick((now) => now === null ? null : { ...now, targets: value, busy: false,
+        error: value.length === 0 ? "没有其他已保存的主机连接。" : null });
+    } catch (reason) {
+      setRelayPick((now) => now === null ? null : { ...now, busy: false,
+        error: errorText(reason, "无法读取可发送的主机列表。") });
+    }
+  }
+
+  async function startRelay() {
+    const pick = relayPick;
+    const browserHandle = visibleState.directory?.browserHandle ?? null;
+    if (pick === null || browserHandle === null || pick.connectionId === null ||
+      pick.busy || relay?.state === "running") return;
+    const destDir = pick.destDir.trim();
+    const target = pick.targets.find((item) => item.connectionId === pick.connectionId);
+    if (target === undefined || !destDir.startsWith("/")) {
+      setRelayPick({ ...pick, error: "请选择目标主机并填写以 / 开头的远端目录。" });
+      return;
+    }
+    const confirmed = await directoryUploadConfirm.ask(
+      "发送到其他主机",
+      `将 ${pick.entry.name}（${compactSftpBytes(pick.entry.sizeBytes)}）发送到 ${target.label} 的 ${destDir}？目标已有同名文件会被拒绝。`,
+    );
+    if (!confirmed) return;
+    setRelayPick({ ...pick, busy: true, error: null });
+    try {
+      const value = await api.startSftpRelay(browserHandle, pick.entry.entryHandle,
+        pick.connectionId, destDir);
+      if (!isSftpRelay(value)) throw new Error();
+      setRelay({ ...value, browserHandle });
+      setRelayPick(null);
+    } catch (reason) {
+      setRelayPick((now) => now === null ? null : { ...now, busy: false,
+        error: errorText(reason, "发送没有开始。") });
+    }
+  }
+
+  async function cancelRelay() {
+    const browserHandle = visibleState.directory?.browserHandle ?? null;
+    if (browserHandle === null || relay === null || relay.state !== "running") return;
+    try {
+      const value = await api.cancelSftpRelay(browserHandle, relay.relayHandle);
+      if (value !== null && isSftpRelay(value)) setRelay({ ...value, browserHandle });
+    } catch (reason) {
+      setTransferNotice(errorText(reason, "未能取消发送。"));
+    }
+  }
+
   async function retryQueueItem(itemId: number) {
     const browserHandle = visibleState.directory?.browserHandle ?? null;
     if (browserHandle === null) return;
@@ -811,11 +919,14 @@ export function SftpBrowserPage({
       return void downloadDirectory(entry, action === "download-directory-extract");
     }
     if (action === "upload-directory") return void uploadDirectory(entry);
+    if (action === "relay" && entry !== null) return void openRelay(entry);
     if (action === "properties") {
       if (entry !== null) setProperties(entry);
       return;
     }
     if (action === "open") return;
+    // Relay needs an entry; a blank-area menu has no file to send.
+    if (action === "relay") return;
     const subject = entry === null ? (directory?.directoryLabel ?? "当前目录") : entry.name;
     const next: SftpOperationDraft = { kind: action, subject };
     if (action === "rename" && entry !== null) next.name = entry.name;
@@ -1198,6 +1309,25 @@ export function SftpBrowserPage({
               </button>
             </p>
           )}
+          {relay === null ? null : (
+            <p className={`sftp-browser-transfer${relay.state === "failed" ? " is-error" : " is-running"}`}
+              role="status" data-testid="sftp-relay-status">
+              <span>
+                {relay.state === "running"
+                  ? `${relay.leg === "upload" ? "正在发送到目标主机" : "正在取回本机"} ${compactSftpBytes(relay.doneBytes)} / ${compactSftpBytes(relay.totalBytes)}…`
+                  : relay.detail}
+              </span>
+              {relay.state === "running" ? (
+                <button type="button" data-testid="sftp-relay-cancel" onClick={() => void cancelRelay()}>
+                  取消发送
+                </button>
+              ) : (
+                <button type="button" data-testid="sftp-relay-dismiss" onClick={() => setRelay(null)}>
+                  知道了
+                </button>
+              )}
+            </p>
+          )}
           {transferNotice === null || downloading !== null ? null : (
             <TransientNotice source="文件传输" message={transferNotice ?? ""} severity="info"><p className="sftp-browser-transfer" role="status">{transferNotice}</p></TransientNotice>
           )}
@@ -1236,6 +1366,14 @@ export function SftpBrowserPage({
           entry={properties}
           onChmod={() => startOperation("chmod", properties)}
           onClose={() => setProperties(null)}
+        />
+      )}
+      {relayPick === null ? null : (
+        <SftpRelayDialog
+          pick={relayPick}
+          onPick={setRelayPick}
+          onStart={() => void startRelay()}
+          onClose={() => setRelayPick(null)}
         />
       )}
       {directoryUploadConfirm.dialog === null ? null : (
@@ -1461,4 +1599,72 @@ export function SftpBrowserEmpty({ title, detail, compact = false }: {
   return <div className={compact ? "sftp-browser-empty is-compact" : "sftp-browser-empty"}>
     <strong>{title}</strong><p>{detail}</p>
   </div>;
+}
+
+interface RelayPick {
+  entry: SftpBrowserEntry;
+  targets: SftpRelayTarget[];
+  connectionId: string | null;
+  destDir: string;
+  busy: boolean;
+  error: string | null;
+}
+
+function SftpRelayDialog({ pick, onPick, onStart, onClose }: {
+  pick: RelayPick;
+  onPick: (next: RelayPick | null | ((now: RelayPick | null) => RelayPick | null)) => void;
+  onStart: () => void;
+  onClose: () => void;
+}) {
+  useModalScrim();
+  return (
+    <div className="sftp-operation-backdrop" role="presentation">
+      <section className="sftp-operation-dialog sftp-properties-dialog" role="dialog"
+        aria-modal="true" aria-label="发送到其他主机" data-testid="sftp-relay-dialog">
+        <header>
+          <h2>发送到其他主机</h2>
+          <p>
+            把 {pick.entry.name}（{compactSftpBytes(pick.entry.sizeBytes)}）先取回本机，
+            再经所选主机自己的连接发送上去；目标已有同名文件会被拒绝。
+          </p>
+        </header>
+        {pick.targets.length === 0 ? null : (
+          <ul className="sftp-relay-targets">
+            {pick.targets.map((target) => (
+              <li key={target.connectionId}>
+                <label>
+                  <input type="radio" name="sftp-relay-target"
+                    checked={pick.connectionId === target.connectionId}
+                    onChange={() => onPick((now) => now === null ? null : { ...now, connectionId: target.connectionId })} />
+                  {target.label}
+                </label>
+              </li>
+            ))}
+          </ul>
+        )}
+        <label className="sftp-relay-dest">
+          目标目录
+          <input type="text" value={pick.destDir} spellCheck={false}
+            data-testid="sftp-relay-dest"
+            onChange={(event) => {
+              const typed = event.currentTarget.value;
+              onPick((now) => now === null ? null : { ...now, destDir: typed });
+            }} />
+        </label>
+        {pick.error === null ? null : (
+          <p className="sftp-browser-transfer is-error" role="alert">{pick.error}</p>
+        )}
+        <footer>
+          <button type="button" className="is-primary" data-testid="sftp-relay-start"
+            disabled={pick.busy || pick.connectionId === null}
+            onClick={onStart}>
+            {pick.busy ? "正在处理…" : "发送"}
+          </button>
+          <button type="button" disabled={pick.busy} onClick={onClose}>
+            取消
+          </button>
+        </footer>
+      </section>
+    </div>
+  );
 }

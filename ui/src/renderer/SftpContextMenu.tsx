@@ -30,6 +30,7 @@ export type SftpMenuAction =
   | "rename"
   | "chmod"
   | "archive"
+  | "relay"
   | "remove"
   | "create-directory"
   | "properties";
@@ -157,6 +158,7 @@ export function menuItems(entry: SftpBrowserEntry | null, localScan = false): Me
   }
   if (entry.kind === "file") {
     items.push({ action: "download", label: "下载", icon: <DownloadIcon /> });
+    items.push({ action: "relay", label: "发送到其他主机…", icon: <UploadIcon /> });
   }
   if (entry.kind === "directory") {
     items.push({ action: "download-directory", label: "下载目录…", icon: <DownloadIcon /> });

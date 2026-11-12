@@ -18,6 +18,8 @@ import {
   isSftpOperationReceipt,
   isSftpOperationUndoResult,
   isSftpQueueEnqueueResult,
+  isSftpRelay,
+  isSftpRelayTargetList,
   isSftpTransferCancelResult,
   isSftpTransferQueue,
   isSftpStagedUpload,
@@ -282,6 +284,42 @@ export function createTerminalApi(): TerminalApi {
       }
       return checked("sftp_queue_retry", { browserHandle, itemId }, SFTP_BROWSER_TIMEOUT_MS,
         isSftpTransferQueue, "The SFTP queue result is invalid.");
+    },
+    listSftpRelayTargets: async (...values: unknown[]) => {
+      requireArity(values, 1, "Invalid SFTP relay request.");
+      const [browserHandle] = values;
+      if (!isSftpBrowserOpaqueHandle(browserHandle)) refuse("Invalid SFTP relay request.");
+      return checked("sftp_relay_targets", { browserHandle }, SFTP_BROWSER_TIMEOUT_MS,
+        isSftpRelayTargetList, "The SFTP relay target list is invalid.");
+    },
+    startSftpRelay: async (...values: unknown[]) => {
+      requireArity(values, 4, "Invalid SFTP relay request.");
+      const [browserHandle, fileHandle, connectionId, destDir] = values;
+      if (!isSftpBrowserOpaqueHandle(browserHandle) || !isSftpBrowserOpaqueHandle(fileHandle) ||
+        !isSftpBrowserOpaqueHandle(connectionId) || typeof destDir !== "string" ||
+        !destDir.startsWith("/") || destDir.length > 4096) {
+        refuse("Invalid SFTP relay request.");
+      }
+      return checked("sftp_relay_start", { browserHandle, fileHandle, connectionId, destDir },
+        SFTP_BROWSER_TIMEOUT_MS, isSftpRelay, "The SFTP relay result is invalid.");
+    },
+    pollSftpRelay: async (...values: unknown[]) => {
+      requireArity(values, 2, "Invalid SFTP relay request.");
+      const [browserHandle, relayHandle] = values;
+      if (!isSftpBrowserOpaqueHandle(browserHandle) || !isSftpBrowserOpaqueHandle(relayHandle)) {
+        refuse("Invalid SFTP relay request.");
+      }
+      return checked("sftp_relay_poll", { browserHandle, relayHandle }, SFTP_BROWSER_TIMEOUT_MS,
+        (value) => value === null || isSftpRelay(value), "The SFTP relay state is invalid.");
+    },
+    cancelSftpRelay: async (...values: unknown[]) => {
+      requireArity(values, 2, "Invalid SFTP relay cancellation.");
+      const [browserHandle, relayHandle] = values;
+      if (!isSftpBrowserOpaqueHandle(browserHandle) || !isSftpBrowserOpaqueHandle(relayHandle)) {
+        refuse("Invalid SFTP relay cancellation.");
+      }
+      return checked("sftp_relay_cancel", { browserHandle, relayHandle }, SFTP_BROWSER_TIMEOUT_MS,
+        (value) => value === null || isSftpRelay(value), "The SFTP relay result is invalid.");
     },
     planSftpOperation: async (...values: unknown[]) => {
       requireArity(values, 2, "Invalid SFTP operation request.");
