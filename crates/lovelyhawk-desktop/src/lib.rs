@@ -285,6 +285,7 @@ pub fn run() -> ExitCode {
             child_commands::sftp_list,
             child_commands::sftp_read_text,
             child_commands::sftp_download,
+            child_commands::sftp_download_directory,
             child_commands::sftp_plan,
             child_commands::sftp_confirm,
             child_commands::sftp_execute,

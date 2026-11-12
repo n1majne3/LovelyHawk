@@ -84,6 +84,17 @@ export interface TerminalApi {
   listSftpDirectory(browserHandle: string, directoryHandle: string): Promise<unknown>;
   readSftpText(browserHandle: string, fileHandle: string): Promise<unknown>;
   downloadSftpEntry(browserHandle: string, fileHandle: string): Promise<unknown>;
+  /**
+   * Packs one listed directory into a remote tar and downloads it to the
+   * location the host's native dialog chooses — or unpacks it into a chosen
+   * empty folder. The page passes a suggested file name only.
+   */
+  downloadSftpDirectory(
+    browserHandle: string,
+    directoryHandle: string,
+    defaultName: string,
+    extract: boolean,
+  ): Promise<unknown>;
   planSftpOperation(browserHandle: string, input: unknown): Promise<unknown>;
   confirmSftpOperation(planHandle: string): Promise<unknown>;
   executeSftpOperation(planHandle: string): Promise<unknown>;

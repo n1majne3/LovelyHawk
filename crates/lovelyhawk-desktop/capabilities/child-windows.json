@@ -29,6 +29,7 @@
     "allow-sftp-list",
     "allow-sftp-read-text",
     "allow-sftp-download",
+    "allow-sftp-download-directory",
     "allow-sftp-plan",
     "allow-sftp-confirm",
     "allow-sftp-execute",

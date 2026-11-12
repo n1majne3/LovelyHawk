@@ -2027,6 +2027,23 @@ impl BackendState {
                     Err(failure) => Err(failure),
                 }
             }
+            RpcMethod::SftpBrowserDownloadDirectory => {
+                match parse_params::<SftpBrowserDownloadDirectoryParams>(request.params) {
+                    Ok(params) => self
+                        .sftp_browser
+                        .download_directory(
+                            &params.binding_handle,
+                            &params.browser_handle,
+                            &params.directory_handle,
+                            std::path::Path::new(&params.local_path),
+                            params.extract_to.as_deref().map(std::path::Path::new),
+                        )
+                        .await
+                        .map(to_value)
+                        .map_err(sftp_browser_failure),
+                    Err(failure) => Err(failure),
+                }
+            }
             RpcMethod::SftpBrowserOperationPlan => {
                 match parse_params::<SftpBrowserOperationParams>(request.params) {
                     Ok(params) => match params.to_request() {
@@ -3127,6 +3144,8 @@ enum RpcMethod {
     SftpBrowserTextRead,
     #[serde(rename = "sftp-browser.download")]
     SftpBrowserDownload,
+    #[serde(rename = "sftp-browser.download-directory")]
+    SftpBrowserDownloadDirectory,
     #[serde(rename = "sftp-browser.operation.plan")]
     SftpBrowserOperationPlan,
     #[serde(rename = "sftp-browser.operation.confirm")]
@@ -4023,6 +4042,20 @@ struct SftpBrowserDownloadParams {
     file_handle: String,
     /// Chosen by the operator in the native save dialog and forwarded by main.
     local_path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SftpBrowserDownloadDirectoryParams {
+    binding_handle: String,
+    browser_handle: String,
+    directory_handle: String,
+    /// Chosen by the operator in the native save dialog and forwarded by main.
+    local_path: String,
+    /// When the operator asked for extraction: a native-folder-dialog path
+    /// that must be an existing empty directory, forwarded by main.
+    #[serde(default)]
+    extract_to: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -6936,37 +6969,57 @@ fn page_descriptors() -> Vec<PageDescriptor> {
     ]
 }
 
-pub async fn serve<R, W>(reader: R, mut writer: W, state: Arc<BackendState>) -> io::Result<()>
+/// The stdio lab harness. Each frame is handled on its own task so a control
+/// call — a transfer cancel above all — can reach work a longer call is still
+/// running, the same way the desktop bridge's lanes behave. Responses carry
+/// their request id, so completion order may differ from arrival order; only
+/// the writes themselves are serialized.
+pub async fn serve<R, W>(reader: R, writer: W, state: Arc<BackendState>) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
 {
     let mut reader = BufReader::new(reader);
+    let writer = Arc::new(tokio::sync::Mutex::new(writer));
+    let mut tasks = tokio::task::JoinSet::new();
     loop {
         let frame = match read_frame(&mut reader).await {
             Ok(frame) => frame,
             Err(error) => {
+                while tasks.join_next().await.is_some() {}
                 state.terminal.shutdown().await;
                 return Err(error);
             }
         };
-        let response = match frame {
-            FrameRead::Eof => {
-                state.terminal.shutdown().await;
-                return Ok(());
+        match frame {
+            FrameRead::Eof => break,
+            FrameRead::TooLarge => {
+                let response = RpcResponse::failure(
+                    None,
+                    "request-too-large",
+                    "The backend request exceeded the allowed size.",
+                );
+                let mut writer = writer.lock().await;
+                if let Err(error) = write_response(&mut *writer, response).await {
+                    state.terminal.shutdown().await;
+                    return Err(error);
+                }
             }
-            FrameRead::TooLarge => RpcResponse::failure(
-                None,
-                "request-too-large",
-                "The backend request exceeded the allowed size.",
-            ),
-            FrameRead::Data(frame) => handle_frame(&state, frame.as_bytes()).await,
-        };
-        if let Err(error) = write_response(&mut writer, response).await {
-            state.terminal.shutdown().await;
-            return Err(error);
+            FrameRead::Data(frame) => {
+                let state = Arc::clone(&state);
+                let writer = Arc::clone(&writer);
+                tasks.spawn(async move {
+                    let response = handle_frame(&state, frame.as_bytes()).await;
+                    let mut writer = writer.lock().await;
+                    let _ = write_response(&mut *writer, response).await;
+                });
+            }
         }
     }
+    // The peer is gone; finish what is already running so its writes land.
+    while tasks.join_next().await.is_some() {}
+    state.terminal.shutdown().await;
+    Ok(())
 }
 
 async fn handle_frame(state: &BackendState, frame: &[u8]) -> RpcResponse {

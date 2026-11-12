@@ -23,6 +23,8 @@ export type SftpMenuAction =
   | "preview"
   | "edit"
   | "download"
+  | "download-directory"
+  | "download-directory-extract"
   | "rename"
   | "chmod"
   | "archive"
@@ -152,6 +154,14 @@ export function menuItems(entry: SftpBrowserEntry | null, localScan = false): Me
   }
   if (entry.kind === "file") {
     items.push({ action: "download", label: "下载", icon: <DownloadIcon /> });
+  }
+  if (entry.kind === "directory") {
+    items.push({ action: "download-directory", label: "下载目录…", icon: <DownloadIcon /> });
+    items.push({
+      action: "download-directory-extract",
+      label: "下载并解压到本机文件夹…",
+      icon: <DownloadIcon />,
+    });
   }
   // A folder the pane can open or a regular file it can preview: the same two
   // kinds the fetch resolver accepts — a link never reaches the backend.

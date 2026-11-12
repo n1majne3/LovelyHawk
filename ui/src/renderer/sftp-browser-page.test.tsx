@@ -28,6 +28,7 @@ const api: SftpBrowserApi & LocalBrowserApi = {
   listSftpDirectory: async () => { throw new Error(); },
   readSftpText: async () => { throw new Error(); },
   downloadSftpEntry: async () => { throw new Error(); },
+  downloadSftpDirectory: async () => { throw new Error(); },
   planSftpOperation: async () => { throw new Error(); },
   confirmSftpOperation: async () => { throw new Error(); },
   executeSftpOperation: async () => { throw new Error(); },
@@ -238,5 +239,41 @@ describe("取回本机扫描 in the file manager", () => {
     // A stale listing refuses the action before any dialog opens.
     expect(source.indexOf('if (action === "local-scan")')).toBeGreaterThan(
       source.indexOf("目录列表已过期"));
+  });
+});
+
+describe("下载目录 in the file manager", () => {
+  it("offers both download forms on directories and never on files, links or the blank area", () => {
+    const file = entries.find((entry) => entry.action === "preview")!;
+    const directory = entries.find((entry) => entry.action === "browse")!;
+    const link = entries.find((entry) => entry.action === "none")!;
+    const actions = menuItems(directory).map((item) => item.action);
+    expect(actions).toContain("download-directory");
+    expect(actions).toContain("download-directory-extract");
+    for (const entry of [file, link, null]) {
+      const own = menuItems(entry as SftpBrowserEntry | null).map((item) => item.action);
+      expect(own).not.toContain("download-directory");
+      expect(own).not.toContain("download-directory-extract");
+    }
+  });
+
+  it("hands the host only handles and a suggested name, never a path", () => {
+    const source = readFileSync(new URL("./SftpBrowserPage.tsx", import.meta.url), "utf8");
+    expect(source).toContain("api.downloadSftpDirectory(");
+    const call = source.split("api.downloadSftpDirectory(")[1]!.split(")")[0]!;
+    expect(call.split(",").map((part) => part.trim()).filter(Boolean)).toHaveLength(4);
+    expect(call).toContain("entry.entryHandle");
+    expect(call).toContain("entry.name");
+    expect(call).not.toMatch(/path|Path/u);
+    // A degraded target is refused before any dialog opens, with the same
+    // limits message the banner shows.
+    expect(source).toContain("degradedSftp === true");
+    expect(source).toContain("目标没有 SFTP 子系统");
+    // Cancellation rides the same transfer switch as file downloads.
+    expect(source).toContain('data-testid="sftp-cancel-download"');
+    // The host command, not a page path, decides where the archive lands.
+    const apiSource = readFileSync(new URL("../host/terminal-api.ts", import.meta.url), "utf8");
+    expect(apiSource).toContain('"sftp_download_directory"');
+    expect(apiSource).not.toContain("localPath");
   });
 });

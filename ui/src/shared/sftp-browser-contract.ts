@@ -115,6 +115,22 @@ export interface SftpTransferCancelResult {
   cancelled: number;
 }
 
+/**
+ * The result of a whole-directory download: the tar reached the chosen save
+ * path, or it was refused/cancelled before that. `state` says which; the
+ * counts are always the preflight numbers so a refusal shows them.
+ */
+export interface SftpDirectoryDownloadResult {
+  saved: boolean;
+  state?: "done" | "refused-over-cap" | "extract-refused" | "extract-failed";
+  fileCount?: string;
+  totalBytes?: string;
+  archiveBytes?: string | null;
+  extractedEntries?: string | null;
+  detail?: string;
+  fileName?: string;
+}
+
 /** What an undo did: put back and read back, or refused with the reason. */
 export interface SftpOperationUndoResult {
   planHandle: string;
@@ -148,6 +164,17 @@ export interface SftpBrowserApi {
   readSftpText(browserHandle: string, fileHandle: string): Promise<unknown>;
   /** Asks main for a save location, then copies the file there. */
   downloadSftpEntry(browserHandle: string, fileHandle: string): Promise<unknown>;
+  /**
+   * Packs a remote directory server-side and downloads the tar to a location
+   * the native dialog picks — or unpacks it into a picked empty folder. The
+   * page passes a suggested file name only; it never names a path.
+   */
+  downloadSftpDirectory(
+    browserHandle: string,
+    directoryHandle: string,
+    defaultName: string,
+    extract: boolean,
+  ): Promise<unknown>;
   /** Nothing changes until confirm and execute follow this plan. */
   planSftpOperation(browserHandle: string, input: SftpOperationInput): Promise<unknown>;
   confirmSftpOperation(planHandle: string): Promise<unknown>;
@@ -402,6 +429,29 @@ export function isSftpOperationReceipt(value: unknown): value is SftpOperationRe
 
 export function isSftpTransferCancelResult(value: unknown): value is SftpTransferCancelResult {
   return record(value) && exact(value, ["cancelled"]) && unsigned(value.cancelled, 64);
+}
+
+const directoryDownloadStates = new Set([
+  "done",
+  "refused-over-cap",
+  "extract-refused",
+  "extract-failed",
+]);
+
+export function isSftpDirectoryDownloadResult(
+  value: unknown,
+): value is SftpDirectoryDownloadResult {
+  if (!record(value) || typeof value.saved !== "boolean") return false;
+  if (!value.saved) return exact(value, ["saved"]);
+  return exact(value, [
+    "saved", "state", "fileCount", "totalBytes", "archiveBytes",
+    "extractedEntries", "detail", "fileName",
+  ]) &&
+    typeof value.state === "string" && directoryDownloadStates.has(value.state) &&
+    u64String(value.fileCount) && u64String(value.totalBytes) &&
+    (value.archiveBytes === null || u64String(value.archiveBytes)) &&
+    (value.extractedEntries === null || u64String(value.extractedEntries)) &&
+    planText(value.detail, 1_024) && safeName(value.fileName, false, 256);
 }
 
 export function isSftpOperationUndoResult(value: unknown): value is SftpOperationUndoResult {

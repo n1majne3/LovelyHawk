@@ -542,6 +542,56 @@ impl SftpService {
         }
     }
 
+    /// Counts what a whole-directory archive would pack, so an oversized tree
+    /// is refused with numbers rather than an hour of tar. One fixed command
+    /// does it all: `find`/`wc -l` answer the file count, `stat -c %s` (GNU
+    /// and BusyBox both carry it) sums sizes — skipped when the count alone
+    /// already overruns. Symlinks are `-type l`, not `-type f`, so they are
+    /// absent from both numbers.
+    pub async fn directory_archive_preflight(
+        &self,
+        session: &BoundSftpSession,
+        path: &RemotePath,
+    ) -> CoreResult<ArchiveDownloadPreflight> {
+        let output = self
+            .operation_execute(
+                session,
+                directory_archive_preflight_command(path.as_str()),
+                Duration::from_secs(300),
+            )
+            .await?;
+        if output.timed_out {
+            return Err(CoreError::ssh(
+                "archive preflight",
+                "target command timed out",
+            ));
+        }
+        for line in output.output.lines() {
+            if line.starts_with("LH-NOTDIR") {
+                return Err(CoreError::validation(
+                    "archive source",
+                    "must be a directory",
+                ));
+            }
+            if let Some(record) = line.strip_prefix("LH ") {
+                let mut fields = record.split_whitespace();
+                let files = fields
+                    .next()
+                    .and_then(|field| field.parse::<u64>().ok())
+                    .ok_or_else(|| CoreError::ssh("archive preflight", "bad file count"))?;
+                let bytes = fields
+                    .next()
+                    .and_then(|field| field.parse::<u64>().ok())
+                    .ok_or_else(|| CoreError::ssh("archive preflight", "bad byte count"))?;
+                return Ok(ArchiveDownloadPreflight { files, bytes });
+            }
+        }
+        Err(CoreError::ssh(
+            "archive preflight",
+            format!("unparseable answer: {}", output.output.trim()),
+        ))
+    }
+
     /// Resolve a remote path through the SFTP server's REALPATH operation.
     /// Security-sensitive callers compare this value again immediately before
     /// mutation so ancestor symlink changes cannot silently widen a managed root.
@@ -2525,6 +2575,37 @@ fn operation_metadata(operation: &SftpOperation) -> BTreeMap<String, String> {
     }
 }
 
+/// Caps for a whole-directory download archive, applied before it is packed:
+/// at most this many regular files and this many content bytes (the download
+/// is a plain tar, so "before compression" is just the content size).
+pub const MAX_ARCHIVE_DOWNLOAD_FILES: u64 = 20_000;
+/// Byte cap for the same archive; see [`MAX_ARCHIVE_DOWNLOAD_FILES`].
+pub const MAX_ARCHIVE_DOWNLOAD_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// What the archive preflight counted under the directory. Symlinks land in
+/// the tar as links and are counted by neither field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArchiveDownloadPreflight {
+    pub files: u64,
+    pub bytes: u64,
+}
+
+/// The fixed preflight command behind `directory_archive_preflight`. Only the
+/// directory is variable, and it enters through the shell-escape boundary.
+fn directory_archive_preflight_command(path: &str) -> String {
+    format!(
+        "d={}; [ -d \"$d\" ] || {{ echo 'LH-NOTDIR'; exit 3; }}; \
+         n=$(find \"$d\" -type f | wc -l); \
+         if [ \"$n\" -gt {MAX_ARCHIVE_DOWNLOAD_FILES} ]; then \
+         printf 'LH %s 0\\n' \"$n\"; exit 0; fi; \
+         s=$(find \"$d\" -type f -exec stat -c %s {{}} + 2>/dev/null \
+         | awk '{{s+=$1}} END {{print s+0}}'); \
+         printf 'LH %s %s\\n' \"$n\" \"${{s:-0}}\"",
+        crate::shell_escape::shq(path),
+        MAX_ARCHIVE_DOWNLOAD_FILES = MAX_ARCHIVE_DOWNLOAD_FILES,
+    )
+}
+
 fn archive_command(
     sources: &[RemotePath],
     temporary: &RemotePath,
@@ -3822,6 +3903,23 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// The preflight counts a directory with one fixed command: the path is
+    /// the only variable and it enters through the shell-escape boundary.
+    #[test]
+    fn archive_download_preflight_command_quotes_the_path_and_bounds_the_count() {
+        let command =
+            directory_archive_preflight_command("/var/www/has space; rm -rf /; echo pwned");
+        assert!(command.contains("find \"$d\" -type f"));
+        assert!(command.contains("LH-NOTDIR"));
+        assert!(command.contains(&MAX_ARCHIVE_DOWNLOAD_FILES.to_string()));
+        // The hostile text survives only inside a single-quoted literal: the
+        // injected command never reaches the shell as words.
+        assert!(command.contains("'/var/www/has space; rm -rf /; echo pwned'"));
+        assert!(!command.contains("d=/var/www"));
+        // Symlinks are -type l, never -type f: they stay out of both counts.
+        assert!(!command.contains("-type l"));
     }
 
     #[test]

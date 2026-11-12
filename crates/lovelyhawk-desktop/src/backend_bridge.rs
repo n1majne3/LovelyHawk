@@ -326,6 +326,7 @@ mod tests {
             "connections.export-file",
             "windows.evidence.part",
             "sftp-browser.download",
+            "sftp-browser.download-directory",
             "sftp-browser.upload.stage",
             "java.hot-update.class.stage",
             "application-log.export.prepare",

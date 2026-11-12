@@ -9,6 +9,7 @@ import {
 } from "../shared/local-scan-contract.js";
 import {
   isSftpBrowserOpaqueHandle,
+  isSftpDirectoryDownloadResult,
   isSftpDirectorySnapshot,
   isSftpOperationInput,
   isSftpOperationPlan,
@@ -188,6 +189,19 @@ export function createTerminalApi(): TerminalApi {
             ? typeof value.fileName === "string" && typeof value.bytes === "string"
             : value.fileName === null && value.bytes === null),
         "The SFTP transfer result is invalid.");
+    },
+    downloadSftpDirectory: async (...values: unknown[]) => {
+      requireArity(values, 4, "Invalid SFTP directory download request.");
+      const [browserHandle, directoryHandle, defaultName, extract] = values;
+      if (!isSftpBrowserOpaqueHandle(browserHandle) || !isSftpBrowserOpaqueHandle(directoryHandle) ||
+        typeof defaultName !== "string" || defaultName.length === 0 ||
+        new TextEncoder().encode(defaultName).byteLength > 128 ||
+        typeof extract !== "boolean") {
+        refuse("Invalid SFTP directory download request.");
+      }
+      return checked("sftp_download_directory",
+        { browserHandle, directoryHandle, defaultName, extract }, DIALOG_TIMEOUT_MS,
+        isSftpDirectoryDownloadResult, "The SFTP transfer result is invalid.");
     },
     planSftpOperation: async (...values: unknown[]) => {
       requireArity(values, 2, "Invalid SFTP operation request.");

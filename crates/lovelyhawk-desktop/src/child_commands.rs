@@ -597,6 +597,98 @@ pub async fn sftp_download<R: Runtime>(
     }))
 }
 
+/// "下载目录…": a whole remote directory packed server-side into a tar and
+/// downloaded. The save path — or the empty folder for the extract variant —
+/// comes from the system dialog here; the page never names a local path.
+#[tauri::command]
+pub async fn sftp_download_directory<R: Runtime>(
+    window: WebviewWindow<R>,
+    host: State<'_, Host>,
+    browser_handle: String,
+    directory_handle: String,
+    default_name: String,
+    extract: bool,
+) -> CommandResult<Value> {
+    let scope = scope(&window, &host)?;
+    if !opaque(&browser_handle) || !opaque(&directory_handle) {
+        return Err("Invalid SFTP directory download request.".to_owned());
+    }
+    // The page may suggest the archive's file name — flatten it to a plain
+    // component, then the host appends the suffix.
+    let clean: String = default_name
+        .chars()
+        .map(|c| {
+            if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') || c.is_control() {
+                '-'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let clean = clean.trim_matches(['.', ' '].as_slice());
+    let (local_path, extract_to) = if extract {
+        let Some(folder) = local_files::choose(
+            &window,
+            "选择要解压到的空文件夹",
+            DialogKind::PickFolder,
+            None,
+        )
+        .await
+        else {
+            return Ok(json!({ "saved": false }));
+        };
+        // The tar lands in a host temp file this command always removes.
+        let temp = std::env::temp_dir().join(format!(
+            "lovelyhawk-download-{}.tar",
+            uuid::Uuid::new_v4().simple()
+        ));
+        (temp, Some(folder))
+    } else {
+        let base = if clean.is_empty() { "download" } else { clean };
+        let Some(path) = local_files::choose(
+            &window,
+            "保存目录打包文件",
+            DialogKind::Save {
+                default_name: &format!("{base}.tar"),
+            },
+            None,
+        )
+        .await
+        else {
+            return Ok(json!({ "saved": false }));
+        };
+        (path, None)
+    };
+    let receipt = host
+        .bridge
+        .call(
+            "sftp-browser.download-directory",
+            json!({
+                "bindingHandle": scope.binding_handle,
+                "browserHandle": browser_handle,
+                "directoryHandle": directory_handle,
+                "localPath": local_path.to_string_lossy(),
+                "extractTo": extract_to.as_ref().map(|p| p.to_string_lossy().into_owned()),
+            }),
+        )
+        .await;
+    if extract_to.is_some() {
+        let _ = std::fs::remove_file(&local_path);
+    }
+    let receipt = receipt?;
+    let shown = extract_to.as_ref().unwrap_or(&local_path);
+    Ok(json!({
+        "saved": true,
+        "state": receipt.get("state"),
+        "fileCount": receipt.get("fileCount"),
+        "totalBytes": receipt.get("totalBytes"),
+        "archiveBytes": receipt.get("archiveBytes"),
+        "extractedEntries": receipt.get("extractedEntries"),
+        "detail": receipt.get("detail"),
+        "fileName": local_files::display_name(shown, "download"),
+    }))
+}
+
 /// One SFTP change as the browser pane describes it. The backend takes the
 /// fields flat beside the handles, with absent options as nulls.
 #[derive(serde::Deserialize)]

@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   isSftpBrowserOpaqueHandle,
+  isSftpDirectoryDownloadResult,
   isSftpDirectorySnapshot,
   isSftpOperationReceipt,
   isSftpOperationUndoResult,
@@ -155,6 +156,35 @@ describe("sftp browser standalone contract", () => {
     }
   });
 
+  it("validates the directory-download result exactly, including its refusal states", () => {
+    expect(isSftpDirectoryDownloadResult({ saved: false })).toBe(true);
+    const done = {
+      saved: true, state: "done", fileCount: "12", totalBytes: "4096",
+      archiveBytes: "2048", extractedEntries: "10", detail: "目录已打包为 tar 下载。",
+      fileName: "var.tar",
+    };
+    expect(isSftpDirectoryDownloadResult(done)).toBe(true);
+    expect(isSftpDirectoryDownloadResult({
+      ...done, state: "refused-over-cap", archiveBytes: null, extractedEntries: null,
+    })).toBe(true);
+    expect(isSftpDirectoryDownloadResult({ ...done, state: "extract-refused" })).toBe(true);
+    expect(isSftpDirectoryDownloadResult({ ...done, state: "extract-failed" })).toBe(true);
+    for (const invalid of [
+      { saved: false, extra: 1 },
+      { ...done, state: "running" },
+      { ...done, fileCount: 12 },
+      { ...done, archiveBytes: "not-a-number" },
+      { ...done, extractedEntries: -1 },
+      { ...done, detail: "line\nbreak" },
+      { ...done, fileName: "has\nnewline" },
+      { ...done, localPath: "C:\\x" },
+      { ...done, remotePath: "/etc" },
+      null,
+    ]) {
+      expect(isSftpDirectoryDownloadResult(invalid)).toBe(false);
+    }
+  });
+
   /**
    * Reading, plus the one transfer that needs no plan. Everything that changes
    * the target has to arrive through the plan/confirm pipeline instead, so
@@ -196,11 +226,12 @@ describe("sftp browser standalone contract", () => {
     expect(isSftpOperationUndoResult({ ...undone, path: "/etc/passwd" })).toBe(false);
   });
 
-  it("keeps the public surface at exactly thirteen finite methods", () => {
+  it("keeps the public surface at exactly fourteen finite methods", () => {
     const source = readFileSync(new URL("./sftp-browser-contract.ts", import.meta.url), "utf8");
     const api = source.split("export interface SftpBrowserApi")[1]!.split("\n}")[0]!;
     expect([...api.matchAll(/^\s{2}([A-Za-z0-9]+)\(/gmu)].map((match) => match[1])).toEqual([
       "openSftpBrowser", "listSftpDirectory", "readSftpText", "downloadSftpEntry",
+      "downloadSftpDirectory",
       "planSftpOperation", "confirmSftpOperation", "executeSftpOperation",
       "cancelSftpOperation", "undoSftpOperation", "cancelSftpTransfer", "stageSftpUpload", "openFileEditor",
       "openDirectoryTerminal",

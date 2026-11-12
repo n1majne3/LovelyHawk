@@ -17,8 +17,9 @@ use lovelyhawk_core::{
     operations::{DangerousConfirmation, OperationState},
     path_guard::PathGuard,
     sftp::{
-        ArchiveFormat, BoundSftpSession, MAX_DIRECTORY_ENTRIES, RemotePath, SftpEntry,
-        SftpFileKind, SftpMutation, SftpPlannedOperation, SftpTransferCancel, SftpTransport,
+        ArchiveFormat, BoundSftpSession, MAX_ARCHIVE_DOWNLOAD_BYTES, MAX_ARCHIVE_DOWNLOAD_FILES,
+        MAX_DIRECTORY_ENTRIES, RemotePath, SftpEntry, SftpFileKind, SftpMutation,
+        SftpPlannedOperation, SftpTransferCancel, SftpTransport,
     },
     ssh::{BoundSshSession, SFTP_HANDSHAKE_OPERATION},
     target::TargetGuard,
@@ -155,6 +156,200 @@ impl SftpBrowserApi {
             browser_handle: access.browser_handle.clone(),
             file_handle: access.node.handle.clone(),
             bytes: receipt.bytes.to_string(),
+        })
+    }
+
+    /// Packs a whole directory into a remote tar, downloads it to the
+    /// host-chosen local path, and always removes the remote temp archive —
+    /// on success, on refusal, on failure and on cancel. Over-cap trees are
+    /// refused with the counted numbers, and an optional hardened extraction
+    /// can land the members in a chosen empty folder.
+    pub(crate) async fn download_directory(
+        &self,
+        binding_handle: &str,
+        browser_handle: &str,
+        directory_handle: &str,
+        local_path: &Path,
+        extract_to: Option<&Path>,
+    ) -> Result<SftpDirectoryDownloadDto, SftpBrowserApiError> {
+        validate_handle(browser_handle)?;
+        validate_handle(directory_handle)?;
+        let (_, scope) = self.capture_binding(binding_handle)?;
+        let (access, _permit) = self.begin_operation(
+            &scope,
+            browser_handle,
+            directory_handle,
+            EntryAction::Browse,
+        )?;
+        let session = self.bind_sftp(&scope).await?;
+        self.validate_binding(&scope)?;
+        self.verify_operation(&access)?;
+        if self.sftp_degraded(&session).await? {
+            return Err(SftpBrowserApiError::SubsystemUnavailable);
+        }
+        let directory = access.node.path.clone();
+        let parent = directory
+            .parent()
+            .map_err(|_| SftpBrowserApiError::InvalidListing)?;
+        let preflight = timeout(
+            LIST_DEADLINE,
+            self.services
+                .sftp()
+                .directory_archive_preflight(&session, &directory),
+        )
+        .await
+        .map_err(|_| SftpBrowserApiError::Deadline)??;
+        if preflight.files > MAX_ARCHIVE_DOWNLOAD_FILES
+            || preflight.bytes > MAX_ARCHIVE_DOWNLOAD_BYTES
+        {
+            return Ok(SftpDirectoryDownloadDto {
+                browser_handle: browser_handle.to_owned(),
+                state: "refused-over-cap".to_owned(),
+                file_count: preflight.files.to_string(),
+                total_bytes: preflight.bytes.to_string(),
+                archive_bytes: None,
+                extracted_entries: None,
+                detail: format!(
+                    "目录超出打包上限：共 {} 个文件{}；上限为 {} 个文件或 {} 字节。",
+                    preflight.files,
+                    if preflight.files > MAX_ARCHIVE_DOWNLOAD_FILES {
+                        "（超出文件数上限，字节数未统计）".to_owned()
+                    } else {
+                        format!("、{} 字节", preflight.bytes)
+                    },
+                    MAX_ARCHIVE_DOWNLOAD_FILES,
+                    MAX_ARCHIVE_DOWNLOAD_BYTES
+                ),
+            });
+        }
+        // Cancel is wired before packing so a stop during the archive phase
+        // still aborts the download below — the trap and restore then clear
+        // every remote temporary either way.
+        let cancel = SftpTransferCancel::new();
+        let _transfer = self.register_transfer(&scope, browser_handle, &cancel)?;
+        let temporary = parent
+            .child(&format!(
+                ".lovelyres-download-{}.tar",
+                Uuid::new_v4().simple()
+            ))
+            .map_err(|_| SftpBrowserApiError::InvalidListing)?;
+        let mut operation = self
+            .services
+            .sftp()
+            .plan(
+                &session,
+                SftpMutation::CreateArchive {
+                    sources: vec![directory],
+                    destination: temporary.clone(),
+                    format: ArchiveFormat::Tar,
+                },
+            )
+            .map_err(|_| SftpBrowserApiError::InvalidListing)?;
+        operation
+            .confirm(DangerousConfirmation::approve(operation.definition()))
+            .map_err(|_| SftpBrowserApiError::Busy)?;
+        let verification = match operation.execute_and_verify().await {
+            Ok(verification) => verification,
+            Err(error) => {
+                let _ = operation.restore().await;
+                return Err(error.into());
+            }
+        };
+        if !verification.passed {
+            let _ = operation.restore().await;
+            return Err(SftpBrowserApiError::Core);
+        }
+        if cancel.is_cancelled() {
+            // The archive finished after the operator asked to stop: it goes
+            // back away and nothing is downloaded.
+            let _ = operation.restore().await;
+            return Err(SftpBrowserApiError::Cancelled);
+        }
+        let outcome = run_transfer(
+            self.services.sftp().download_new(
+                &session,
+                &self.paths,
+                &temporary,
+                local_path,
+                &cancel,
+            ),
+            &cancel,
+            TRANSFER_DEADLINE,
+        )
+        .await;
+        // Whatever the transfer did, the remote temp archive goes away.
+        let cleaned = operation.restore().await.is_ok();
+        let receipt = match outcome {
+            Err(error) => return Err(error),
+            Ok(Err(error)) => {
+                if lovelyhawk_core::sftp::is_transfer_cancelled(&error) {
+                    return Err(SftpBrowserApiError::Cancelled);
+                }
+                return Err(error.into());
+            }
+            Ok(Ok(receipt)) => receipt,
+        };
+        let mut detail =
+            "目录已打包为 tar 下载；符号链接在包中保持为链接条目，不会跟随成普通文件。".to_owned();
+        let mut extracted_entries = None;
+        if let Some(target) = extract_to {
+            let empty = target
+                .is_dir()
+                .then(|| std::fs::read_dir(target).map(|mut it| it.next().is_none()))
+                .and_then(|result| result.ok())
+                .unwrap_or(false);
+            if !empty {
+                if cleaned {
+                    detail.push_str("远端临时包已删除。");
+                } else {
+                    detail.push_str("远端临时包可能未删除，请核对。");
+                }
+                return Ok(SftpDirectoryDownloadDto {
+                    browser_handle: browser_handle.to_owned(),
+                    state: "extract-refused".to_owned(),
+                    file_count: preflight.files.to_string(),
+                    total_bytes: preflight.bytes.to_string(),
+                    archive_bytes: Some(receipt.bytes.to_string()),
+                    extracted_entries: None,
+                    detail: format!("{detail}所选本机文件夹不存在、不是文件夹或不是空文件夹。"),
+                });
+            }
+            match lovelyhawk_core::local_scan::extract_fetch_archive(local_path, target) {
+                Ok(report) => {
+                    extracted_entries = Some(report.files.to_string());
+                    if report.skipped > 0 {
+                        detail.push_str(&format!(
+                            "解压时跳过 {} 个不安全成员（如链接或越界路径）。",
+                            report.skipped
+                        ));
+                    }
+                }
+                Err(error) => {
+                    return Ok(SftpDirectoryDownloadDto {
+                        browser_handle: browser_handle.to_owned(),
+                        state: "extract-failed".to_owned(),
+                        file_count: preflight.files.to_string(),
+                        total_bytes: preflight.bytes.to_string(),
+                        archive_bytes: Some(receipt.bytes.to_string()),
+                        extracted_entries: None,
+                        detail: format!("{detail}解压失败：{error}"),
+                    });
+                }
+            }
+        }
+        if cleaned {
+            detail.push_str("远端临时包已删除。");
+        } else {
+            detail.push_str("远端临时包可能未删除，请核对。");
+        }
+        Ok(SftpDirectoryDownloadDto {
+            browser_handle: browser_handle.to_owned(),
+            state: "done".to_owned(),
+            file_count: preflight.files.to_string(),
+            total_bytes: preflight.bytes.to_string(),
+            archive_bytes: Some(receipt.bytes.to_string()),
+            extracted_entries,
+            detail,
         })
     }
 
@@ -736,6 +931,23 @@ pub(crate) struct SftpBrowserEntryDto {
     /// make, so the numbers are reported as they arrive.
     pub(crate) owner_id: Option<u32>,
     pub(crate) group_id: Option<u32>,
+}
+
+/// The result of a whole-directory download. `state` is one of
+/// `refused-over-cap`, `extract-refused`, `extract-failed` or `done`; the
+/// counts are always the preflight numbers, `archiveBytes` is the tar's size
+/// once it existed, and `extractedEntries` counts unpacked files when the
+/// optional extraction ran.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SftpDirectoryDownloadDto {
+    pub(crate) browser_handle: String,
+    pub(crate) state: String,
+    pub(crate) file_count: String,
+    pub(crate) total_bytes: String,
+    pub(crate) archive_bytes: Option<String>,
+    pub(crate) extracted_entries: Option<String>,
+    pub(crate) detail: String,
 }
 
 /// What a finished transfer moved, in capability terms only.
@@ -3128,6 +3340,42 @@ mod tests {
         assert!(archive_format("tar-zstd").is_ok());
         for refused in ["zip", "", "tar; rm -rf /", "TAR"] {
             assert!(archive_format(refused).is_err(), "{refused}");
+        }
+    }
+
+    /// The download result crosses as exact camelCase fields with the
+    /// preflight counts always present so a refusal can show its numbers.
+    #[test]
+    fn directory_download_dto_serializes_exact_fields() {
+        let dto = SftpDirectoryDownloadDto {
+            browser_handle: "opaque-browser".to_owned(),
+            state: "refused-over-cap".to_owned(),
+            file_count: "21000".to_owned(),
+            total_bytes: "0".to_owned(),
+            archive_bytes: None,
+            extracted_entries: None,
+            detail: "目录超出打包上限".to_owned(),
+        };
+        let value = serde_json::to_value(&dto).unwrap();
+        let object = value.as_object().unwrap();
+        assert_eq!(object.len(), 7);
+        for key in [
+            "browserHandle",
+            "state",
+            "fileCount",
+            "totalBytes",
+            "archiveBytes",
+            "extractedEntries",
+            "detail",
+        ] {
+            assert!(object.contains_key(key), "{key}");
+        }
+        assert_eq!(value["state"], "refused-over-cap");
+        assert!(value["archiveBytes"].is_null());
+        // No local or remote path ever crosses on the receipt.
+        let encoded = serde_json::to_string(&dto).unwrap();
+        for forbidden in ["localPath", "remotePath", "extractTo", "path"] {
+            assert!(!encoded.contains(forbidden), "{forbidden}");
         }
     }
 

@@ -12,6 +12,7 @@ import {
   isSftpOperationUndoResult,
   isSftpStagedUpload,
   isSftpTextPreview,
+  isSftpDirectoryDownloadResult,
   isSftpTransferResult,
   isSftpTransferCancelResult,
   type SftpOperationInput,
@@ -109,7 +110,7 @@ export function SftpBrowserPage({
   const [pendingPreview, setPendingPreview] = useState<PendingPreview | null>(null);
   const [transferNotice, setTransferNotice] = useState<string | null>(null);
   // The download running now, shown with a way to stop it.
-  const [downloading, setDownloading] = useState<{ browserHandle: string; name: string; cancelling: boolean } | null>(null);
+  const [downloading, setDownloading] = useState<{ browserHandle: string; name: string; stage: string; cancelling: boolean } | null>(null);
   // The open 取回本机扫描 dialog: the browser entry it fetches, never a path this page typed.
   const [localScan, setLocalScan] = useState<{
     browserHandle: string;
@@ -452,7 +453,7 @@ export function SftpBrowserPage({
     if (browserHandle === null || fileHandle === null) return;
     transferInFlight.current = true;
     setTransferNotice(null);
-    setDownloading({ browserHandle, name: selected?.name ?? "所选文件", cancelling: false });
+    setDownloading({ browserHandle, name: selected?.name ?? "所选文件", stage: "正在下载", cancelling: false });
     try {
       const value = await api.downloadSftpEntry(browserHandle, fileHandle);
       if (!isSftpTransferResult(value)) throw new Error();
@@ -463,6 +464,52 @@ export function SftpBrowserPage({
       setTransferNotice(transferStopped(reason)
         ? "已取消下载，写到一半的文件已经删除。"
         : "下载失败；文件可能已变化，或所选位置不可写。");
+    } finally {
+      transferInFlight.current = false;
+      setDownloading(null);
+    }
+  }
+
+  /**
+   * "下载目录…": the target packs the directory into a tar, the host save
+   * dialog — or the folder dialog for the extract variant — picks where it
+   * goes, and the backend removes the remote temp archive however it ends.
+   * The page hands over the directory's opaque handle and a suggested file
+   * name only; local paths are the dialog's business.
+   */
+  async function downloadDirectory(entry: SftpBrowserEntry | null, extract: boolean): Promise<void> {
+    if (transferInFlight.current || entry === null || entry.kind !== "directory") return;
+    const browserHandle = visibleState.directory?.browserHandle ?? null;
+    if (browserHandle === null) return;
+    if (visibleState.directory?.degradedSftp === true) {
+      setTransferNotice("目标没有 SFTP 子系统：无法改名、调整权限、删除或做递归操作；列目录经命令回退完成，文件下载上传经 SCP 通道完成。");
+      return;
+    }
+    transferInFlight.current = true;
+    setTransferNotice(null);
+    setDownloading({
+      browserHandle,
+      name: entry.name,
+      stage: extract ? "正在打包、下载并解压" : "正在打包并下载",
+      cancelling: false,
+    });
+    try {
+      const value = await api.downloadSftpDirectory(
+        browserHandle, entry.entryHandle, entry.name, extract,
+      );
+      if (!isSftpDirectoryDownloadResult(value)) throw new Error();
+      if (!value.saved) {
+        setTransferNotice("已取消保存。");
+      } else if (value.state === "done") {
+        setTransferNotice(value.detail ?? `已保存为 ${value.fileName ?? ""}。`);
+      } else {
+        // Refusals and extract failures carry their own numbers and reasons.
+        setTransferNotice(value.detail ?? "目录下载未完成。");
+      }
+    } catch (reason) {
+      setTransferNotice(transferStopped(reason)
+        ? "已取消下载，写到一半的文件和远端的临时包都已经删除。"
+        : errorText(reason, "目录下载失败；目录可能已变化，或所选位置不可写。"));
     } finally {
       transferInFlight.current = false;
       setDownloading(null);
@@ -506,6 +553,9 @@ export function SftpBrowserPage({
       return void openFileWindow(entry, action === "edit");
     }
     if (action === "download") return void downloadSelected();
+    if (action === "download-directory" || action === "download-directory-extract") {
+      return void downloadDirectory(entry, action === "download-directory-extract");
+    }
     if (action === "properties") {
       if (entry !== null) setProperties(entry);
       return;
@@ -816,7 +866,7 @@ export function SftpBrowserPage({
               a usable size. */}
           {downloading === null ? null : (
             <p className="sftp-browser-transfer is-running" role="status">
-              <span>正在下载 {downloading.name}…</span>
+              <span>{downloading.stage} {downloading.name}…</span>
               <button type="button" disabled={downloading.cancelling} data-testid="sftp-cancel-download"
                 onClick={() => {
                   const current = downloading;
