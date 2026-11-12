@@ -7,10 +7,11 @@ use lovelyhawk_core::{
     windows_incident::{
         BaselineChangePlan, BaselineChangeReport, DvcRuntimeStatus, WindowsAccountsSnapshot,
         WindowsBaselineSnapshot, WindowsCommandMonitorSnapshot, WindowsDefenderSnapshot,
-        WindowsFileAccess, WindowsFilePreview, WindowsFilesSnapshot, WindowsLogsSnapshot,
-        WindowsNetworkSnapshot, WindowsOverviewSnapshot, WindowsProcessInspection,
-        WindowsProcessesSnapshot, WindowsRegistrySnapshot, WindowsStartupSnapshot,
-        WindowsWebshellSnapshot, fileless_powershell_script,
+        WindowsFileAccess, WindowsFilePreview, WindowsFilesSnapshot, WindowsLogonChainSnapshot,
+        WindowsLogsSnapshot, WindowsMssqlAuditSnapshot, WindowsNetworkSnapshot,
+        WindowsOverviewSnapshot, WindowsProcessInspection, WindowsProcessesSnapshot,
+        WindowsRegistrySnapshot, WindowsStartupSnapshot, WindowsWebshellSnapshot,
+        fileless_powershell_script,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -191,6 +192,12 @@ pub(crate) enum WindowsIncidentRequest {
     CollectCommands {
         session_id: String,
     },
+    CollectLogonChains {
+        session_id: String,
+    },
+    CollectMssqlAudit {
+        session_id: String,
+    },
     DeleteFile {
         path: String,
         dir_path: String,
@@ -245,6 +252,8 @@ impl WindowsIncidentRequest {
             | Self::ScanWebshells { session_id, .. }
             | Self::CollectDefender { session_id }
             | Self::CollectCommands { session_id }
+            | Self::CollectLogonChains { session_id }
+            | Self::CollectMssqlAudit { session_id }
             | Self::DeleteFile { session_id, .. }
             | Self::DeleteRegistryValue { session_id, .. } => Some(session_id),
             _ => None,
@@ -347,6 +356,12 @@ pub(crate) enum WindowsIncidentResponse {
     },
     Defender {
         snapshot: WindowsDefenderSnapshot,
+    },
+    LogonChains {
+        snapshot: WindowsLogonChainSnapshot,
+    },
+    MssqlAudit {
+        snapshot: WindowsMssqlAuditSnapshot,
     },
     Commands {
         snapshot: WindowsCommandMonitorSnapshot,
@@ -695,6 +710,7 @@ impl WindowsIncidentApi {
                         | "system"
                         | "application"
                         | "wmi"
+                        | "winrm"
                 ) {
                     return Err(WindowsIncidentError::Invalid);
                 }
@@ -1005,6 +1021,22 @@ impl WindowsIncidentApi {
                         .map_err(|_| WindowsIncidentError::Failed)?
                         .map_err(|_| WindowsIncidentError::Failed)?;
                 Ok(WindowsIncidentResponse::Commands { snapshot })
+            }
+            WindowsIncidentRequest::CollectLogonChains { session_id } => {
+                let snapshot =
+                    tokio::task::spawn_blocking(move || svc.collect_logon_chains(&session_id))
+                        .await
+                        .map_err(|_| WindowsIncidentError::Failed)?
+                        .map_err(|_| WindowsIncidentError::Failed)?;
+                Ok(WindowsIncidentResponse::LogonChains { snapshot })
+            }
+            WindowsIncidentRequest::CollectMssqlAudit { session_id } => {
+                let snapshot =
+                    tokio::task::spawn_blocking(move || svc.collect_mssql_audit(&session_id))
+                        .await
+                        .map_err(|_| WindowsIncidentError::Failed)?
+                        .map_err(|_| WindowsIncidentError::Failed)?;
+                Ok(WindowsIncidentResponse::MssqlAudit { snapshot })
             }
             WindowsIncidentRequest::DeleteFile {
                 path,

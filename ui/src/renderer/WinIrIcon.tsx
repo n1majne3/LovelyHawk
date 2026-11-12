@@ -13,6 +13,8 @@ const paths: Record<WindowsIncidentTab, string> = {
   tasks: "M4 4h16v17H4z M8 2v4 M16 2v4 M4 8h16 M8 14l3 3 5-6",
   accounts: "M16 8a4 4 0 1 1-8 0 4 4 0 0 1 8 0z M4 21v-2c0-4 4-5 8-5s8 1 8 5v2",
   logs: "M5 3h11l3 3v15H5z M15 3v5h4 M9 12h6 M9 16h6",
+  "logon-chains": "M9 11a3 3 0 1 0 0-6 3 3 0 0 0 0 6z M4 21v-1c0-3 2.5-5 5-5s5 2 5 5v1 M14 10h4l3 3-3 3h-4l-3-3z",
+  "mssql-audit": "M12 3c5 0 8 1.5 8 3.5S17 10 12 10 4 8.5 4 6.5 7 3 12 3z M4 6.5v5C4 13.5 7 15 12 15s8-1.5 8-3.5v-5 M4 11.5v5C4 18.5 7 20 12 20s8-1.5 8-3.5v-5",
   defender: "M12 2l8 4v6c0 5-3.5 8.5-8 10-4.5-1.5-8-5-8-10V6z M12 8v5 M12 16h.01",
   files: "M3 6h7l2 3h9v11H3z M3 6V4h7l2 2h7v3",
   webshell: "M10 4a6 6 0 1 0 0 12 6 6 0 0 0 0-12z M14.5 14.5L20 20 M8 10h4 M10 8v4",

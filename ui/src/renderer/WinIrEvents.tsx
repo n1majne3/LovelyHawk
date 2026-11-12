@@ -37,6 +37,7 @@ export const LOG_CATEGORIES = [
   { value: "clear-log", label: "日志清除 · 104 / 1102" },
   { value: "process", label: "进程创建 / 退出 · 4688 / 4689" },
   { value: "wmi", label: "WMI 活动" },
+  { value: "winrm", label: "WinRM / PowerShell 远程管理" },
   { value: "security", label: "Security 最近事件" },
   { value: "system", label: "System 最近事件" },
   { value: "application", label: "Application 最近事件" },

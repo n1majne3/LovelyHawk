@@ -57,6 +57,10 @@ pub fn handle_native_collect(spec: &str) -> String {
         collect_defender()
     } else if spec == "commands" || spec == "commands-v1" {
         collect_commands()
+    } else if spec == "logon-chain" || spec == "logon-chain-v1" {
+        query_powershell_json(crate::windows_read_queries::LOGON_CHAIN)
+    } else if spec == "mssql-audit" || spec == "mssql-audit-v1" {
+        query_powershell_json(crate::windows_read_queries::MSSQL_AUDIT)
     } else if let Some(scan_path) = spec.strip_prefix("webshell-scan:") {
         scan_webshells(scan_path)
     } else {

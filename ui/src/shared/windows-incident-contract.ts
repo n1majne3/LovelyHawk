@@ -18,7 +18,9 @@ export type WindowsRemoteIntent =
         | "collect-startup"
         | "collect-accounts"
         | "collect-defender"
-        | "collect-commands";
+        | "collect-commands"
+        | "collect-logon-chains"
+        | "collect-mssql-audit";
     }
   | { action: "scan-webshells"; path: string }
   | { action: "collect-logs"; category: string }
@@ -256,6 +258,83 @@ export interface WindowsLogsSnapshot {
   entries: WindowsEventLogEntry[];
 }
 
+export interface WindowsLogonEvent {
+  recordId: number;
+  time: string;
+  id: number;
+  logonType: number;
+  account: string;
+  domain: string;
+  sourceIp: string;
+  workstation: string;
+  logonId: string;
+  process: string;
+  authPackage: string;
+}
+
+export interface WindowsLogonFingerprint {
+  /** `"ipc" | "psexec" | "wmic" | "sharp-rdp" | "brute-force"` */
+  kind: string;
+  rule: string;
+}
+
+export interface WindowsLogonChain {
+  sourceIp: string;
+  workstation: string;
+  account: string;
+  events: WindowsLogonEvent[];
+  first: string;
+  last: string;
+  fingerprint: WindowsLogonFingerprint | null;
+  failedBeforeSuccess: number;
+}
+
+export interface WindowsLogonChainSnapshot {
+  /** Security log unreadable — a permission gap, never "no logons". */
+  permissionGap: boolean;
+  truncated: boolean;
+  eventCount: number;
+  chains: WindowsLogonChain[];
+  warnings: string[];
+}
+
+export interface MssqlInstance {
+  name: string;
+  instanceId: string;
+  errorlogPath: string;
+  /** `"ok" | "missing" | "unreadable"` — separate visible states. */
+  errorlogState: string;
+  errorlogSize: number;
+  errorlogTail: string[];
+  tracePath: string;
+  traceSize: number;
+}
+
+export interface MssqlFailedLogin {
+  clientIp: string;
+  account: string;
+  count: number;
+  first: string;
+  last: string;
+}
+
+export interface MssqlClue {
+  source: string;
+  instance: string;
+  /** `"xp-cmdshell" | "ole-automation" | "extended-proc-dll" | "add-extended-proc"` */
+  rule: string;
+  line: string;
+}
+
+export interface WindowsMssqlAuditSnapshot {
+  noInstances: boolean;
+  instances: MssqlInstance[];
+  failedLogins: MssqlFailedLogin[];
+  clues: MssqlClue[];
+  eventCount: number;
+  warnings: string[];
+}
+
 export interface WindowsFileEntry {
   name: string;
   fullPath: string;
@@ -473,7 +552,9 @@ export type WindowsIncidentResponse =
   | { kind: "registry"; snapshot: WindowsRegistrySnapshot }
   | { kind: "webshell"; snapshot: WindowsWebshellSnapshot }
   | { kind: "defender"; snapshot: WindowsDefenderSnapshot }
-  | { kind: "commands"; snapshot: WindowsCommandMonitorSnapshot };
+  | { kind: "commands"; snapshot: WindowsCommandMonitorSnapshot }
+  | { kind: "logon-chains"; snapshot: WindowsLogonChainSnapshot }
+  | { kind: "mssql-audit"; snapshot: WindowsMssqlAuditSnapshot };
 
 export interface WindowsIncidentApi {
   windowsChannel?: import("./windows-channel-contract").WindowsChannelOwnerApi;
@@ -540,6 +621,8 @@ export function isWindowsIncidentRequest(value: unknown): value is WindowsIncide
     case "collect-accounts":
     case "collect-defender":
     case "collect-commands":
+    case "collect-logon-chains":
+    case "collect-mssql-audit":
       return keys();
     case "scan-webshells":
       return (
@@ -570,7 +653,7 @@ export function isWindowsIncidentRequest(value: unknown): value is WindowsIncide
       );
     case "collect-logs":
       return keys("category") && typeof value.category === "string" &&
-        ["all", "logon", "account", "service", "powershell", "failed-logon", "rdp", "defender", "tasks", "sysmon", "clear-log", "process", "security", "system", "application", "wmi"].includes(value.category);
+        ["all", "logon", "account", "service", "powershell", "failed-logon", "rdp", "defender", "tasks", "sysmon", "clear-log", "process", "security", "system", "application", "wmi", "winrm"].includes(value.category);
     case "collect-files":
       return (
         keys("path") &&
@@ -678,7 +761,7 @@ const object = (fields: Readonly<Record<string, Check>>): Check => (value) =>
   isRecord(value) && exactKeys(value, Object.keys(fields)) && Object.entries(fields).every(([key, check]) => check(value[key]));
 const reasonList = list(shortText, 64);
 const port: Check = (value) => uint(value) && (value as number) <= 65535;
-const logCategory: Check = (value) => typeof value === "string" && ["all", "logon", "account", "service", "powershell", "failed-logon", "rdp", "defender", "tasks", "sysmon", "clear-log", "process", "security", "system", "application", "wmi"].includes(value);
+const logCategory: Check = (value) => typeof value === "string" && ["all", "logon", "account", "service", "powershell", "failed-logon", "rdp", "defender", "tasks", "sysmon", "clear-log", "process", "security", "system", "application", "wmi", "winrm"].includes(value);
 
 const checkStatusShape = object({
   registration: object({ registered: boolean, clsid: shortText, addinName: shortText, localServerCommand: nullable(text) }),
@@ -765,6 +848,40 @@ const checkLogs = object({
     recordId: uint, timeCreated: shortText, channel: shortText, eventId: uint, level: shortText, category: shortText,
     summary: text, detail: text, detailTruncated: boolean, riskLevel: risk,
   }), 4096),
+});
+const checkLogonEvent = object({
+  recordId: uint, time: shortText, id: uint, logonType: uint, account: shortText,
+  domain: shortText, sourceIp: shortText, workstation: shortText, logonId: shortText,
+  process: text, authPackage: shortText,
+});
+const checkLogonChains = object({
+  permissionGap: boolean, truncated: boolean, eventCount: uint, warnings: reasonList,
+  chains: list(object({
+    sourceIp: shortText, workstation: shortText, account: shortText, first: shortText, last: shortText,
+    failedBeforeSuccess: uint,
+    fingerprint: (value) => value === null || (isRecord(value) && exactKeys(value, ["kind", "rule"]) &&
+      ["ipc", "psexec", "wmic", "sharp-rdp", "brute-force"].includes(value.kind as string) && isBoundedText(value.rule, 1024)),
+    events: list(checkLogonEvent, 20_000),
+  }), 4_096),
+});
+const checkMssqlAudit = object({
+  noInstances: boolean, eventCount: uint, warnings: reasonList,
+  instances: list(object({
+    name: shortText, instanceId: shortText, errorlogPath: text,
+    errorlogState: (value) => ["ok", "missing", "unreadable"].includes(value as string),
+    errorlogSize: uint,
+    errorlogTail: list(text, 1_024),
+    tracePath: text, traceSize: uint,
+  }), 32),
+  failedLogins: list(object({
+    clientIp: shortText, account: shortText, count: uint, first: shortText, last: shortText,
+  }), 512),
+  clues: list(object({
+    source: (value) => value === "errorlog" || value === "application",
+    instance: shortText,
+    rule: (value) => ["xp-cmdshell", "ole-automation", "extended-proc-dll", "add-extended-proc"].includes(value as string),
+    line: text,
+  }), 512),
 });
 const checkFilesShape = object({
   currentPath: text, totalEntries: uint, truncated: boolean,
@@ -970,6 +1087,10 @@ export function matchesWindowsIncidentResponse(
       return snapshotResponse(value, "commands", checkCommands);
     case "collect-logs":
       return snapshotResponse(value, "logs", checkLogs);
+    case "collect-logon-chains":
+      return snapshotResponse(value, "logon-chains", checkLogonChains);
+    case "collect-mssql-audit":
+      return snapshotResponse(value, "mssql-audit", checkMssqlAudit);
     case "collect-files":
     case "delete-file":
       return snapshotResponse(value, "files", checkFiles);

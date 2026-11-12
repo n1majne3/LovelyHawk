@@ -20,6 +20,8 @@ import { WinIrAccounts, WinIrBaseline, WinIrStartup } from "./WinIrChecks";
 import { useWindowsChannel } from "./use-windows-channel";
 import type { WindowsChannelTab } from "../shared/windows-channel-contract";
 import { WinIrCommands, WinIrDefender, WinIrLogs, WinIrTimeline, WinIrWebshell } from "./WinIrEvents";
+import { WinIrLogonChains } from "./WinIrLogonChains";
+import { WinIrMssqlAudit } from "./WinIrMssqlAudit";
 import { WinIrBaselineChanges } from "./WinIrBaselineChanges";
 import { WinIrFileManager } from "./WinIrFileManager";
 import { WinIrIcon } from "./WinIrIcon";
@@ -188,6 +190,8 @@ export function WindowsIncidentPage({ ref, api, writeClipboard, onBackToWelcome,
       case "services": case "drivers": case "tasks": return data.snapshots[tab]?.entries.filter((entry) => entry.riskLevel !== "normal").length;
       case "accounts": return data.snapshots.accounts?.suspiciousCount;
       case "logs": return data.snapshots.logs?.highRiskCount;
+      case "logon-chains": return data.snapshots["logon-chains"]?.chains.filter((chain) => chain.fingerprint !== null).length;
+      case "mssql-audit": return data.snapshots["mssql-audit"]?.clues.length;
       case "defender": return data.snapshots.defender?.highRiskCount;
       case "files": return data.snapshots.files?.entries.filter((entry) => entry.riskLevel === "high" || entry.riskLevel === "medium").length;
       case "webshell": return data.snapshots.webshell ? data.snapshots.webshell.highRiskCount + data.snapshots.webshell.mediumRiskCount : undefined;
@@ -350,6 +354,8 @@ export function WindowsIncidentPage({ ref, api, writeClipboard, onBackToWelcome,
             {key === "startup" ? <WinIrStartup snapshot={data.snapshots.startup ?? null} busy={busy} connected={connected} focus={focusFor(focus, "startup")} related={related} onCopy={(text) => void copy(text)} onFile={locateFile} onRegistry={locateRegistry} onRemove={(entry) => void removeStartup(entry)} onManage={(kind,entry)=>{setInventoryFocus({kind,name:entry.name,location:entry.location,request:++requestId.current});navigate(kind,true);}} /> : null}
             {key === "accounts" ? <WinIrAccounts snapshot={data.snapshots.accounts ?? null} busy={busy} connected={connected} focus={focusFor(focus, "accounts")} related={related} onCopy={(text) => void copy(text)} onLogs={(query) => goTo({ tab: "logs", query })} onDisable={(entry) => void disableAccount(entry)} onDelete={(entry) => void deleteAccount(entry)} /> : null}
             {key === "logs" ? <WinIrLogs onDirectory={(path) => { if (!busy && connected) { navigate("files", true); void data.collect("files", path); } }} snapshot={data.snapshots.logs ?? null} busy={busy || !connected} category={data.snapshots.logs?.categoryFilter ?? "all"} onCategory={(category) => void data.collect("logs", category)} focus={focusFor(focus, "logs")} onCopy={(text) => void copy(text)} /> : null}
+            {key === "logon-chains" ? <WinIrLogonChains snapshot={data.snapshots["logon-chains"] ?? null} busy={busy} connected={connected} onCopy={(text) => void copy(text)} /> : null}
+            {key === "mssql-audit" ? <WinIrMssqlAudit snapshot={data.snapshots["mssql-audit"] ?? null} busy={busy} connected={connected} onCopy={(text) => void copy(text)} /> : null}
             {key === "defender" ? <WinIrDefender snapshot={data.snapshots.defender ?? null} busy={busy} connected={connected} onCopy={(text) => void copy(text)} onFile={locateFile} /> : null}
             {key === "timeline" ? <WinIrTimeline snapshots={data.snapshots} onCopy={(text) => void copy(text)} onGo={goTo} /> : null}
             {key === "files" ? <WinIrFileManager snapshot={data.snapshots.files ?? null} busy={busy} connected={connected} revealPath={focus?.target.tab === "files" ? focus.target.path : null} related={related} onNavigate={(path) => void data.collect("files", path)} onPreview={data.previewFile} onInspectAccess={data.inspectFileAccess} onCommands={() => openDock("command")} onPull={(path) => void data.pullFile(path).then((received) => { if (received) openDock("files"); })} onDelete={(entry) => void deleteFile(entry)} onScanWebshells={(path) => { navigate("webshell", true); void data.collect("webshell", path); }} onCopy={(text) => void copy(text)} /> : null}

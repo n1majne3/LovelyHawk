@@ -208,3 +208,48 @@ it("validates captured-object details and irreversible deletion without arbitrar
   expect(matchesWindowsIncidentResponse(apply,{kind:"control-report",report})).toBe(true);
   for(const extra of [{...report,canRestore:true},{...report,state:"submitted"}])expect(matchesWindowsIncidentResponse(apply,{kind:"control-report",report:extra})).toBe(false);
 });
+
+it("collects logon chains with an exact snapshot shape and rejects forged fields", () => {
+  const request = { action: "collect-logon-chains", sessionId } as const;
+  expect(isWindowsIncidentRequest(request)).toBe(true);
+  for (const bad of [{ ...request, days: 7 }, { ...request, sessionId: "x" }, { action: "collect-logon-chains" }]) expect(isWindowsIncidentRequest(bad)).toBe(false);
+  const event = { recordId: 1, time: "2026-10-26T01:02:03Z", id: 4624, logonType: 3, account: "svc-web", domain: "LAB", sourceIp: "10.0.0.9", workstation: "WS1", logonId: "0x1f3e2", process: "NtLmSsp", authPackage: "NTLM" };
+  const chain = { sourceIp: "10.0.0.9", workstation: "WS1", account: "svc-web", first: event.time, last: event.time, fingerprint: { kind: "ipc", rule: "单次类型 3 网络登录且没有后续事件" }, failedBeforeSuccess: 0, events: [event] };
+  const snapshot = { permissionGap: false, truncated: false, eventCount: 1, warnings: ["Security 日志需要管理员权限"], chains: [chain] };
+  expect(matchesWindowsIncidentResponse(request, { kind: "logon-chains", snapshot })).toBe(true);
+  for (const bad of [
+    { ...snapshot, chains: [{ ...chain, fingerprint: { kind: "ransom", rule: "x" } }] },
+    { ...snapshot, chains: [{ ...chain, fingerprint: { kind: "ipc" } }] },
+    { ...snapshot, chains: [{ ...chain, events: [{ ...event, note: "extra" }] }] },
+    { ...snapshot, permissionGap: "maybe" },
+    { ...snapshot, extra: 1 },
+  ]) expect(matchesWindowsIncidentResponse(request, { kind: "logon-chains", snapshot: bad })).toBe(false);
+  expect(matchesWindowsIncidentResponse(request, { kind: "mssql-audit", snapshot: { noInstances: true, instances: [], failedLogins: [], clues: [], eventCount: 0, warnings: [] } })).toBe(false);
+});
+
+it("collects MSSQL audit with an exact snapshot shape and rejects forged fields", () => {
+  const request = { action: "collect-mssql-audit", sessionId } as const;
+  expect(isWindowsIncidentRequest(request)).toBe(true);
+  for (const bad of [{ ...request, instance: "MSSQLSERVER" }, { action: "collect-mssql-audit", sessionId, extra: true }]) expect(isWindowsIncidentRequest(bad)).toBe(false);
+  const instance = { name: "MSSQLSERVER", instanceId: "MSSQL16.MSSQLSERVER", errorlogPath: "C:\ERRORLOG", errorlogState: "ok", errorlogSize: 4096, errorlogTail: ["Login failed for user 'sa'"], tracePath: "C:\log.trc", traceSize: 1024 };
+  const snapshot = {
+    noInstances: false, eventCount: 3, warnings: [],
+    instances: [instance],
+    failedLogins: [{ clientIp: "10.0.0.4", account: "sa", count: 9, first: "2026-10-26T01:00:00Z", last: "2026-10-26T01:09:00Z" }],
+    clues: [{ source: "errorlog", instance: "MSSQLSERVER", rule: "xp-cmdshell", line: "Configuration option 'xp_cmdshell' changed" }],
+  };
+  expect(matchesWindowsIncidentResponse(request, { kind: "mssql-audit", snapshot })).toBe(true);
+  for (const bad of [
+    { ...snapshot, instances: [{ ...instance, errorlogState: "hacked" }] },
+    { ...snapshot, instances: [{ ...instance, errorlogTail: Array(1025).fill("x") }] },
+    { ...snapshot, clues: [{ ...snapshot.clues[0], rule: "injection" }] },
+    { ...snapshot, clues: [{ ...snapshot.clues[0], password: "sa" }] },
+    { ...snapshot, noInstances: "yes" },
+  ]) expect(matchesWindowsIncidentResponse(request, { kind: "mssql-audit", snapshot: bad })).toBe(false);
+});
+
+it("accepts the winrm log category and rejects unlisted categories", () => {
+  expect(isWindowsIncidentRequest({ action: "collect-logs", category: "winrm", sessionId })).toBe(true);
+  expect(isWindowsIncidentRequest({ action: "collect-logs", category: "powershell", sessionId })).toBe(true);
+  expect(isWindowsIncidentRequest({ action: "collect-logs", category: "ssh", sessionId })).toBe(false);
+});

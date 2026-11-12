@@ -5,7 +5,9 @@ import type {
   WindowsCommandMonitorSnapshot,
   WindowsDefenderSnapshot,
   WindowsFilesSnapshot,
+  WindowsLogonChainSnapshot,
   WindowsLogsSnapshot,
+  WindowsMssqlAuditSnapshot,
   WindowsNetworkSnapshot,
   WindowsOverviewSnapshot,
   WindowsProcessesSnapshot,
@@ -27,6 +29,8 @@ export interface WinIrSnapshots {
   tasks: WindowsInventorySnapshot;
   accounts: WindowsAccountsSnapshot;
   logs: WindowsLogsSnapshot;
+  "logon-chains": WindowsLogonChainSnapshot;
+  "mssql-audit": WindowsMssqlAuditSnapshot;
   defender: WindowsDefenderSnapshot;
   files: WindowsFilesSnapshot;
   webshell: WindowsWebshellSnapshot;
@@ -57,6 +61,8 @@ export const WIN_IR_MODULES: ReadonlyArray<{
   { key: "tasks", label: "计划任务", group: "调查", description: "查看系统与用户计划任务，核对操作、触发器和运行权限。", action: "刷新计划任务" },
   { key: "accounts", label: "本地账户", group: "调查", description: "核对管理员、账户状态、口令属性与最近登录。", action: "采集账户" },
   { key: "logs", label: "事件日志", group: "取证", description: "围绕登录、账户变更、服务安装和脚本执行筛选事件。", action: "读取事件日志" },
+  { key: "logon-chains", label: "登录链分析", group: "取证", description: "把登录成功与失败事件按来源和账户串成链条，标出爆破后成功、PsExec、WMIC 等横向移动线索。", action: "分析登录链" },
+  { key: "mssql-audit", label: "MSSQL 日志审计", group: "取证", description: "读取 SQL Server 实例的 ERRORLOG 与登录失败事件，标出 xp_cmdshell 等危险配置线索。", action: "审计 MSSQL 日志" },
   { key: "defender", label: "Defender 解析", group: "取证", description: "通过日志与配置快速解析 Windows Defender 威胁检出、处置状态、排除项与防篡改变更。", action: "解析 Defender" },
   { key: "files", label: "文件排查", group: "取证", description: "像文件管理器一样浏览远程目录，查看属性、预览内容并拉取取证文件。", action: "刷新目录" },
   { key: "webshell", label: "Webshell 查杀", group: "取证", description: "多线程扫描 Web 目录与脚本后门，检测一句话木马、冰蝎/哥斯拉特征与高熵混淆脚本。", action: "开始查杀" },

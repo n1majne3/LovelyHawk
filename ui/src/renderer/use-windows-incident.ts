@@ -39,6 +39,8 @@ function collectionRequest(tab: CollectionTab, argument: string): WindowsRemoteI
     case "startup": return { action: "collect-startup" };
     case "accounts": return { action: "collect-accounts" };
     case "logs": return { action: "collect-logs", category: argument };
+    case "logon-chains": return { action: "collect-logon-chains" };
+    case "mssql-audit": return { action: "collect-mssql-audit" };
     case "defender": return { action: "collect-defender" };
     case "files": return { action: "collect-files", path: argument };
     case "webshell": return { action: "scan-webshells", path: argument };

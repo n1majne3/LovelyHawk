@@ -22,6 +22,8 @@ mod baseline;
 mod baseline_change;
 mod control;
 mod inventory;
+mod logon_chain;
+mod mssql_audit;
 mod process_change;
 mod script_transport;
 mod startup_catalog;
@@ -34,6 +36,14 @@ pub use control::{
 };
 pub use inventory::{
     WindowsInventoryEntry, WindowsInventoryKind, WindowsInventorySnapshot, parse_inventory_json,
+};
+pub use logon_chain::{
+    LogonChain, LogonEvent, LogonFingerprint, WindowsLogonChainSnapshot, build_logon_chains,
+    logon_type_label, parse_logon_chain_json,
+};
+pub use mssql_audit::{
+    MssqlAuditEvent, MssqlClue, MssqlFailedLogin, MssqlInstance, WindowsMssqlAuditSnapshot,
+    parse_mssql_audit_json,
 };
 pub use process_change::{
     ProcessChangeItem, ProcessChangePlan, ProcessChangeReport, ProcessChangeState, ProcessPlanItem,
@@ -929,6 +939,28 @@ impl WindowsIncidentService {
         let json_str =
             self.run_native_or_ps(&format!("logs-v2:{category}"), &script, session_id)?;
         parse_logs_json(&json_str, category)
+    }
+
+    /// Logon-chain analysis: Security logon events plus service installs,
+    /// grouped into per-source chains with fingerprints in core.
+    pub fn collect_logon_chains(&self, session_id: &str) -> CoreResult<WindowsLogonChainSnapshot> {
+        let json_str = self.run_native_or_ps(
+            "logon-chain-v1",
+            lovelyhawk_win_dvc::windows_read_queries::LOGON_CHAIN,
+            session_id,
+        )?;
+        parse_logon_chain_json(&json_str)
+    }
+
+    /// MSSQL audit: instance discovery, bounded ERRORLOG tails and failed
+    /// login aggregation — missing and unreadable pieces stay visible.
+    pub fn collect_mssql_audit(&self, session_id: &str) -> CoreResult<WindowsMssqlAuditSnapshot> {
+        let json_str = self.run_native_or_ps(
+            "mssql-audit-v1",
+            lovelyhawk_win_dvc::windows_read_queries::MSSQL_AUDIT,
+            session_id,
+        )?;
+        parse_mssql_audit_json(&json_str)
     }
 
     pub fn collect_files(

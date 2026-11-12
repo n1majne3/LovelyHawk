@@ -31,7 +31,7 @@ pub fn logs(category: &str) -> Option<String> {
         "powershell" => "@{LogName='Microsoft-Windows-PowerShell/Operational'; Id=@(4103,4104)}",
         "failed-logon" => "@{LogName='Security'; Id=@(4625,4740,4771,4776)}",
         "rdp" => {
-            "@{LogName='Microsoft-Windows-TerminalServices-LocalSessionManager/Operational'; Id=@(21,22,23,24,25)},@{LogName='Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational'; Id=@(1149)}"
+            "@{LogName='Microsoft-Windows-TerminalServices-LocalSessionManager/Operational'; Id=@(21,22,23,24,25)},@{LogName='Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational'; Id=@(1149)},@{LogName='Microsoft-Windows-RemoteDesktopServices-RdpCoreTS/Operational'; Id=@(131)}"
         }
         "defender" => {
             "@{LogName='Microsoft-Windows-Windows Defender/Operational'; Id=@(1116,1117,5001,5007)}"
@@ -50,6 +50,7 @@ pub fn logs(category: &str) -> Option<String> {
         "wmi" => {
             "@{LogName='Microsoft-Windows-WMI-Activity/Operational'; Id=@(5857,5858,5859,5860,5861)}"
         }
+        "winrm" => "@{LogName='Microsoft-Windows-WinRM/Operational'; Id=@(6,91,168)}",
         "all" => {
             "@{LogName='Security'; Id=@(4624,4625,4720,4726,4732,4688,1102)},\
                   @{LogName='System'; Id=@(7045,7036,104)},\
@@ -160,6 +161,192 @@ $values = foreach ($name in ($names | Select-Object -First 256)) {{
 "#
     ))
 }
+
+/// Logon-chain collection: Security logon events plus System 7045 service
+/// installs, normalized to one record each so core can build the chains.
+/// A Security-log read failure comes back as `readError` — the page must be
+/// able to tell "no permission" from "no logons".
+pub const LOGON_CHAIN: &str = r#"# LovelyHawk-IR-Query
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$warnings = New-Object System.Collections.Generic.List[string]
+$records = New-Object System.Collections.Generic.List[object]
+$readError = ''
+$maxEvents = 20000
+$truncated = $false
+
+$security = @()
+try {
+  $security = @(Get-WinEvent -FilterHashtable @{ LogName = 'Security'; Id = @(4624,4625,4634,4647,4648,4672,4776); StartTime = (Get-Date).AddDays(-7) } -MaxEvents $maxEvents -ErrorAction Stop)
+  if ($security.Count -ge $maxEvents) { $truncated = $true }
+} catch {
+  if ($_.FullyQualifiedErrorId -like 'NoMatchingEventsFound*') { $security = @() }
+  else { $readError = "Security 日志读取失败：$($_.Exception.Message)（需要管理员或事件日志读取权限）" }
+}
+$installs = @()
+try {
+  $installs = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = @(7045); StartTime = (Get-Date).AddDays(-7) } -MaxEvents 500 -ErrorAction Stop)
+} catch {
+  if ($_.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*') { $warnings.Add('System 服务安装事件读取失败，PsExec 的 7045 线索可能缺失。') }
+}
+
+$recordBytes = 0
+foreach ($e in (@($security) + @($installs))) {
+  $map = @{}
+  try {
+    $xml = [xml]$e.ToXml()
+    foreach ($d in @($xml.Event.EventData.Data)) { if ($d.Name) { $map[[string]$d.Name] = [string]$d.'#text' } }
+  } catch {}
+  $id = [uint32]$e.Id
+  $account = ''; $domain = ''; $ip = ''; $station = ''; $logonId = ''; $proc = ''; $auth = ''
+  switch ($id) {
+    { $_ -in @(4624,4625,4634,4647) } {
+      $account = [string]($map['TargetUserName'] + '')
+      $domain = [string]($map['TargetDomainName'] + '')
+      $ip = [string]($map['IpAddress'] + '')
+      $station = [string]($map['WorkstationName'] + '')
+      $logonId = [string]($map['TargetLogonId'] + '')
+      $proc = [string]($map['ProcessName'] + '')
+      $auth = [string]($map['AuthenticationPackageName'] + '')
+    }
+    4776 {
+      $account = [string]($map['TargetUserName'] + '')
+      $station = [string]($map['Workstation'] + '')
+      $auth = [string]($map['PackageName'] + '')
+    }
+    4648 {
+      $account = [string]($map['TargetUserName'] + '')
+      $domain = [string]($map['TargetDomainName'] + '')
+      $ip = [string]($map['IpAddress'] + '')
+      $logonId = [string]($map['TargetLogonId'] + '')
+      $proc = [string]($map['ProcessName'] + '')
+      $auth = [string]($map['AuthenticationPackageName'] + '')
+    }
+    4672 {
+      $account = [string]($map['SubjectUserName'] + '')
+      $domain = [string]($map['SubjectDomainName'] + '')
+      $logonId = [string]($map['SubjectLogonId'] + '')
+    }
+    7045 {
+      $account = [string]($map['AccountName'] + '')
+      $proc = [string]($map['ImagePath'] + '')
+    }
+  }
+  if ($ip -eq '-') { $ip = '' }
+  if ($station -eq '-') { $station = '' }
+  $lt = 0
+  try { $lt = [int]($map['LogonType']) } catch {}
+  $record = [ordered]@{
+    recordId = [uint64]$e.RecordId
+    time = $e.TimeCreated.ToUniversalTime().ToString('o')
+    id = $id
+    logonType = [uint32][Math]::Max(0, $lt)
+    account = if ($account.Length -gt 256) { $account.Substring(0,256) } else { $account }
+    domain = if ($domain.Length -gt 256) { $domain.Substring(0,256) } else { $domain }
+    sourceIp = if ($ip.Length -gt 64) { $ip.Substring(0,64) } else { $ip }
+    workstation = if ($station.Length -gt 256) { $station.Substring(0,256) } else { $station }
+    logonId = if ($logonId.Length -gt 64) { $logonId.Substring(0,64) } else { $logonId }
+    process = if ($proc.Length -gt 1024) { $proc.Substring(0,1024) } else { $proc }
+    authPackage = if ($auth.Length -gt 128) { $auth.Substring(0,128) } else { $auth }
+  }
+  $recordBytes += [Text.Encoding]::UTF8.GetByteCount(($record | ConvertTo-Json -Compress)) + 1
+  if ($recordBytes -gt 1500000) { $truncated = $true; $warnings.Add('登录事件达到字节预算，后续记录未返回。'); break }
+  $records.Add($record)
+}
+[ordered]@{ events = @($records.ToArray()); truncated = $truncated; readError = $readError; warnings = @($warnings.ToArray()) } | ConvertTo-Json -Depth 5 -Compress
+"#;
+
+/// MSSQL log audit: registry instance discovery, bounded ERRORLOG tails and
+/// Application 18454/18456 failed logins. Every unreadable piece comes back
+/// as its own state — nothing reports silence as safety.
+pub const MSSQL_AUDIT: &str = r#"# LovelyHawk-IR-Query
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$warnings = New-Object System.Collections.Generic.List[string]
+$instances = New-Object System.Collections.Generic.List[object]
+$events = New-Object System.Collections.Generic.List[object]
+$noInstances = $false
+
+$instanceMap = $null
+try {
+  $instanceMap = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\Instance Names\SQL' -ErrorAction Stop
+} catch {
+  $noInstances = $true
+}
+if ($null -ne $instanceMap) {
+  $names = @($instanceMap.PSObject.Properties | Where-Object { $_.Name -notlike 'PS*' } | Select-Object -First 8)
+  if ($names.Count -eq 0) { $noInstances = $true }
+  foreach ($prop in $names) {
+    $instName = [string]$prop.Name
+    $instId = [string]$prop.Value
+    $errorlog = ''
+    try {
+      $params = Get-Item -LiteralPath "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\$instId\MSSQLServer\Parameters" -ErrorAction Stop
+      foreach ($v in @($params.GetValueNames())) {
+        $arg = [string]$params.GetValue($v)
+        if ($arg -match '^-e(.+)$') { $errorlog = $Matches[1].Trim(); break }
+      }
+      if (-not $errorlog) {
+        $setup = Get-ItemProperty -LiteralPath "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\$instId\Setup" -ErrorAction Stop
+        if ($setup.SQLPath) { $errorlog = Join-Path ([string]$setup.SQLPath) 'MSSQL\Log\ERRORLOG' }
+      }
+    } catch { $warnings.Add("实例 $instName 的启动参数读取失败，未能定位 ERRORLOG。") }
+    $state = 'missing'; $size = 0; $tail = @(); $tracePath = ''; $traceSize = 0
+    if ($errorlog) {
+      if (Test-Path -LiteralPath $errorlog -PathType Leaf) {
+        try {
+          $item = Get-Item -LiteralPath $errorlog -ErrorAction Stop
+          $size = [uint64]$item.Length
+          $tail = @(Get-Content -LiteralPath $errorlog -Tail 400 -ErrorAction Stop | ForEach-Object { $line = [string]$_; if ($line.Length -gt 2048) { $line.Substring(0,2048) } else { $line } })
+          $state = 'ok'
+          $candidate = Join-Path (Split-Path -Parent $errorlog) 'log.trc'
+          if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            $tracePath = $candidate
+            try { $traceSize = [uint64](Get-Item -LiteralPath $candidate -ErrorAction Stop).Length } catch {}
+          }
+        } catch {
+          $state = 'unreadable'
+          $warnings.Add("实例 $instName 的 ERRORLOG 读取被拒绝：$($_.Exception.Message)")
+        }
+      }
+    }
+    $instances.Add([ordered]@{
+      name = $instName
+      instanceId = $instId
+      errorlogPath = $errorlog
+      errorlogState = $state
+      errorlogSize = $size
+      errorlogTail = @($tail)
+      tracePath = $tracePath
+      traceSize = $traceSize
+    })
+  }
+}
+
+try {
+  $evs = @(Get-WinEvent -FilterHashtable @{ LogName = 'Application'; Id = @(18454,18456); StartTime = (Get-Date).AddDays(-7) } -MaxEvents 2000 -ErrorAction Stop | Where-Object { [string]$_.ProviderName -like 'MSSQL*' })
+  foreach ($e in $evs) {
+    $msg = [string]$e.Message
+    $client = ''
+    if ($msg -match 'CLIENT:\s*<?([0-9a-fA-F\.:]+)') { $client = $Matches[1].TrimEnd('>') }
+    $acct = ''
+    if ($msg -match "for user '([^']+)'") { $acct = $Matches[1] }
+    if ($msg.Length -gt 1024) { $msg = $msg.Substring(0,1024) }
+    $events.Add([ordered]@{
+      recordId = [uint64]$e.RecordId
+      timeCreated = $e.TimeCreated.ToUniversalTime().ToString('o')
+      eventId = [uint32]$e.Id
+      provider = [string]$e.ProviderName
+      clientIp = $client
+      account = $acct
+      message = $msg
+    })
+  }
+} catch {
+  if ($_.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*') { $warnings.Add('Application 日志的 MSSQL 登录事件读取失败，失败登录统计可能不完整。') }
+}
+[ordered]@{ noInstances = $noInstances; instances = @($instances.ToArray()); events = @($events.ToArray()); warnings = @($warnings.ToArray()) } | ConvertTo-Json -Depth 5 -Compress
+"#;
 
 pub const OVERVIEW: &str = include_str!("queries/overview.ps1");
 pub const BASELINE: &str = concat!(
