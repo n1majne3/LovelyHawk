@@ -2117,7 +2117,7 @@ fn is_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-pub(crate) fn content_sha256(bytes: &[u8]) -> String {
+pub fn content_sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
@@ -2339,9 +2339,10 @@ fn mutation_description(mutation: &SftpMutation) -> (String, Option<String>) {
             ),
             Some("恢复成读到的那组权限位".to_owned()),
         ),
-        SftpMutation::Remove { path } => {
-            (removal_summary(path), Some(RESTORE_FROM_BACKUP.to_owned()))
-        }
+        SftpMutation::Remove { path } => (
+            format!("{}；该操作不做内容核对", removal_summary(path)),
+            Some(RESTORE_FROM_BACKUP.to_owned()),
+        ),
         SftpMutation::RemoveFileIfMatch { path, .. } => (
             format!(
                 "{}；移之前先核对文件还是你看到的那一份",

@@ -30,7 +30,10 @@ use lovelyhawk_core::{
         RESTORE_TOOLS_REFUSAL,
     },
     operations::{DangerousConfirmation, OperationPlan, OperationState, VerificationResult},
-    sftp::{BoundSftpSession, RemotePath, SftpFileKind, SftpMutation, SftpPlannedOperation},
+    sftp::{
+        BoundSftpSession, MAX_EDIT_BYTES, RemotePath, SftpFileKind, SftpMutation,
+        SftpPlannedOperation, content_sha256,
+    },
     ssh::BoundSshSession,
     target::TargetGuard,
 };
@@ -1429,7 +1432,35 @@ impl EmergencyPathApi {
                     mode: expected_mode & !EXECUTE_BITS,
                 }
             }
-            EmergencyPathAction::Quarantine => SftpMutation::Remove { path: path.clone() },
+            EmergencyPathAction::Quarantine => {
+                let metadata = timeout(
+                    INSPECT_DEADLINE,
+                    self.services.sftp().metadata(&session, path, false),
+                )
+                .await
+                .map_err(|_| EmergencyPathApiError::Deadline)?
+                .map_err(|_| EmergencyPathApiError::Core)?;
+                // A regular file quarantines under a content check: the hash
+                // is read while planning and the move refuses to touch
+                // anything that changed since. Everything else — directories,
+                // links, oversized or unreadable files — keeps the plain move
+                // and the plan text says it carries no content check.
+                if metadata.kind == SftpFileKind::File && metadata.size <= MAX_EDIT_BYTES {
+                    let content = timeout(
+                        INSPECT_DEADLINE,
+                        self.services.sftp().read_file(&session, path),
+                    )
+                    .await
+                    .map_err(|_| EmergencyPathApiError::Deadline)?
+                    .map_err(|_| EmergencyPathApiError::Core)?;
+                    SftpMutation::RemoveFileIfMatch {
+                        path: path.clone(),
+                        expected_sha256: content_sha256(&content),
+                    }
+                } else {
+                    SftpMutation::Remove { path: path.clone() }
+                }
+            }
             // SSH-carried actions are matched above the SFTP arm; a
             // new variant must pick a transport there, not fall into
             // this match silently.

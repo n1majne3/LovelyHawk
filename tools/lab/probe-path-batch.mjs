@@ -108,6 +108,40 @@ try {
   const restored = onHost("sh", "-c", "stat -c '%a %n' /var/www/html/aa.php /var/www/html/cc.php");
   check("undo puts both execute bits back", restored.includes("755 /var/www/html/aa.php") && restored.includes("755 /var/www/html/cc.php"));
 
+  // Quarantine gets the same changed-since-plan guarantee through a content
+  // hash: a file whose bytes moved between plan and execute stays untouched.
+  const freshOutput = await sidecar.call("emergency-command.run",
+    { bindingHandle: binding, snapshotHandle: catalog.snapshotHandle, commandHandle: webshell.commandHandle, containerHandle: null });
+  const quarantineHandles = ["aa.php", "bb.php"]
+    .map((file) => (freshOutput.paths ?? []).find((p) => p.path === `/var/www/html/${file}`))
+    .filter(Boolean);
+  check("fresh run re-offers the two still-planted markers", quarantineHandles.length === 2);
+  const qPlan = await sidecar.call("emergency-command.path.batch.plan",
+    { bindingHandle: binding, pathHandles: quarantineHandles.map((h) => h.pathHandle), action: "quarantine" });
+  check("quarantine batch plans both items", qPlan.planned === 2 && qPlan.items.every((item) => item.planHandle !== null));
+  await sidecar.call("emergency-command.path.batch.confirm", { bindingHandle: binding, batchHandle: qPlan.batchHandle });
+  onHost("sh", "-c", "printf '<?php // mutated after quarantine plan' >> /var/www/html/bb.php");
+  const qSteps = [];
+  for (let i = 0; i < 4; i += 1) {
+    const step = await sidecar.call("emergency-command.path.batch.step", { bindingHandle: binding, batchHandle: qPlan.batchHandle });
+    qSteps.push(step);
+    if (step.finished) break;
+  }
+  const qReceipts = qSteps.map((s) => s.receipt).filter(Boolean);
+  const qDone = qReceipts.filter((r) => r.passed);
+  const qRefused = qReceipts.filter((r) => !r.passed);
+  check("content-changed file is refused untouched, unchanged file is quarantined",
+    qDone.length === 1 && qRefused.length === 1 && qRefused[0].untouched === true && qRefused[0].path === "/var/www/html/bb.php");
+  const qAfter = onHost("sh", "-c", "ls /var/www/html/; ls -la /var/www/html/.lovelyres-backups/ 2>/dev/null | tail -n +2");
+  check("quarantined file moved to the backup area, refused one stayed",
+    !qAfter.split("\n")[0].split(" ").includes("aa.php") && qAfter.includes("aa.php.removed") && qAfter.includes("bb.php"));
+  for (const receipt of qDone) {
+    const undo = await sidecar.call("emergency-command.path.undo", { bindingHandle: binding, planHandle: receipt.planHandle });
+    check(`quarantine undo restores ${receipt.path}`, undo.undone === true);
+  }
+  const qRestored = onHost("sh", "-c", "cat /var/www/html/aa.php");
+  check("restored file keeps its original bytes", qRestored.includes("eval($_POST"));
+
   console.log(`\n${checks.length}/${checks.length} checks passed`);
 } catch (error) {
   failure ??= error?.message ?? String(error);
