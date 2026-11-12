@@ -50,12 +50,14 @@ interface SystemInfoPageProps {
   api: SystemInfoApi;
   writeClipboard?: (text: string) => Promise<void>;
   openFile?: (bindingHandle: string, snapshotHandle: string, rowId: string) => Promise<unknown>;
+  /** Opens the command workbench (e.g. for the package-verify check). */
+  onOpenWorkbench?: () => void;
 }
 
 const ROW_LIMITS = [500, 1_000, 2_000, 5_000, MAX_SYSTEM_INFO_ROWS] as const;
 const PAGE_SIZE = 100;
 
-export function SystemInfoPage({ connection, api, writeClipboard, openFile }: SystemInfoPageProps) {
+export function SystemInfoPage({ connection, api, writeClipboard, openFile, onOpenWorkbench }: SystemInfoPageProps) {
   const [state, dispatch] = useReducer(systemInfoReducer, undefined, createSystemInfoState);
   const [summaryVersion, setSummaryVersion] = useState(0);
   const [notice, setNotice] = useState<string | null>(null);
@@ -731,6 +733,7 @@ export function SystemInfoPage({ connection, api, writeClipboard, openFile }: Sy
           onSubmitPassword={(password) => void rowActions.submitPassword(password)}
           onCopyOutput={(text) => void copyText(text, "已复制输出。")}
           onClose={rowActions.close}
+          onOpenWorkbench={onOpenWorkbench}
         />
       ) : null}
 

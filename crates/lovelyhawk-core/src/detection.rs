@@ -994,10 +994,11 @@ for lh_root in $lh_roots; do
   lh_n=$((lh_n + 1))
   if [ "$lh_n" -gt 12 ]; then printf '缺口：站点目录超过 12 个，其余未扫描\n'; break; fi
   if [ ! -r "$lh_root" ] || [ ! -x "$lh_root" ]; then printf '缺口：站点目录不可读，未扫描：%s\n' "$lh_root"; continue; fi
-  find "$lh_root" -xdev -type f -size -2M \( -name '*.php' -o -name '*.php[0-9]' -o -name '*.phtml' -o -name '*.pht' -o -name '*.phar' -o -name '*.jsp' -o -name '*.jspx' -o -name '*.asp' -o -name '*.aspx' -o -name '*.asa' -o -name '*.cer' -o -name '*.ashx' -o -name '*.jpg' -o -name '*.jpeg' -o -name '*.png' -o -name '*.gif' -o -name '.htaccess' -o -name '.user.ini' \) -print0 2>/dev/null | awk -v root="$lh_root" '
+  find "$lh_root" -xdev -type f -size -2048k \( -name '*.php' -o -name '*.php[0-9]' -o -name '*.phtml' -o -name '*.pht' -o -name '*.phar' -o -name '*.jsp' -o -name '*.jspx' -o -name '*.asp' -o -name '*.aspx' -o -name '*.asa' -o -name '*.cer' -o -name '*.ashx' -o -name '*.jpg' -o -name '*.jpeg' -o -name '*.png' -o -name '*.gif' -o -name '.htaccess' -o -name '.user.ini' \) -exec printf '%s\036' {} + 2>/dev/null | awk -v root="$lh_root" '
 BEGIN {
   gsub(/[[:cntrl:]]/, "?", root)
-  RS = "\0"
+  # \036 (RS) as the record delimiter: BusyBox awk cannot split on NUL.
+  RS = sprintf("%c", 30)
   emitted = 0
   scanned = 0
   listed = 0
@@ -1064,7 +1065,7 @@ BEGIN {
     }
   }
   close(path)
-  RS = "\0"
+  RS = sprintf("%c", 30)
   if (rc < 0 && ln == 0 && unread < 40) {
     unread++
     p = path
@@ -2979,7 +2980,7 @@ mod tests {
         assert!(command.contains("'.htaccess'"));
         assert!(command.contains("'.user.ini'"));
         assert!(!command.contains("-mtime"), "age restriction must be gone");
-        assert!(command.contains("-size -2M"), "per-file size cap stays");
+        assert!(command.contains("-size -2048k"), "per-file size cap stays");
         for needle in [
             "/home/*/public_html",
             "/var/www/*/html",

@@ -140,6 +140,20 @@ ExecStart=/tmp/lhlab.sh
         quiet: &[],
     },
     Case {
+        id: "file-smarty-templates-c",
+        fixture: "mkdir -p /var/www/html/templates_c /var/www/html/templates; printf '<?php eval($_POST[\"lh\"]);' > /var/www/html/templates_c/aa11_file_index.tpl.php; printf '{if $lh}ok{/if}' > /var/www/html/templates/index.tpl",
+        expect: &["templates_c/aa11_file_index.tpl.php", "执行/解码特征"],
+        expect_pkg: &[],
+        quiet: &[],
+    },
+    Case {
+        id: "file-webshell-hint",
+        fixture: "mkdir -p /var/www/html; printf '<?php eval($_POST[\"lh\"]);' > /var/www/html/lhlab.php",
+        expect: &["/var/www/html/lhlab.php"],
+        expect_pkg: &[],
+        quiet: &[],
+    },
+    Case {
         id: "system-modules",
         fixture: "",
         expect: &[],

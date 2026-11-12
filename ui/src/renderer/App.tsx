@@ -699,6 +699,7 @@ export function App() {
               api={window.lovelyhawk}
               writeClipboard={window.lovelyhawk.writeClipboard}
               openFile={window.lovelyhawk.openSystemInfoFile}
+              onOpenWorkbench={() => void navigateTo("emergency-commands")}
             />
           ) : activePage.id === "ai-history" ? (
             <AiHistoryPage

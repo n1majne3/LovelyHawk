@@ -83,6 +83,14 @@ pub(crate) enum Guard {
         runtime_before: String,
         runtime_after: String,
     },
+    /// Appending `Subsystem sftp internal-sftp` to sshd_config when `sshd -T`
+    /// reports no effective sftp subsystem. The write prepends a global line
+    /// so no `Match` block is touched, keeps the original inode, and restores
+    /// by copying the verified backup back over the same file.
+    Sftp {
+        before: BaselineBackupEvidence,
+        state_before: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -244,6 +252,228 @@ $(cat "$lh_f")"
       else if (!n) { print "SUDOLOG|syslog-only"; print "SUDOLOG_OK" }
       else { print "SUDOLOG|unset"; print "SUDOLOG_OK" }
     }'
+}
+lh_apache() {
+  for lh_t in awk cat head ps; do command -v "$lh_t" >/dev/null 2>&1 || return 1; done
+  lh_confs=''
+  for lh_f in /etc/httpd/conf/httpd.conf /etc/apache2/apache2.conf /usr/local/apache2/conf/httpd.conf \
+    /etc/httpd/conf.d/*.conf /etc/apache2/conf-enabled/*.conf /etc/apache2/sites-enabled/*.conf \
+    /etc/apache2/mods-enabled/*.conf /usr/local/apache2/conf/extra/*.conf; do
+    [ -r "$lh_f" ] && lh_confs="$lh_confs $lh_f"
+  done
+  lh_modbin=''
+  for lh_c in apachectl apache2ctl httpd apache2; do
+    command -v "$lh_c" >/dev/null 2>&1 && { lh_modbin=$lh_c; break; }
+  done
+  [ -n "$lh_confs$lh_modbin" ] || { printf 'APACHE|ABSENT\n'; return 0; }
+  # Debian/RHEL write `User ${APACHE_RUN_USER}`; the value lives in envvars
+  # files, so read those too or the directive cannot be judged.
+  lh_envs=''
+  for lh_e in /etc/apache2/envvars /etc/sysconfig/httpd /etc/default/apache2 /etc/httpd/envvars; do
+    [ -r "$lh_e" ] && lh_envs="$lh_envs $lh_e"
+  done
+  if [ -n "$lh_confs" ]; then
+    cat $lh_confs 2>/dev/null | head -c 524288 | awk -v envtext="$(cat $lh_envs 2>/dev/null)" '
+      BEGIN {
+        en = split(envtext, EL, "\n")
+        for (i = 1; i <= en; i++) {
+          s = EL[i]
+          sub(/^[ \t]*export[ \t]+/, "", s); sub(/^[ \t]+/, "", s)
+          eq = index(s, "=")
+          if (eq < 2) continue
+          nm = substr(s, 1, eq - 1); vv = substr(s, eq + 1)
+          gsub(/[ \t]+/, "", nm); sub(/[ \t]*#.*$/, "", vv)
+          gsub(/^[ \t]+|[ \t]+$/, "", vv)
+          sub(/^"/, "", vv); sub(/"$/, "", vv); sub(/^\47/, "", vv); sub(/\47$/, "", vv)
+          if (nm ~ /^[A-Za-z_][A-Za-z0-9_]*$/) env[nm] = vv
+        }
+      }
+      function resolve(vv,   nm, z) {
+        for (z = 0; z < 8; z++) {
+          if (!match(vv, /[$][{]?[A-Za-z_][A-Za-z0-9_]*[}]?/)) return vv
+          nm = substr(vv, RSTART, RLENGTH)
+          gsub(/[$}{]/, "", nm)
+          if (!(nm in env)) return "unresolved"
+          vv = substr(vv, 1, RSTART - 1) env[nm] substr(vv, RSTART + RLENGTH)
+        }
+        return "unresolved"
+      }
+      /^[ \t]*(#|$)/ { next }
+      {
+        low = tolower($0)
+        if (low ~ /<[ \t]*location/) { inloc = 1; rst = 0; hnd = 0; next }
+        if (inloc && low ~ /<\/[ \t]*location/) { if (hnd && !rst) st = "exposed"; inloc = 0; next }
+        if (inloc && low ~ /sethandler[ \t]+server-(status|info)/) hnd = 1
+        if (inloc && low ~ /require|allow[ \t]+from|order[ \t]|deny[ \t]+from/) rst = 1
+        k = tolower($1)
+        if (k == "options") {
+          seen = 1; grant = 0; deny = 0; none = 0
+          for (i = 2; i <= NF; i++) {
+            w = tolower($i); gsub(/["\47]/, "", w)
+            if (w == "none") none = 1
+            else if (w == "all" || w == "+all" || w == "indexes" || w == "+indexes") grant = 1
+            else if (w == "-indexes" || w == "-all") deny = 1
+          }
+          if (grant && !deny && !none) idx_on = 1
+          next
+        }
+        if (k == "user") usr = resolve($2)
+        else if (k == "timeout" && $2 ~ /^[0-9]+$/) tmo = $2
+        else if (k == "limitrequestbody") lrb = 1
+        else if (!inloc && low ~ /sethandler[ \t]+server-(status|info)/) st = "exposed"
+      }
+      END {
+        if (idx_on) print "APACHE|indexes|on"
+        else if (seen) print "APACHE|indexes|off"
+        else print "APACHE|indexes|unset"
+        print "APACHE|status|" (st == "" ? "off" : st)
+        print "APACHE|usr|" (usr == "" ? "unset" : usr)
+        if (tmo != "") print "APACHE|tmo|" tmo
+        if (lrb) print "APACHE|lrb|set"
+      }'
+  else
+    printf 'APACHE|indexes|unverified\nAPACHE|status|unverified\nAPACHE|usr|unverified\n'
+  fi
+  ps -eo uid,ppid,comm 2>/dev/null | awk '
+    $3 ~ /^(httpd|apache2)$/ {
+      if ($2 == 1) master = NR
+      else if ($1 == 0) w0 = 1
+    }
+    END { if (w0) print "APACHE|worker0|1" }'
+  lh_mods=''
+  if [ -n "$lh_modbin" ]; then
+    lh_mods=$("$lh_modbin" -M 2>/dev/null | awk '{print tolower($1)}')
+  fi
+  if [ -z "$lh_mods" ] && [ -n "$lh_confs" ]; then
+    lh_mods=$(cat $lh_confs 2>/dev/null | awk 'tolower($1)=="loadmodule"{print tolower($2)}')
+  fi
+  if [ -z "$lh_mods" ]; then
+    printf 'APACHE|mods|unverified\nAPACHE_OK\n'; return 0
+  fi
+  printf '%s\n' "$lh_mods" | awk '
+    /^(autoindex|status|info|userdir|cgi|cgid|asis|dav|dav_fs|dav_lock|proxy_ftp)(_module)?$/ {
+      sub(/_module$/, ""); risky = risky (risky ? "," : "") $0; r = 1
+    }
+    END { print "APACHE|mods|" (r ? risky : "none") }'
+  printf 'APACHE_OK\n'
+}
+lh_tomcat() {
+  for lh_t in awk cat ps grep; do command -v "$lh_t" >/dev/null 2>&1 || return 1; done
+  lh_home=''
+  for lh_d in /usr/local/tomcat /opt/tomcat /opt/tomcat* /etc/tomcat /etc/tomcat* /var/lib/tomcat* /usr/share/tomcat*; do
+    if [ -d "$lh_d" ] && { [ -r "$lh_d/conf/server.xml" ] || [ -d "$lh_d/webapps" ]; }; then
+      lh_home=$lh_d; break
+    fi
+  done
+  [ -n "$lh_home" ] || { printf 'TOMCAT|ABSENT\n'; return 0; }
+  lh_conf=$lh_home/conf
+  lh_web=$lh_home/webapps
+  # manager/host-manager deploy two ways: a webapps/<name> dir or an external
+  # $conf/Catalina/localhost/<name>.xml descriptor whose docBase may live
+  # outside webapps (Debian tomcat10-admin). A descriptor overrides the app's
+  # own META-INF/context.xml, so it is the only restriction source then.
+  # An unreadable deployment channel is a gap, not proof of absence.
+  lh_mgr_bad=0 lh_mgr_gap=0
+  for lh_xd in "$lh_conf" "$lh_conf/Catalina/localhost" "$lh_web"; do
+    [ -d "$lh_xd" ] || continue
+    [ -r "$lh_xd" ] && [ -x "$lh_xd" ] || lh_mgr_gap=1
+  done
+  for lh_base in manager host-manager; do
+    lh_cx="$lh_conf/Catalina/localhost/$lh_base.xml"
+    lh_deployed=0 lh_restricted=0
+    if [ -r "$lh_cx" ]; then
+      lh_deployed=1
+      grep -qE 'RemoteAddrValve|RemoteCIDRValve|allow="127\.|allow="::1' "$lh_cx" 2>/dev/null && lh_restricted=1
+    elif [ -d "$lh_web/$lh_base" ]; then
+      lh_deployed=1
+      if [ -r "$lh_web/$lh_base/META-INF/context.xml" ] && grep -qE 'RemoteAddrValve|RemoteCIDRValve|allow="127\.|allow="::1' "$lh_web/$lh_base/META-INF/context.xml" 2>/dev/null; then
+        lh_restricted=1
+      fi
+    fi
+    if [ "$lh_deployed" = 1 ] && [ "$lh_restricted" = 0 ]; then lh_mgr_bad=1; fi
+  done
+  # A confirmed exposure outranks an enumeration gap; a gap alone is never safe.
+  if [ "$lh_mgr_bad" = 1 ]; then printf 'TOMCAT|mgr|exposed\n'
+  elif [ "$lh_mgr_gap" = 1 ]; then printf 'TOMCAT|mgr|unverified\n'
+  else printf 'TOMCAT|mgr|safe\n'; fi
+  if [ -r "$lh_conf/server.xml" ]; then
+    awk '
+      {
+        # XML comments may span lines; a commented connector is no connector.
+        s = $0
+        while (length(s) > 0) {
+          if (cmt) { e = index(s, "-->"); if (e == 0) { s = ""; break }; s = substr(s, e + 3); cmt = 0; continue }
+          c = index(s, "<!--"); if (c == 0) break
+          e = index(substr(s, c + 4), "-->")
+          if (e == 0) { s = substr(s, 1, c - 1); cmt = 1; break }
+          s = substr(s, 1, c - 1) substr(s, c + 4 + e + 2)
+        }
+        line = s
+      }
+      line ~ /<[Cc]onnector/ || buf != "" { buf = buf " " line; if (line !~ />/) next }
+      { if (buf != "") { l = buf; buf = "" } else l = line
+        if (tolower(l) ~ /protocol[^>]*ajp/) {
+          ajp = "open"
+          if (l ~ /secretRequired="true"/ || l ~ /secret="[^"]+"/) ajp = "secured"
+        } }
+      END { print "TOMCAT|ajp|" (ajp == "open" ? "open" : "secured") }' "$lh_conf/server.xml"
+  else
+    printf 'TOMCAT|ajp|unverified\n'
+  fi
+  # comm narrows to real launchers; args must still name catalina/tomcat so an
+  # unrelated java process is not attributed to this instance. The lh_tomcat
+  # token excludes this probe's own argv, which embeds the script text.
+  ps -eo uid,comm,args 2>/dev/null | awk '
+    ($2 == "java" || $2 == "jsvc") && $0 ~ /catalina|tomcat/ && $0 !~ /lh_tomcat/ {
+      seen = 1
+      if ($1 == 0) root = 1
+    }
+    END {
+      if (root) print "TOMCAT|usr|root"
+      else if (seen) print "TOMCAT|usr|non-root"
+      else print "TOMCAT|usr|unknown"
+    }'
+  if [ -r "$lh_conf/web.xml" ]; then
+    awk '
+      {
+        # Commented-out parameters must not answer for the live config.
+        s = $0
+        while (length(s) > 0) {
+          if (cmt) { e = index(s, "-->"); if (e == 0) { s = ""; break }; s = substr(s, e + 3); cmt = 0; continue }
+          c = index(s, "<!--"); if (c == 0) break
+          e = index(substr(s, c + 4), "-->")
+          if (e == 0) { s = substr(s, 1, c - 1); cmt = 1; break }
+          s = substr(s, 1, c - 1) substr(s, c + 4 + e + 2)
+        }
+        line = s
+      }
+      line ~ /init-param/ { inp = 1; nm = ""; vl = "" }
+      inp && line ~ /<param-name>/ { t = line; gsub(/.*<param-name>|<\/param-name>.*/, "", t); nm = t }
+      inp && line ~ /<param-value>/ { t = line; gsub(/.*<param-value>|<\/param-value>.*/, "", t); vl = t;
+        if (nm ~ /listings/) lst = (vl ~ /true/ ? "true" : "false"); inp = 0 }
+      line ~ /<session-timeout>/ { t = line; gsub(/.*<session-timeout>|<\/session-timeout>.*/, "", t); ses = t }
+      END {
+        print "TOMCAT|lst|" (lst == "" ? "false" : lst)
+        print "TOMCAT|ses|" (ses ~ /^[0-9]+$/ ? ses : "30")
+      }' "$lh_conf/web.xml"
+  else
+    printf 'TOMCAT|lst|unverified\nTOMCAT|ses|unverified\n'
+  fi
+  printf 'TOMCAT_OK\n'
+}
+lh_sftp() {
+  lh_file /etc/ssh/sshd_config || return 1
+  lh_a=$lh_attrs lh_d=$lh_digest
+  command -v sshd >/dev/null 2>&1 || return 1
+  lh_t=$(sshd -T 2>/dev/null) || return 1
+  lh_state=absent
+  printf '%s\n' "$lh_t" | awk '$1=="subsystem" && $2=="sftp"{f=1} END{exit !f}' && lh_state=present
+  printf 'SFTP|%s|%s|%s\n' "$lh_state" "$lh_a" "$lh_d"
+}
+lh_sftp_state() {
+  command -v sshd >/dev/null 2>&1 || return 1
+  lh_t=$(sshd -T 2>/dev/null) || return 1
+  printf '%s\n' "$lh_t" | awk '$1=="subsystem" && $2=="sftp"{f=1} END{if(f) print "present"; else print "absent"}'
 }
 "#;
 
@@ -414,9 +644,13 @@ fn audit_policy(probe: &AuditProbe) -> CoreResult<String> {
 }
 
 pub(super) fn scan_item(definition: &BaselineDefinition) -> String {
-    // `lr_h` is defined once in the scan functions; the scan has to fit in
-    // one argument.
-    format!("lr_h {} {};", shq(definition.id), shq(definition.file))
+    // A self-contained placeholder row: the host observation replaces it, and
+    // an empty source defaults to the check's primary file.
+    format!(
+        "printf 'ITEM=%s\\t__unverified__\\t%s\\n' {} {}; ",
+        shq(definition.id),
+        shq(definition.file)
+    )
 }
 async fn run(
     service: &BaselineService,
@@ -438,7 +672,7 @@ async fn run(
 }
 pub(super) fn scan_script() -> String {
     format!(
-        "\n{PROBE}\nfor lh_target in {}; do (lh_perm \"$lh_target\") 2>/dev/null || printf 'GAP|%s\\n' \"$lh_target\"; done; (lh_audit) 2>/dev/null || printf 'GAP|audit\\n'; (lh_sshd) 2>/dev/null || printf 'GAP|sshd\\n'; (lh_tmout) 2>/dev/null || printf 'GAP|tmout\\n'; (lh_pwhist) 2>/dev/null || printf 'GAP|pwhist\\n'; (lh_wheel) 2>/dev/null || printf 'GAP|wheel\\n'; (lh_dormant) 2>/dev/null || printf 'GAP|dormant\\n'",
+        "\n{PROBE}\nfor lh_target in {}; do (lh_perm \"$lh_target\") 2>/dev/null || printf 'GAP|%s\\n' \"$lh_target\"; done; (lh_audit) 2>/dev/null || printf 'GAP|audit\\n'; (lh_sshd) 2>/dev/null || printf 'GAP|sshd\\n'; (lh_tmout) 2>/dev/null || printf 'GAP|tmout\\n'; (lh_pwhist) 2>/dev/null || printf 'GAP|pwhist\\n'; (lh_wheel) 2>/dev/null || printf 'GAP|wheel\\n'; (lh_dormant) 2>/dev/null || printf 'GAP|dormant\\n'; (lh_apache) 2>/dev/null || printf 'GAP|apache\\n'; (lh_tomcat) 2>/dev/null || printf 'GAP|tomcat\\n'",
         AUTH_FILES
             .iter()
             .map(|p| shq(p))
@@ -689,6 +923,113 @@ fn sudolog_observed(output: &str) -> BaselineObservedValue {
         _ => BaselineObservedValue::Value("unset".to_owned()),
     }
 }
+
+/// `APACHE|<key>|<value>` rows; `APACHE|ABSENT` means the component is not on
+/// the host at all, and a missing `APACHE_OK` keeps every check undecidable.
+fn apache_observed(item_id: &str, output: &str) -> BaselineObservedValue {
+    if output.lines().any(|line| line == "APACHE|ABSENT") {
+        return BaselineObservedValue::NotInstalled;
+    }
+    if !output.lines().any(|line| line == "APACHE_OK") {
+        return BaselineObservedValue::Unverified;
+    }
+    let get = |key: &str| {
+        output
+            .lines()
+            .filter_map(|line| line.strip_prefix(&format!("APACHE|{key}|")))
+            .next()
+            .unwrap_or("")
+    };
+    let v = |s: &str| BaselineObservedValue::Value(s.to_owned());
+    match item_id {
+        "apache-options-indexes" => match get("indexes") {
+            "on" => v("on"),
+            "off" => v("off"),
+            _ => v("unset"),
+        },
+        "apache-status-info" => match get("status") {
+            "exposed" => v("exposed"),
+            "unverified" => BaselineObservedValue::Unverified,
+            _ => v("off"),
+        },
+        "apache-run-user" => {
+            if get("worker0") == "1" {
+                v("root-worker")
+            } else {
+                match get("usr") {
+                    "unverified" | "unresolved" => BaselineObservedValue::Unverified,
+                    "root" => v("root"),
+                    "" | "unset" => v("unset"),
+                    _ => v("non-root"),
+                }
+            }
+        }
+        "apache-timeout" => match get("tmo").parse::<u64>() {
+            Ok(n) if n <= 300 => v("within-300"),
+            Ok(n) => v(&n.to_string()),
+            _ => v("within-300"),
+        },
+        "apache-limit-request-body" => v(if get("lrb") == "set" {
+            "configured"
+        } else {
+            "unset"
+        }),
+        "apache-modules-minimal" => match get("mods") {
+            "unverified" | "" => BaselineObservedValue::Unverified,
+            m => v(m),
+        },
+        _ => BaselineObservedValue::Unverified,
+    }
+}
+
+/// `TOMCAT|<key>|<value>` rows, same contract as `APACHE|*`.
+fn tomcat_observed(item_id: &str, output: &str) -> BaselineObservedValue {
+    if output.lines().any(|line| line == "TOMCAT|ABSENT") {
+        return BaselineObservedValue::NotInstalled;
+    }
+    if !output.lines().any(|line| line == "TOMCAT_OK") {
+        return BaselineObservedValue::Unverified;
+    }
+    let get = |key: &str| {
+        output
+            .lines()
+            .filter_map(|line| line.strip_prefix(&format!("TOMCAT|{key}|")))
+            .next()
+            .unwrap_or("")
+    };
+    let v = |s: &str| BaselineObservedValue::Value(s.to_owned());
+    match item_id {
+        "tomcat-manager-access" => match get("mgr") {
+            "exposed" => v("exposed"),
+            "unverified" => BaselineObservedValue::Unverified,
+            _ => v("safe"),
+        },
+        "tomcat-ajp-secret" => match get("ajp") {
+            "open" => v("open"),
+            "unverified" => BaselineObservedValue::Unverified,
+            _ => v("secured"),
+        },
+        "tomcat-run-user" => match get("usr") {
+            "root" => v("root"),
+            "non-root" => v("non-root"),
+            _ => BaselineObservedValue::Unverified,
+        },
+        "tomcat-listings-off" => match get("lst") {
+            "true" => v("true"),
+            "unverified" => BaselineObservedValue::Unverified,
+            _ => v("false"),
+        },
+        "tomcat-session-timeout" => match get("ses").parse::<u64>() {
+            Ok(n) if n <= 30 => v("within-30"),
+            Ok(n) => v(&n.to_string()),
+            _ => match get("ses") {
+                "unverified" => BaselineObservedValue::Unverified,
+                _ => v("within-30"),
+            },
+        },
+        _ => BaselineObservedValue::Unverified,
+    }
+}
 pub(super) fn scan_from_output(output: &str) -> CoreResult<Vec<BaselineStatus>> {
     BASELINE_CATALOG
         .iter()
@@ -706,6 +1047,10 @@ pub(super) fn scan_from_output(output: &str) -> CoreResult<Vec<BaselineStatus>> 
                 Some(dormant_observed(output))
             } else if d.id == "sudo-operation-log" {
                 Some(sudolog_observed(output))
+            } else if d.id.starts_with("apache-") {
+                Some(apache_observed(d.id, output))
+            } else if d.id.starts_with("tomcat-") {
+                Some(tomcat_observed(d.id, output))
             } else if d.file == AUDIT_FILE {
                 output
                     .lines()
@@ -787,7 +1132,12 @@ async fn capture_state(
     } else {
         "true"
     };
-    if definition.file == AUDIT_FILE {
+    if definition.id == "ssh-sftp-subsystem" {
+        let output = run(service, session, &format!("{permission} && lh_sftp")).await?;
+        let guard = parse_sftp(output.trim(), definition.file)?;
+        guard.validate(definition)?;
+        Ok(guard)
+    } else if definition.file == AUDIT_FILE {
         let output = run(service, session, &format!("{permission} && lh_audit")).await?;
         let probe = parse_audit(output.trim())?;
         let after = audit_policy(&probe)?;
@@ -836,6 +1186,19 @@ pub(super) async fn read_view(
                 a[0], a[1], a[2]
             )
         }
+        Ok(Guard::Sftp {
+            before,
+            state_before,
+        }) => {
+            format!(
+                "sshd -T 生效 sftp 子系统：{state_before}。\n{}文件身份已核对；可经确认写入 Subsystem sftp internal-sftp（不依赖外部 sftp-server），经 sshd -t 校验后重载，失败可独立放回。\n不改动 Match 块；生效值来自其他位置时不提供写入。",
+                if before.sha256.is_some() {
+                    "sshd_config 完整摘要与"
+                } else {
+                    "sshd_config "
+                }
+            )
+        }
         Ok(Guard::Audit {
             before,
             runtime_before,
@@ -867,6 +1230,8 @@ pub(super) async fn read_view(
         path: definition.file.to_owned(),
         key: if definition.file == AUDIT_FILE {
             "认证文件监控"
+        } else if definition.id == "ssh-sftp-subsystem" {
+            "SFTP 子系统"
         } else {
             "文件属主与权限"
         },
@@ -880,7 +1245,9 @@ pub(super) async fn read_view(
 impl Guard {
     fn before(&self) -> &BaselineBackupEvidence {
         match self {
-            Self::Permissions { before, .. } | Self::Audit { before, .. } => before,
+            Self::Permissions { before, .. }
+            | Self::Audit { before, .. }
+            | Self::Sftp { before, .. } => before,
         }
     }
     pub(super) fn validate(&self, definition: &BaselineDefinition) -> CoreResult<()> {
@@ -936,6 +1303,21 @@ impl Guard {
                     return Err(error("audit plan changed"));
                 }
             }
+            Self::Sftp {
+                before,
+                state_before,
+            } => {
+                // The only writable transition is absent -> internal-sftp.
+                // If sshd -T already reports an effective Subsystem sftp line
+                // (from any file sshd reads), no write is offered.
+                if definition.id != "ssh-sftp-subsystem"
+                    || definition.file != before.file
+                    || state_before != "absent"
+                    || before.sha256.is_none()
+                {
+                    return Err(error("invalid sftp plan"));
+                }
+            }
         }
         Ok(())
     }
@@ -953,6 +1335,9 @@ impl Guard {
                     a[0], a[1], a[2]
                 ))
             }
+            Self::Sftp { .. } => Ok(format!(
+                "在 {file} 开头追加全局指令 Subsystem sftp internal-sftp：不依赖外部 sftp-server 二进制，不改动 Match 块与已有内容，写入后经 sshd -t 校验并重载 sshd。先在受管私有目录备份完整文件；新连接即可使用 SFTP/本工作台文件管理，进行中的会话不受影响。放回前核对备份摘要，把原文件内容写回同一 inode 并重载；遇到后续变化即停止。",
+            )),
             Self::Audit { runtime_before, .. } => Ok(format!(
                 "为 /etc/passwd、/etc/group、/etc/shadow、/etc/gshadow 增加写入及属性变化监控。规则片段：{file}（root:root，0600）；运行中只添加缺失的 {} 条本工具规则，不重载其他规则或重启服务。会增加审计事件量。保存片段不证明启动加载，规则存在不证明日志成功落盘，须独立产生测试事件并检查留存。恢复只撤销本次新增规则并放回原片段，遇到后续变化即停止。\n{}",
                 wanted_rules()
@@ -1012,7 +1397,46 @@ fn guard_assertion(guard: &Guard, restored: bool) -> CoreResult<String> {
                 shq(runtime)
             ))
         }
+        Guard::Sftp {
+            before,
+            state_before,
+        } => {
+            if restored {
+                Ok(format!(
+                    "{} [ \"$(lh_sftp_state)\" = {} ] || exit 42; ",
+                    assert_file_evidence(before),
+                    shq(state_before)
+                ))
+            } else {
+                // Same inode, new digest, and `sshd -T` must now read the
+                // effective line — file content alone is not proof.
+                Ok(format!(
+                    "lh_file {} && [ \"$lh_attrs\" = {} ] || exit 42; [ \"$(lh_sftp_state)\" = present ] || exit 42; ",
+                    shq(&before.file),
+                    shq(before
+                        .attributes
+                        .as_deref()
+                        .ok_or_else(|| error("missing file identity"))?)
+                ))
+            }
+        }
     }
+}
+
+/// `SFTP|<state>|<attrs>|<digest>` from `lh_sftp`; only an absent effective
+/// state plans a write, anything else refuses instead of guessing.
+fn parse_sftp(line: &str, file: &str) -> CoreResult<Guard> {
+    let p: Vec<&str> = line.split('|').collect();
+    if p.len() != 4 || p[0] != "SFTP" {
+        return Err(error("unreadable sftp evidence"));
+    }
+    if !matches!(p[1], "absent" | "present") {
+        return Err(error("sftp state not decidable"));
+    }
+    Ok(Guard::Sftp {
+        before: evidence(file, p[2], p[3])?,
+        state_before: p[1].to_owned(),
+    })
 }
 fn change_attrs(file: &str, mode: u64, uid: u64, gid: u64) -> String {
     format!(
@@ -1088,6 +1512,19 @@ pub(super) fn apply_command(plan: &BaselineChangePlan) -> CoreResult<String> {
             }
             command.push_str(&watch_delta(guard, false));
         }
+        Guard::Sftp { before, .. } => {
+            // Prepend at line 1: global scope is guaranteed before any Match
+            // block, and `cat` back into the file keeps inode and attributes.
+            command.push_str(&format!(
+                "lr_tmp={}; {{ printf 'Subsystem sftp internal-sftp\\n'; cat -- {}; }} > \"$lr_tmp\" && cat -- \"$lr_tmp\" > {} && rm -f -- \"$lr_tmp\" || {{ rm -f -- \"$lr_tmp\"; exit 41; }}; sshd -t || exit 43; ",
+                shq(&format!("{}/sftp-edit.tmp", plan.remote_root)),
+                shq(&before.file),
+                shq(&before.file)
+            ));
+            if plan.reload_policy == BaselineReloadPolicy::ApplyNow {
+                command.push_str(SSHD_RELOAD);
+            }
+        }
     }
     command.push_str(&guard_assertion(guard, false)?);
     command.push_str(&files_read_body(&plan.files, "APPLIED_FILE=", true)?);
@@ -1151,6 +1588,16 @@ pub(super) fn restore_command(
                 ));
             }
         }
+        Guard::Sftp { before, .. } => {
+            // Restore = copy the verified backup over the same inode, then
+            // reload so the running daemon matches the file again.
+            command.push_str(&format!(
+                "cat -- {} > {} || exit 43; sshd -t || exit 43; ",
+                shq(&backup),
+                shq(&before.file)
+            ));
+            command.push_str(SSHD_RELOAD);
+        }
     }
     command.push_str(&assert_file_evidence(guard.before()));
     command.push_str(&guard_assertion(guard, true)?);
@@ -1191,6 +1638,7 @@ pub(super) async fn verify(
             match guard {
             Guard::Permissions { .. } => "已独立核对完整内容摘要、文件身份、属主、属组、权限与 ACL；文件正文未改动。",
             Guard::Audit { .. } => "已独立核对规则片段和内核规则，其他规则保持原状。尚未确认审计事件落盘或重启后的自动加载。",
+            Guard::Sftp { .. } => "已用 sshd -T 独立核对生效的 sftp 子系统并核对文件身份；建议再以一次真实 SFTP 连接复核。",
         }.to_owned()
         } else {
             "独立复核未通过，请核对当前属性和运行规则；保留备份与操作记录，不能据此认定已恢复。"
@@ -1297,6 +1745,44 @@ fn partial_restore_command(
                 command.push_str(&format!("rm -- {}; ", shq(AUDIT_FILE)));
             }
         }
+        Guard::Sftp {
+            before,
+            state_before,
+        } => {
+            let now = parse_sftp(observation.trim(), &before.file)?;
+            let Guard::Sftp {
+                before: now_file,
+                state_before: now_state,
+            } = now
+            else {
+                return Err(error("sftp observation mismatch"));
+            };
+            // Only undo a file that is exactly this plan's result: same inode
+            // and attributes, with the subsystem now effective.
+            if now_state != "present"
+                || now_file.attributes != before.attributes
+                || now_file.sha256 == before.sha256
+            {
+                return if now_state == *state_before {
+                    Ok(command)
+                } else {
+                    Err(error("sshd_config 在失败后有其他变化，未自动放回"))
+                };
+            }
+            let backup = format!("{}/file-0.before", remote_root);
+            command.push_str(&format!(
+                "lh_path {} && [ \"$(lh_hash {})\" = {} ] || exit 42; cat -- {} > {} || exit 43; sshd -t || exit 43; ",
+                shq(&backup),
+                shq(&backup),
+                shq(before
+                    .sha256
+                    .as_deref()
+                    .ok_or_else(|| error("missing original hash"))?),
+                shq(&backup),
+                shq(&before.file)
+            ));
+            command.push_str(SSHD_RELOAD);
+        }
     }
     Ok(command)
 }
@@ -1326,6 +1812,7 @@ pub(super) async fn failed_execution(
                 run(service, session, &format!("lh_perm {}", shq(&before.file))).await?
             }
             Guard::Audit { .. } => run(service, session, "lh_audit").await?,
+            Guard::Sftp { .. } => run(service, session, "lh_sftp").await?,
         };
         let command = partial_restore_command(guard, &plan.remote_root, &observation)?;
         successful_output(
@@ -1425,7 +1912,13 @@ mod tests {
             assert!(parse_permission(line).is_err());
         }
         let missing = scan_from_output("GAP|audit\nGAP|/etc/shadow").unwrap();
-        assert_eq!(missing.len(), 13);
+        assert_eq!(
+            missing.len(),
+            BASELINE_CATALOG
+                .iter()
+                .filter(|d| matches!(d.reading, Reading::HostState))
+                .count()
+        );
         assert!(missing.iter().all(
             |status| status.observed == BaselineObservedValue::Unverified && !status.compliant
         ));
@@ -1720,7 +2213,6 @@ SSHD_OK
     fn sshd_state_items_are_check_only() {
         for id in [
             "ssh-weak-algorithms",
-            "ssh-sftp-subsystem",
             "ssh-login-restriction",
             "session-idle-timeout",
             "password-history",
@@ -1730,6 +2222,13 @@ SSHD_OK
             let definition = crate::baseline::definition(id).expect(id);
             assert!(!definition.is_writable(), "{id}");
         }
+        // The sftp subsystem is the one SSH host-state item with a guarded
+        // write path (Subsystem sftp internal-sftp through the sshd chain).
+        assert!(
+            crate::baseline::definition("ssh-sftp-subsystem")
+                .unwrap()
+                .is_writable()
+        );
         // The managed permission/audit HostState items keep their write path.
         assert!(
             crate::baseline::definition("logging-auth-file-watches")
@@ -2012,5 +2511,100 @@ SUDOLOG_OK"
             Value("unset".to_owned())
         );
         assert_eq!(sudolog_observed("SUDOLOG|enabled"), Unverified);
+    }
+
+    #[test]
+    fn apache_observation_maps_markers() {
+        use BaselineObservedValue::{NotInstalled, Unverified, Value};
+        let v = |s: &str| Value(s.to_owned());
+        assert_eq!(
+            apache_observed("apache-options-indexes", "APACHE|ABSENT"),
+            NotInstalled
+        );
+        assert_eq!(
+            apache_observed("apache-options-indexes", "noise"),
+            Unverified
+        );
+        let base = "APACHE|indexes|on\nAPACHE|status|exposed\nAPACHE|usr|www-data\nAPACHE|worker0|1\nAPACHE|tmo|600\nAPACHE|mods|autoindex,dav\nAPACHE_OK";
+        assert_eq!(apache_observed("apache-options-indexes", base), v("on"));
+        assert_eq!(apache_observed("apache-status-info", base), v("exposed"));
+        assert_eq!(apache_observed("apache-run-user", base), v("root-worker"));
+        assert_eq!(apache_observed("apache-timeout", base), v("600"));
+        assert_eq!(
+            apache_observed("apache-modules-minimal", base),
+            v("autoindex,dav")
+        );
+        let ok = "APACHE|indexes|off\nAPACHE|status|restricted\nAPACHE|usr|www-data\nAPACHE|lrb|set\nAPACHE|mods|none\nAPACHE_OK";
+        assert_eq!(apache_observed("apache-options-indexes", ok), v("off"));
+        assert_eq!(apache_observed("apache-status-info", ok), v("off"));
+        assert_eq!(apache_observed("apache-run-user", ok), v("non-root"));
+        assert_eq!(apache_observed("apache-timeout", ok), v("within-300"));
+        assert_eq!(
+            apache_observed("apache-limit-request-body", ok),
+            v("configured")
+        );
+        assert_eq!(apache_observed("apache-modules-minimal", ok), v("none"));
+    }
+
+    #[test]
+    fn tomcat_observation_maps_markers() {
+        use BaselineObservedValue::{NotInstalled, Unverified, Value};
+        let v = |s: &str| Value(s.to_owned());
+        assert_eq!(
+            tomcat_observed("tomcat-manager-access", "TOMCAT|ABSENT"),
+            NotInstalled
+        );
+        assert_eq!(
+            tomcat_observed("tomcat-manager-access", "noise"),
+            Unverified
+        );
+        let base = "TOMCAT|mgr|exposed\nTOMCAT|ajp|open\nTOMCAT|usr|root\nTOMCAT|lst|true\nTOMCAT|ses|60\nTOMCAT_OK";
+        assert_eq!(tomcat_observed("tomcat-manager-access", base), v("exposed"));
+        assert_eq!(tomcat_observed("tomcat-ajp-secret", base), v("open"));
+        assert_eq!(tomcat_observed("tomcat-run-user", base), v("root"));
+        assert_eq!(tomcat_observed("tomcat-listings-off", base), v("true"));
+        assert_eq!(tomcat_observed("tomcat-session-timeout", base), v("60"));
+        let ok = "TOMCAT|mgr|safe\nTOMCAT|ajp|secured\nTOMCAT|usr|non-root\nTOMCAT|lst|false\nTOMCAT|ses|30\nTOMCAT_OK";
+        assert_eq!(tomcat_observed("tomcat-manager-access", ok), v("safe"));
+        assert_eq!(tomcat_observed("tomcat-ajp-secret", ok), v("secured"));
+        assert_eq!(tomcat_observed("tomcat-run-user", ok), v("non-root"));
+        assert_eq!(tomcat_observed("tomcat-listings-off", ok), v("false"));
+        assert_eq!(
+            tomcat_observed("tomcat-session-timeout", ok),
+            v("within-30")
+        );
+        let gap = "TOMCAT|mgr|safe\nTOMCAT|ajp|unverified\nTOMCAT|usr|unknown\nTOMCAT_OK";
+        assert_eq!(tomcat_observed("tomcat-ajp-secret", gap), Unverified);
+        assert_eq!(tomcat_observed("tomcat-run-user", gap), Unverified);
+        // An unreadable deployment channel is a gap, never a pass.
+        let blind =
+            "TOMCAT|mgr|unverified\nTOMCAT|lst|unverified\nTOMCAT|ses|unverified\nTOMCAT_OK";
+        assert_eq!(tomcat_observed("tomcat-manager-access", blind), Unverified);
+        assert_eq!(tomcat_observed("tomcat-listings-off", blind), Unverified);
+        assert_eq!(tomcat_observed("tomcat-session-timeout", blind), Unverified);
+    }
+
+    #[test]
+    fn sftp_guard_parses_and_refuses_present() {
+        let attrs = "600:0:0:2049:19:1";
+        let digest = "a".repeat(64);
+        let guard = parse_sftp(
+            &format!("SFTP|absent|{attrs}|{digest}"),
+            "/etc/ssh/sshd_config",
+        )
+        .unwrap();
+        let def = crate::baseline::BASELINE_CATALOG
+            .iter()
+            .find(|d| d.id == "ssh-sftp-subsystem")
+            .unwrap();
+        guard.validate(def).unwrap();
+        let present = parse_sftp(
+            &format!("SFTP|present|{attrs}|{digest}"),
+            "/etc/ssh/sshd_config",
+        )
+        .unwrap();
+        assert!(present.validate(def).is_err());
+        assert!(parse_sftp("garbage", "/etc/ssh/sshd_config").is_err());
+        assert!(parse_sftp("SFTP|absent|x|y", "/etc/ssh/sshd_config").is_err());
     }
 }

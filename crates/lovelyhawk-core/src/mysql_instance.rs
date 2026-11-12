@@ -42,11 +42,30 @@ const UDF_SQL: &str = "SELECT name, dl FROM mysql.func";
 const VARIABLES_SQL: &str = "SHOW GLOBAL VARIABLES WHERE Variable_name IN (\
      'general_log','general_log_file','log_output','local_infile',\
      'secure_file_priv','datadir','skip_networking','bind_address',\
-     'sql_mode','version_compile_machine')";
+     'sql_mode','version_compile_machine','strict_password_validation') \
+     OR Variable_name LIKE 'validate_password%' \
+     OR Variable_name LIKE 'component_validate_password%' \
+     OR Variable_name LIKE 'simple_password_check%' \
+     OR Variable_name LIKE 'cracklib_password_check%' \
+     OR Variable_name LIKE 'connection_control%' \
+     OR Variable_name LIKE 'max_password_errors'";
+const PLUGINS_SQL: &str = "SELECT PLUGIN_NAME, PLUGIN_STATUS FROM information_schema.PLUGINS \
+     WHERE PLUGIN_NAME IN ('validate_password','connection_control',\
+     'simple_password_check','cracklib_password_check')";
+const TEST_DB_SQL: &str =
+    "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME IN ('test','test_db')";
+/// MySQL 8.0.19+ keeps per-account FAILED_LOGIN_ATTEMPTS in user_attributes;
+/// older MySQL and MariaDB lack the column, which degrades to a gap there.
+const LOCKING_SQL: &str = "SELECT CONCAT(user,'@',host), user_attributes FROM mysql.user \
+     WHERE user_attributes LIKE '%assword_locking%'";
 
 const MAX_ACCOUNTS: usize = 512;
+/// MariaDB's max_password_errors tops out at 4294967295 — its own default —
+/// so only a value comfortably below that reads as a configured lockout.
+const MAX_PASSWORD_ERRORS_REVIEW: u64 = 1000;
 const MAX_UDFS: usize = 64;
-const MAX_VARIABLES: usize = 48;
+const MAX_VARIABLES: usize = 64;
+const MAX_LOCKING: usize = 64;
 /// Bytes tailed from general_log; larger tails are truncated at the file end.
 const LOG_TAIL_BYTES: u64 = 256 * 1024;
 const MAX_LOG_HITS: usize = 40;
@@ -314,6 +333,90 @@ fn variable_findings(variables: &BTreeMap<String, String>, out: &mut Vec<MySqlIn
     }
 }
 
+/// Password-policy and login-failure lockout checks. `plugins` is the
+/// (name, status) table from information_schema.PLUGINS — an empty slice also
+/// means the section was unreadable, which the caller records as a gap.
+fn policy_findings(
+    product: MySqlProduct,
+    variables: &BTreeMap<String, String>,
+    plugins: &[(String, String)],
+    out: &mut Vec<MySqlInstanceFinding>,
+) {
+    let has_var = |prefix: &str| variables.keys().any(|k| k.starts_with(prefix));
+    let plugin_active = |name: &str| {
+        plugins
+            .iter()
+            .any(|(n, s)| n == name && s.eq_ignore_ascii_case("active"))
+    };
+    match product {
+        MySqlProduct::MySql => {
+            // The component exposes component_validate_password.* variables
+            // and never appears in information_schema.PLUGINS; the legacy
+            // plugin uses validate_password.* and does.
+            if !has_var("validate_password")
+                && !has_var("component_validate_password")
+                && !plugin_active("validate_password")
+            {
+                out.push(MySqlInstanceFinding {
+                    level: MySqlInstanceLevel::Review,
+                    code: "password-policy-absent",
+                    detail: "未启用 validate_password 组件/插件，口令复杂度不受服务端约束。"
+                        .to_owned(),
+                });
+            }
+            if !has_var("connection_control") && !plugin_active("connection_control") {
+                out.push(MySqlInstanceFinding {
+                    level: MySqlInstanceLevel::Review,
+                    code: "connection-control-absent",
+                    detail: "未启用 connection_control 插件，连续登录失败没有延迟/限流保护。"
+                        .to_owned(),
+                });
+            }
+        }
+        MySqlProduct::MariaDb => {
+            if !has_var("simple_password_check")
+                && !has_var("cracklib_password_check")
+                && !variables
+                    .get("strict_password_validation")
+                    .is_some_and(|v| v.eq_ignore_ascii_case("on"))
+                && !plugin_active("simple_password_check")
+                && !plugin_active("cracklib_password_check")
+            {
+                out.push(MySqlInstanceFinding {
+                    level: MySqlInstanceLevel::Review,
+                    code: "password-policy-absent",
+                    detail: "未启用口令复杂度校验（simple_password_check / cracklib_password_check / strict_password_validation）。"
+                        .to_owned(),
+                });
+            }
+            // MariaDB clamps the variable to 1..4294967295; the default is the
+            // top of the range, i.e. lockout effectively never triggers. A
+            // value past the review threshold is as good as no lockout.
+            match variables.get("max_password_errors") {
+                Some(v)
+                    if v.parse::<u64>()
+                        .is_ok_and(|n| n > MAX_PASSWORD_ERRORS_REVIEW) =>
+                {
+                    out.push(MySqlInstanceFinding {
+                        level: MySqlInstanceLevel::Review,
+                        code: "login-lockout-absent",
+                        detail: format!(
+                            "max_password_errors={v}，几乎等于不限失败次数，登录失败锁定未实际生效（MariaDB 10.4+ 可配置失败锁定）。"
+                        ),
+                    });
+                }
+                None => out.push(MySqlInstanceFinding {
+                    level: MySqlInstanceLevel::Review,
+                    code: "login-lockout-absent",
+                    detail: "未读取到 max_password_errors，登录失败锁定未配置或版本不支持。"
+                        .to_owned(),
+                }),
+                _ => {}
+            }
+        }
+    }
+}
+
 fn udf_findings(udfs: &[MySqlUdfRow], out: &mut Vec<MySqlInstanceFinding>) {
     for udf in udfs {
         let interesting = ["sys_", "exec_", "do_system", "lib_mysqludf", "cmdshell"]
@@ -531,11 +634,71 @@ pub(crate) async fn run_review(session: &mut MySqlSession) -> CoreResult<MySqlIn
     }
 
     let mut findings = Vec::new();
+    let mut plugins: Vec<(String, String)> = Vec::new();
+    let mut plugins_read = false;
+    match session.query_rows(PLUGINS_SQL.as_bytes(), 2, 64).await {
+        Ok(rows) => {
+            plugins_read = true;
+            for row in rows {
+                plugins.push((cell(&row, 0), cell(&row, 1)));
+            }
+        }
+        Err(_) => gaps.push(
+            "information_schema.PLUGINS 不可读，口令策略与连接限流插件检查未执行。".to_owned(),
+        ),
+    }
+
+    match session.query_rows(TEST_DB_SQL.as_bytes(), 1, 4).await {
+        Ok(rows) => {
+            for row in rows {
+                let name = cell(&row, 0);
+                if !name.is_empty() {
+                    findings.push(MySqlInstanceFinding {
+                        level: MySqlInstanceLevel::Review,
+                        code: "test-database",
+                        detail: format!(
+                            "存在默认测试库 {name}，历史上是匿名访问与注入的入口，需人工核对。"
+                        ),
+                    });
+                }
+            }
+        }
+        Err(_) => {
+            gaps.push("information_schema.SCHEMATA 不可读，默认测试库检查未执行。".to_owned())
+        }
+    }
+
+    if product == MySqlProduct::MySql {
+        match session.query_rows(LOCKING_SQL.as_bytes(), 2, MAX_LOCKING).await {
+            Ok(rows) => {
+                for row in rows {
+                    let account = cell(&row, 0);
+                    if !account.is_empty() {
+                        findings.push(MySqlInstanceFinding {
+                            level: MySqlInstanceLevel::Info,
+                            code: "account-lockout",
+                            detail: format!(
+                                "账号 {account} 配置了 FAILED_LOGIN_ATTEMPTS 登录失败锁定。"
+                            ),
+                        });
+                    }
+                }
+            }
+            Err(_) => gaps.push(
+                "mysql.user.user_attributes 不可读（或版本早于 8.0.19），按账号的失败锁定检查未执行。"
+                    .to_owned(),
+            ),
+        }
+    }
+
     for row in &accounts {
         account_findings(row, &mut findings);
     }
     udf_findings(&udfs, &mut findings);
     variable_findings(&variables, &mut findings);
+    if plugins_read {
+        policy_findings(product, &variables, &plugins, &mut findings);
+    }
 
     Ok(MySqlInstanceReview {
         product,
@@ -866,5 +1029,97 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].level, MySqlInstanceLevel::High);
         assert_eq!(findings[0].code, "udf-registered");
+    }
+
+    fn vars(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn mysql_policy_findings_cover_absent_controls() {
+        let mut findings = Vec::new();
+        policy_findings(MySqlProduct::MySql, &vars(&[]), &[], &mut findings);
+        assert!(findings.iter().any(|f| f.code == "password-policy-absent"));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.code == "connection-control-absent")
+        );
+
+        let mut findings = Vec::new();
+        policy_findings(
+            MySqlProduct::MySql,
+            &vars(&[
+                ("validate_password.policy", "MEDIUM"),
+                ("connection_control_failed_connections_threshold", "5"),
+            ]),
+            &[],
+            &mut findings,
+        );
+        assert!(findings.is_empty());
+
+        let mut findings = Vec::new();
+        policy_findings(
+            MySqlProduct::MySql,
+            &vars(&[]),
+            &[("connection_control".to_owned(), "ACTIVE".to_owned())],
+            &mut findings,
+        );
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.code == "connection-control-absent")
+        );
+
+        // The 8.0 component form: variables are component_validate_password.*
+        // and mysql.component, not information_schema.PLUGINS, records it.
+        let mut findings = Vec::new();
+        policy_findings(
+            MySqlProduct::MySql,
+            &vars(&[("component_validate_password.policy", "MEDIUM")]),
+            &[],
+            &mut findings,
+        );
+        assert!(!findings.iter().any(|f| f.code == "password-policy-absent"));
+    }
+
+    #[test]
+    fn mariadb_policy_findings_cover_absent_controls() {
+        let mut findings = Vec::new();
+        policy_findings(MySqlProduct::MariaDb, &vars(&[]), &[], &mut findings);
+        assert!(findings.iter().any(|f| f.code == "password-policy-absent"));
+        assert!(findings.iter().any(|f| f.code == "login-lockout-absent"));
+
+        // The out-of-range default is as good as no lockout; a small value
+        // reads as a configured policy.
+        for (value, flagged) in [("4294967295", true), ("10000", true), ("4", false)] {
+            let mut findings = Vec::new();
+            policy_findings(
+                MySqlProduct::MariaDb,
+                &vars(&[("max_password_errors", value)]),
+                &[],
+                &mut findings,
+            );
+            assert_eq!(
+                findings.iter().any(|f| f.code == "login-lockout-absent"),
+                flagged,
+                "max_password_errors={value}"
+            );
+        }
+
+        let mut findings = Vec::new();
+        policy_findings(
+            MySqlProduct::MariaDb,
+            &vars(&[
+                ("simple_password_check_minimal_length", "12"),
+                ("max_password_errors", "4"),
+            ]),
+            &[],
+            &mut findings,
+        );
+        assert!(findings.is_empty());
     }
 }

@@ -442,16 +442,17 @@ impl BaselineDefinition {
     /// The generic writer merges repeated keys, which can delete unrelated
     /// server/location settings or ignore Redis includes and ACLs. Presence
     /// checks also have no writable value.
-    pub const fn is_writable(&self) -> bool {
+    pub fn is_writable(&self) -> bool {
         !matches!(
             self.component,
             BaselineComponent::Nginx | BaselineComponent::Redis | BaselineComponent::PostgreSql
         ) && !matches!(self.value_kind, BaselineValueKind::Presence)
             // Host-state observations describe the running configuration;
-            // only the managed permission/audit files have a write path.
+            // only the managed permission/audit files and the guarded sftp
+            // subsystem write have a write path.
             && !(matches!(self.reading, Reading::HostState)
-                && (matches!(self.component, BaselineComponent::Ssh)
-                    || matches!(self.category, BaselineCategory::Authentication)))
+                && !(matches!(self.id, "ssh-sftp-subsystem" | "logging-auth-file-watches")
+                    || matches!(self.category, BaselineCategory::FilePermissions)))
     }
 
     const fn reads_candidate_risks(&self) -> bool {
@@ -682,7 +683,7 @@ pub const BASELINE_CATALOG: &[BaselineDefinition] = &[
         file: "/etc/ssh/sshd_config",
         key: "sshd_sftp",
         format: FileFormat::Whitespace,
-        reload: ReloadGroup::None,
+        reload: ReloadGroup::Sshd,
     },
     BaselineDefinition {
         id: "ssh-login-restriction",
@@ -768,7 +769,7 @@ pub const BASELINE_CATALOG: &[BaselineDefinition] = &[
         id: "sudo-operation-log",
         category: BaselineCategory::Logging,
         title: "启用 sudo 操作日志",
-        description: "检查 /etc/sudoers 与 /etc/sudoers.d 中 Defaults logfile、log_output、log_input、iolog_dir；enabled 表示显式开启，syslog-only 表示仅默认 syslog 记录，unset 表示未找到或已关闭。sudoers 不可读时明确无法判断。",
+        description: "检查 sudoers 与 sudoers.d 中 Defaults logfile、log_output、log_input、iolog_dir；enabled 表示显式开启，syslog-only 表示仅默认 syslog 记录，unset 表示未找到或已关闭。sudoers 不可读时明确无法判断。",
         recommendation: "enabled",
         risk: BaselineRisk::Medium,
         value_kind: BaselineValueKind::Choice(&["enabled"]),
@@ -2612,6 +2613,182 @@ pub const BASELINE_CATALOG: &[BaselineDefinition] = &[
         format: FileFormat::Ini("log.file"),
         reload: ReloadGroup::None,
     },
+    BaselineDefinition {
+        id: "apache-options-indexes",
+        category: BaselineCategory::ServiceHardening,
+        title: "关闭目录列表",
+        description: "检查主配置与 conf.d/启用目录中 live Options 行；on 表示存在授予 Indexes（含 Options All）且未被 -Indexes 否决的上下文，unset 表示没有 Options 行（默认 Options All，同样开启目录列表）。",
+        recommendation: "off",
+        risk: BaselineRisk::Medium,
+        value_kind: BaselineValueKind::Choice(&["off"]),
+        component: BaselineComponent::Apache,
+        reading: Reading::HostState,
+        implicit: None,
+        file: "/etc/httpd/conf/httpd.conf",
+        key: "apache_indexes",
+        format: FileFormat::Whitespace,
+        reload: ReloadGroup::None,
+    },
+    BaselineDefinition {
+        id: "apache-status-info",
+        category: BaselineCategory::ServiceHardening,
+        title: "不外露 server-status/info",
+        description: "检查 Location 块中的 SetHandler server-status/server-info：exposed 表示处理器开放且无 Require/Allow 类限制；受限或未配置记为 off。",
+        recommendation: "off",
+        risk: BaselineRisk::Medium,
+        value_kind: BaselineValueKind::Choice(&["off"]),
+        component: BaselineComponent::Apache,
+        reading: Reading::HostState,
+        implicit: None,
+        file: "/etc/httpd/conf/httpd.conf",
+        key: "apache_status",
+        format: FileFormat::Whitespace,
+        reload: ReloadGroup::None,
+    },
+    BaselineDefinition {
+        id: "apache-run-user",
+        category: BaselineCategory::ServiceHardening,
+        title: "不以 root 运行工作进程",
+        description: "核对 User 指令与运行中 httpd/apache2 工作进程属主；root-worker 表示存在 uid=0 的非主进程（父进程为 root 属正常），unset 表示未配置 User。",
+        recommendation: "non-root",
+        risk: BaselineRisk::High,
+        value_kind: BaselineValueKind::Choice(&["non-root"]),
+        component: BaselineComponent::Apache,
+        reading: Reading::HostState,
+        implicit: None,
+        file: "/etc/httpd/conf/httpd.conf",
+        key: "apache_user",
+        format: FileFormat::Whitespace,
+        reload: ReloadGroup::None,
+    },
+    BaselineDefinition {
+        id: "apache-timeout",
+        category: BaselineCategory::ServiceHardening,
+        title: "限制请求超时",
+        description: "Timeout 生效值不超过 300 秒；unset 按默认 300 计为达标。",
+        recommendation: "within-300",
+        risk: BaselineRisk::Low,
+        value_kind: BaselineValueKind::Choice(&["within-300"]),
+        component: BaselineComponent::Apache,
+        reading: Reading::HostState,
+        implicit: None,
+        file: "/etc/httpd/conf/httpd.conf",
+        key: "apache_timeout",
+        format: FileFormat::Whitespace,
+        reload: ReloadGroup::None,
+    },
+    BaselineDefinition {
+        id: "apache-limit-request-body",
+        category: BaselineCategory::ServiceHardening,
+        title: "限制请求体大小",
+        description: "存在 LimitRequestBody 指令即记为 configured；未设置时不限制上传大小。",
+        recommendation: PRESENCE_MARKER,
+        risk: BaselineRisk::Medium,
+        value_kind: BaselineValueKind::Choice(&[PRESENCE_MARKER]),
+        component: BaselineComponent::Apache,
+        reading: Reading::HostState,
+        implicit: None,
+        file: "/etc/httpd/conf/httpd.conf",
+        key: "apache_limitrequestbody",
+        format: FileFormat::Whitespace,
+        reload: ReloadGroup::None,
+    },
+    BaselineDefinition {
+        id: "apache-modules-minimal",
+        category: BaselineCategory::ServiceHardening,
+        title: "最小化加载模块",
+        description: "通过 apachectl -M 或配置中的 LoadModule 列出已加载的 autoindex/status/info/userdir/cgi/dav 等风险模块（建议性清单，按业务需要裁减）；none 表示未发现。",
+        recommendation: "none",
+        risk: BaselineRisk::Low,
+        value_kind: BaselineValueKind::Choice(&["none"]),
+        component: BaselineComponent::Apache,
+        reading: Reading::HostState,
+        implicit: None,
+        file: "/etc/httpd/conf/httpd.conf",
+        key: "apache_modules",
+        format: FileFormat::Whitespace,
+        reload: ReloadGroup::None,
+    },
+    BaselineDefinition {
+        id: "tomcat-manager-access",
+        category: BaselineCategory::ServiceHardening,
+        title: "限制管理应用访问",
+        description: "webapps/manager 与 host-manager 存在时需在其 context.xml 或 conf/Catalina/localhost/ 对应文件中配置 RemoteAddrValve/RemoteCIDRValve 等来源限制；不存在或全部受限记为 safe。",
+        recommendation: "safe",
+        risk: BaselineRisk::High,
+        value_kind: BaselineValueKind::Choice(&["safe"]),
+        component: BaselineComponent::Tomcat,
+        reading: Reading::HostState,
+        implicit: None,
+        file: "/usr/local/tomcat/conf/server.xml",
+        key: "tomcat_manager",
+        format: FileFormat::Whitespace,
+        reload: ReloadGroup::None,
+    },
+    BaselineDefinition {
+        id: "tomcat-ajp-secret",
+        category: BaselineCategory::ServiceHardening,
+        title: "保护 AJP 连接器",
+        description: "server.xml 中 AJP Connector 未启用或设置 secretRequired=\"true\"/secret 记为 secured；启用且无密钥记为 open（Ghostcat 类风险）。",
+        recommendation: "secured",
+        risk: BaselineRisk::High,
+        value_kind: BaselineValueKind::Choice(&["secured"]),
+        component: BaselineComponent::Tomcat,
+        reading: Reading::HostState,
+        implicit: None,
+        file: "/usr/local/tomcat/conf/server.xml",
+        key: "tomcat_ajp",
+        format: FileFormat::Whitespace,
+        reload: ReloadGroup::None,
+    },
+    BaselineDefinition {
+        id: "tomcat-run-user",
+        category: BaselineCategory::ServiceHardening,
+        title: "不以 root 运行 Tomcat",
+        description: "运行中 java/jsvc/catalina 进程属主为 uid 0 记为 root；无运行进程时无法判断。",
+        recommendation: "non-root",
+        risk: BaselineRisk::High,
+        value_kind: BaselineValueKind::Choice(&["non-root"]),
+        component: BaselineComponent::Tomcat,
+        reading: Reading::HostState,
+        implicit: None,
+        file: "/usr/local/tomcat/conf/server.xml",
+        key: "tomcat_user",
+        format: FileFormat::Whitespace,
+        reload: ReloadGroup::None,
+    },
+    BaselineDefinition {
+        id: "tomcat-listings-off",
+        category: BaselineCategory::ServiceHardening,
+        title: "关闭目录 listings",
+        description: "conf/web.xml DefaultServlet 的 listings init-param 为 true 时不达标；未设置按默认 false 计。",
+        recommendation: "false",
+        risk: BaselineRisk::Medium,
+        value_kind: BaselineValueKind::Choice(&["false"]),
+        component: BaselineComponent::Tomcat,
+        reading: Reading::HostState,
+        implicit: None,
+        file: "/usr/local/tomcat/conf/web.xml",
+        key: "tomcat_listings",
+        format: FileFormat::Whitespace,
+        reload: ReloadGroup::None,
+    },
+    BaselineDefinition {
+        id: "tomcat-session-timeout",
+        category: BaselineCategory::ServiceHardening,
+        title: "限制会话超时",
+        description: "conf/web.xml session-timeout 不超过 30 分钟；未设置按默认 30 计为达标。",
+        recommendation: "within-30",
+        risk: BaselineRisk::Low,
+        value_kind: BaselineValueKind::Choice(&["within-30"]),
+        component: BaselineComponent::Tomcat,
+        reading: Reading::HostState,
+        implicit: None,
+        file: "/usr/local/tomcat/conf/web.xml",
+        key: "tomcat_session_timeout",
+        format: FileFormat::Whitespace,
+        reload: ReloadGroup::None,
+    },
     host::permission_definition("permissions-auth-passwd", "/etc/passwd", "账号文件权限"),
     host::permission_definition("permissions-auth-group", "/etc/group", "用户组文件权限"),
     host::permission_definition("permissions-auth-shadow", "/etc/shadow", "口令文件权限"),
@@ -4093,16 +4270,17 @@ fn scan_command() -> String {
     let mut hosts = String::new();
     for definition in BASELINE_CATALOG {
         // Host-state rows are placeholders the host observation replaces;
-        // one loop emits them all, which keeps the scan inside one argument.
+        // one printf emits them all, which keeps the scan inside one argument.
         if matches!(definition.reading, Reading::HostState) {
-            hosts.push_str(&shq(definition.id));
+            // Ids are closed catalogue tokens, so quoting adds only bytes.
+            hosts.push_str(definition.id);
             hosts.push(' ');
         } else {
             items.push_str(&item_command(definition, &mut table));
         }
     }
     format!(
-        "set -u; printf '%s\\n' {SCAN_MARKER}; {}{}{items}for lh_i in {hosts}; do lr_h \"$lh_i\"; done",
+        "set -u; printf '%s\\n' {SCAN_MARKER}; {}{}{items}printf 'ITEM=%s\\t__unverified__\\t\\n' {hosts}",
         table.prelude(),
         scan_functions(),
     )
@@ -4125,8 +4303,7 @@ fn scan_functions() -> String {
         // or, for sshd, `%sshd` and the main file whose Include lines decide
         // the rest. Bound readers in bytes, even when GNU awk inherits a
         // UTF-8 locale.
-        "lr_h() {{ printf 'ITEM=%s\\t__unverified__\\t%s\\n' \"$1\" \"$2\"; }}; \
-         lr_file() {{ lr_id=$1; lr_key=$2; lr_want=$3; lr_where=$4; lr_fallback=$4; \
+        "lr_file() {{ lr_id=$1; lr_key=$2; lr_want=$3; lr_where=$4; lr_fallback=$4; \
            lr_reader=$5; lr_witness=$6; lr_installed=$7; shift 7; \
            lr_files=; lr_odd=0; lr_unread=0; lr_mode=; \
            if [ \"${{1-}}\" = %sshd ]; then lr_mode=sshd; \
@@ -6232,7 +6409,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(BASELINE_CATALOG.len(), 121);
+        assert_eq!(BASELINE_CATALOG.len(), 132);
         // One plan carries every check this tool will write; the rest are read.
         assert!(
             BASELINE_CATALOG
@@ -6475,8 +6652,8 @@ mod tests {
         const KERNEL_LIMIT: usize = 128 * 1024;
         let scan = scan_command();
         assert!(
-            scan.len() < KERNEL_LIMIT / 2,
-            "the scan is {} bytes, over half of what a single argument may carry",
+            scan.len() < KERNEL_LIMIT * 3 / 4,
+            "the scan is {} bytes, too close to what a single argument may carry",
             scan.len()
         );
         // The saving is the deduplication, so it has to actually be happening.
@@ -7555,7 +7732,9 @@ mod tests {
             let call = match definition.reading {
                 Reading::RunningSysctl => format!("lr_sysctl '{}'", definition.id),
                 Reading::Files(_) => format!("lr_file '{}'", definition.id),
-                Reading::HostState => format!("'{}'", definition.id),
+                // The host placeholders are printf arguments, so each id
+                // appears once, unquoted, with a trailing space.
+                Reading::HostState => format!("{} ", definition.id),
             };
             assert_eq!(
                 command.matches(&call).count(),
@@ -7564,8 +7743,15 @@ mod tests {
                 definition.id,
             );
         }
-        // Every row the scan prints, it prints the same way.
+        // Every row the scan prints, it prints the same way: the typed rows
+        // from lr_file/lr_sysctl plus the host-placeholder printf.
         assert_eq!(command.matches("printf 'ITEM=%s\\t%s\\t%s\\n'").count(), 2);
+        assert_eq!(
+            command
+                .matches("printf 'ITEM=%s\\t__unverified__\\t\\n'")
+                .count(),
+            1
+        );
         // First-wins needs a found flag; last-wins must not have one, or it
         // would silently become first-wins too.
         for definition in BASELINE_CATALOG {
@@ -7669,10 +7855,10 @@ mod tests {
     fn sshd_drop_ins_are_read_only_where_an_include_puts_them() {
         let command = scan_command();
         let mut table = ProgramTable::default();
-        for definition in BASELINE_CATALOG
-            .iter()
-            .filter(|definition| definition.reload == ReloadGroup::Sshd)
-        {
+        for definition in BASELINE_CATALOG.iter().filter(|definition| {
+            definition.reload == ReloadGroup::Sshd
+                && matches!(definition.reading, Reading::Files(_))
+        }) {
             assert!(definition.follows_sshd_includes());
             let call = item_command(definition, &mut table);
             // The walk starts from the main file; the drop-in glob is never

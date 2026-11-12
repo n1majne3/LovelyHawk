@@ -368,6 +368,45 @@ SET GLOBAL general_log='ON';`);
       (review.review.log.hits || []).some(h => h.kind === "outfile" || h.kind === "udf-ddl"));
     check(`[${vendor.key}] review response carries no secret`, !valueHasCanary(review));
 
+    // Password-policy / lockout / test-database checks: a positive and a
+    // negative fixture per vendor, each read back through the real inspect
+    // path. adminTry swallows "already (un)installed" server errors so the
+    // fixture reaches a known state whatever the base image preloads.
+    const inspect = () => rpc("inspect", { profileHandle: profile.profileHandle });
+    const codesOf = r => new Set((r.review?.findings || []).map(f => f.code));
+    const adminTry = sql => { try { return admin(sql); } catch { return ""; } };
+
+    admin("CREATE DATABASE IF NOT EXISTS test");
+    check(`[${vendor.key}] review flags the planted test database`, codesOf(await inspect()).has("test-database"));
+    admin("DROP DATABASE IF EXISTS test");
+
+    if (vendor.key === "mysql") {
+      adminTry("UNINSTALL COMPONENT 'file://component_validate_password'");
+      adminTry("UNINSTALL PLUGIN connection_control");
+      const insecure = codesOf(await inspect());
+      check(`[${vendor.key}] review flags missing validate_password and connection_control`,
+        insecure.has("password-policy-absent") && insecure.has("connection-control-absent"));
+      admin("INSTALL COMPONENT 'file://component_validate_password'");
+      admin("INSTALL PLUGIN connection_control SONAME 'connection_control.so'");
+      admin(`ALTER USER '${ACCOUNT.user}'@'${ACCOUNT.host}' FAILED_LOGIN_ATTEMPTS 3 PASSWORD_LOCK_TIME 2`);
+      const hardened = codesOf(await inspect());
+      check(`[${vendor.key}] review accepts the plugins and reports the per-account lockout`,
+        !hardened.has("password-policy-absent") && !hardened.has("connection-control-absent") &&
+        hardened.has("account-lockout"));
+    } else {
+      // MariaDB clamps max_password_errors to 1..4294967295; its own default
+      // is the top of the range — effectively no lockout, which is the state
+      // the check is meant to flag.
+      admin("SET GLOBAL strict_password_validation='OFF'; SET GLOBAL max_password_errors=4294967295;");
+      const insecure = codesOf(await inspect());
+      check(`[${vendor.key}] review flags disabled password validation and an effectively-unlimited lockout`,
+        insecure.has("password-policy-absent") && insecure.has("login-lockout-absent"));
+      admin("SET GLOBAL strict_password_validation='ON'; SET GLOBAL max_password_errors=4;");
+      const hardened = codesOf(await inspect());
+      check(`[${vendor.key}] review accepts strict_password_validation and max_password_errors=4`,
+        !hardened.has("password-policy-absent") && !hardened.has("login-lockout-absent"));
+    }
+
     const serviceLog = [onHost("sh", "-c", "cat /var/log/lab-service.log 2>/dev/null; for f in /var/log/mysql/*.log /var/lib/mysql/*.err; do [ -f \"$f\" ] && tail -n 300 \"$f\"; done; true"),
       podman("logs", "--tail", "400", containerId)].join("\n");
     check(`[${vendor.key}] server logs contain no new/old password plaintext`, !bytesHaveCanary(Buffer.from(serviceLog)));

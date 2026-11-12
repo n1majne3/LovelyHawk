@@ -10,7 +10,12 @@ export interface SystemInfoRowActionDialogProps {
   onSubmitPassword: (password: string) => void;
   onCopyOutput: (text: string) => void;
   onClose: () => void;
+  /** Opens the command workbench so the operator can run package verification. */
+  onOpenWorkbench?: (() => void) | undefined;
 }
+
+/** Marker the core embeds when a delete/lock failure may mean a replaced tool. */
+const ACCOUNT_TOOL_SUSPECT = "code:account-tool-suspect";
 
 /**
  * One dialog for both kinds of row action.
@@ -27,9 +32,13 @@ export function SystemInfoRowActionDialog({
   onSubmitPassword,
   onCopyOutput,
   onClose,
+  onOpenWorkbench,
 }: SystemInfoRowActionDialogProps) {
   useModalScrim();
   const { action, subject, inspection, plan, receipt, busy, error, needsPassword } = state;
+  const toolSuspect = receipt !== null && receipt.detail.includes(ACCOUNT_TOOL_SUSPECT);
+  const receiptDetail =
+    receipt === null ? "" : receipt.detail.replace(`〔${ACCOUNT_TOOL_SUSPECT}〕`, "").trim();
   const [password, setPassword] = useState("");
   const [passwordAgain, setPasswordAgain] = useState("");
   const isChange = action.kind === "change";
@@ -176,7 +185,27 @@ export function SystemInfoRowActionDialog({
                 {receipt.verified ? "已完成，并在目标机上核对过。" : "没有完成。"}
               </p>
               <dl>
-                <div><dt>目标机反馈</dt><dd>{receipt.detail}</dd></div>
+                <div><dt>目标机反馈</dt><dd>{receiptDetail}</dd></div>
+                {toolSuspect ? (
+                  <div data-testid="system-info-tool-suspect">
+                    <dt>下一步建议</dt>
+                    <dd>
+                      目标机上的 userdel/usermod 可能已被替换。建议先在应急命令页运行「软件包完整性核对」核对相关软件包，或在操作记录中按残留还原。
+                      {onOpenWorkbench !== undefined ? (
+                        <button
+                          type="button"
+                          className="is-link"
+                          onClick={() => {
+                            onClose();
+                            onOpenWorkbench();
+                          }}
+                        >
+                          前往应急命令页
+                        </button>
+                      ) : null}
+                    </dd>
+                  </div>
+                ) : null}
                 {receipt.verified ? null : (
                   <div>
                     <dt>是否已还原</dt>

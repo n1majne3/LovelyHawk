@@ -1243,6 +1243,55 @@ lh_finish
 "#
 );
 
+const CMD_FILE_SMARTY_TEMPLATES_C: &str = bounded_observation!(
+    r#"printf '# 在站点目录下查找 Smarty 编译目录（templates_c / compile_dir），核对编译产物中的执行特征与可疑请求变量。
+'
+command -v find >/dev/null 2>&1 || { lh_gap 'find 不可用，本项未执行。'; lh_finish; exit 1; }
+lh_roots=''
+for lh_r in /var/www /usr/share/nginx /srv/www /srv/http /home/*/public_html /home/*/www /usr/local/apache2/htdocs /usr/local/nginx/html; do
+  [ -d "$lh_r" ] && lh_roots="$lh_roots $lh_r"
+done
+[ -n "$lh_roots" ] || { printf '# 未发现站点目录，未执行扫描。\n'; lh_finish; exit 1; }
+lh_dirs=0
+for lh_root in $lh_roots; do
+  lh_nd=$(find "$lh_root" -xdev -maxdepth 4 -type d \( -name templates_c -o -name compile_dir \) 2>/dev/null | wc -l)
+  lh_dirs=$((lh_dirs + lh_nd))
+  for lh_d in $(find "$lh_root" -xdev -maxdepth 4 -type d \( -name templates_c -o -name compile_dir \) 2>/dev/null | head -n 20); do
+    lh_step
+    printf '# 编译目录：%s\n' "$lh_d"
+    for lh_f in $(find "$lh_d" -xdev -maxdepth 2 -type f -size -1024k 2>/dev/null | head -n 2000); do
+      lh_step
+      [ -r "$lh_f" ] || { lh_gap "$lh_f：权限不足，未读取。"; continue; }
+      lh_exec=$(grep -a -c -E 'eval[[:space:]]*\(|assert[[:space:]]*\(|system[[:space:]]*\(|passthru[[:space:]]*\(|shell_exec[[:space:]]*\(|popen[[:space:]]*\(|proc_open[[:space:]]*\(|pcntl_exec[[:space:]]*\(|create_function[[:space:]]*\(|base64_decode[[:space:]]*\(|gzinflate[[:space:]]*\(|str_rot13[[:space:]]*\(' "$lh_f" 2>/dev/null)
+      if [ "${lh_exec:-0}" -gt 0 ]; then
+        lh_hit "$lh_f | Smarty 编译产物含执行/解码特征（$lh_exec 处），正常模板编译不产生此类代码，需人工核查。"
+        continue
+      fi
+      lh_sup=$(grep -a -c -E '\$_(GET|POST|REQUEST|COOKIE)' "$lh_f" 2>/dev/null)
+      [ "${lh_sup:-0}" -gt 0 ] || continue
+      lh_name=${lh_f##*/}
+      lh_tpl=$(printf '%s' "$lh_name" | awk '{sub(/\.php$/, ""); if (sub(/^.*_file_/, "")) print; else if (sub(/^.*_string_/, "")) print; else print ""}')
+      if [ -n "$lh_tpl" ]; then
+        lh_src=$(find "$lh_root" -xdev -type f -name "$lh_tpl" ! -path '*/templates_c/*' ! -path '*/compile_dir/*' 2>/dev/null | head -n 1)
+        if [ -n "$lh_src" ]; then
+          lh_ct=$(stat -c %Y "$lh_f" 2>/dev/null)
+          lh_st=$(stat -c %Y "$lh_src" 2>/dev/null)
+          if [ -n "$lh_ct" ] && [ -n "$lh_st" ] && [ "$lh_ct" -gt "$((lh_st + 86400))" ]; then
+            lh_hit "$lh_f | 编译产物含请求变量且比源模板 $lh_src 晚超过一天，源模板修改后未重新编译属异常，需人工核查。"
+          fi
+        else
+          lh_hit "$lh_f | 编译产物含请求变量但未找到对应源模板（$lh_tpl），需人工核查。"
+        fi
+      else
+        lh_hit "$lh_f | 编译产物含请求变量且命名无法对应源模板，需人工核查。"
+      fi
+    done
+  done
+done
+[ "$lh_dirs" -gt 0 ] || printf '# 站点目录下未发现 Smarty 编译目录，本项不适用。\n'
+"#
+);
+
 static CATALOG: &[CommandDefinition] = &[
     portable!(
         "perm-suid",
@@ -2200,6 +2249,16 @@ static CATALOG: &[CommandDefinition] = &[
         "WebShell 扫描",
         "发现站点目录并扫描 PHP/JSP/ASP 类脚本、伪装图片、站点配置与隐藏脚本中的可疑特征；命中行提供文件操作入口，均需人工核查，不执行代码。",
         crate::detection::WEBSHELL_SCAN_COMMAND
+    )
+    .self_checked()
+    .with_timeout(60)
+    .flagging(command_findings::collection_finding),
+    portable!(
+        "file-smarty-templates-c",
+        Files,
+        "Smarty 编译目录检查",
+        "在站点目录下发现 templates_c/compile_dir，检查编译产物中的执行特征（eval/system/base64_decode 等）与可疑请求变量；命中行提供文件操作入口，均需人工核查，不执行代码。",
+        CMD_FILE_SMARTY_TEMPLATES_C
     )
     .self_checked()
     .with_timeout(60)

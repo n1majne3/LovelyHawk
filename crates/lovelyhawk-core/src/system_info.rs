@@ -2710,6 +2710,11 @@ pub struct UserAccountOutcome {
     pub action: UserAccountAction,
     pub verification: VerificationResult,
     pub restored_after_failed_verification: bool,
+    /// The change was refused or failed verification for a reason that cannot
+    /// be explained, so the account tool on the target may itself have been
+    /// replaced. Carried as a field, not embedded in `detail`: the page must
+    /// not take UI affordances from remote-controlled text.
+    pub tool_suspect: bool,
 }
 
 #[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -4128,6 +4133,7 @@ impl SystemInfoService {
             service: self,
             session,
             plan: &plan,
+            tool_suspect: std::sync::atomic::AtomicBool::new(false),
         };
         let mut operation = PlannedOperation::plan(plan.operation.clone());
         operation.confirm(confirmation)?;
@@ -4144,6 +4150,9 @@ impl SystemInfoService {
             // account is still exactly as it was confirmed — i.e. nothing
             // happened — which is the one thing the operator needs to know.
             let verification = operation.verify(&self.target, &executor, journal).await?;
+            let tool_suspect = executor
+                .tool_suspect
+                .load(std::sync::atomic::Ordering::Relaxed);
             let unchanged = verification.passed
                 || self
                     .user_account_snapshot(session, &plan.snapshot.username)
@@ -4156,6 +4165,7 @@ impl SystemInfoService {
                 username: plan.snapshot.username,
                 action: plan.action,
                 restored_after_failed_verification: !verification.passed && unchanged,
+                tool_suspect,
                 verification,
             });
         }
@@ -4184,6 +4194,9 @@ impl SystemInfoService {
             action: plan.action,
             verification,
             restored_after_failed_verification,
+            tool_suspect: executor
+                .tool_suspect
+                .load(std::sync::atomic::Ordering::Relaxed),
         })
     }
 
@@ -5517,6 +5530,9 @@ struct UserAccountExecutor<'a> {
     service: &'a SystemInfoService,
     session: &'a BoundSshSession,
     plan: &'a UserAccountPlan,
+    /// Set inside `verify` where the observed snapshot is still in scope, so
+    /// the caller can report a structured flag instead of text sniffing.
+    tool_suspect: std::sync::atomic::AtomicBool,
 }
 
 impl UserAccountExecutor<'_> {
@@ -5628,6 +5644,15 @@ impl OperationExecutor for UserAccountExecutor<'_> {
                     ),
                 });
             }
+            self.tool_suspect.store(
+                !passed
+                    && user_account_delete_suspect(
+                        &self.plan.snapshot,
+                        observed.as_ref(),
+                        &receipt.summary,
+                    ),
+                std::sync::atomic::Ordering::Relaxed,
+            );
             return Ok(VerificationResult {
                 passed,
                 detail: user_account_delete_detail(
@@ -5637,6 +5662,10 @@ impl OperationExecutor for UserAccountExecutor<'_> {
                 ),
             });
         }
+        self.tool_suspect.store(
+            !passed && observed.is_some(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         Ok(VerificationResult {
             passed,
             detail: match observed {
@@ -7451,6 +7480,17 @@ fn user_account_delete_summary(snapshot: &UserAccountSnapshot, groups: Option<&s
 /// summary ends with how the command was received (`accepted`,
 /// `rejected-exit-8`, …), which is the only clue to *why* an account is still
 /// there.
+/// Marker embedded in a failed verification detail: the account tool on the
+/// target may have been replaced. The page strips it and offers the package
+/// verify check and the residue restore instead of guessing.
+pub(crate) const ACCOUNT_TOOL_SUSPECT: &str = "code:account-tool-suspect";
+
+fn account_tool_suspect_hint(tool: &str) -> String {
+    format!(
+        "目标机上的 {tool} 可能没有按预期工作，不排除已被替换。可在应急命令页运行「软件包完整性核对」核对 {tool} 所属软件包，或在操作记录中按残留还原。〔{ACCOUNT_TOOL_SUSPECT}〕"
+    )
+}
+
 fn user_account_delete_detail(
     planned: &UserAccountSnapshot,
     observed: Option<&UserAccountSnapshot>,
@@ -7463,23 +7503,41 @@ fn user_account_delete_detail(
             planned.username, planned.home
         ),
         Some(snapshot) if snapshot == planned => {
-            let reason = match dispatch {
-                "rejected-exit-Some(8)" => {
-                    "userdel 退出码 8：该账户还有进程在运行。先在进程页结束这些进程，或改为锁定账户。"
+            // An explained refusal (still-running processes, missing tool,
+            // no root) says the tool worked as designed; only unexplained
+            // failure makes the tool itself suspect.
+            let (reason, suspect) = match dispatch {
+                "rejected-exit-Some(8)" => (
+                    "userdel 退出码 8：该账户还有进程在运行。先在进程页结束这些进程，或改为锁定账户。",
+                    false,
+                ),
+                "rejected-exit-Some(77)" => {
+                    ("需要 root 权限，或当前账户无法免密使用 sudo。", false)
                 }
-                "rejected-exit-Some(77)" => "需要 root 权限，或当前账户无法免密使用 sudo。",
-                "rejected-exit-Some(78)" => "目标机上既没有 userdel 也没有 deluser。",
-                "rejected-exit-Some(79)" => {
-                    "目标机上 root 已不是 UID 0，为免失去 root 账户没有执行，请先人工检查 /etc/passwd。"
+                "rejected-exit-Some(78)" => ("目标机上既没有 userdel 也没有 deluser。", false),
+                "rejected-exit-Some(79)" => (
+                    "目标机上 root 已不是 UID 0，为免失去 root 账户没有执行，请先人工检查 /etc/passwd。",
+                    false,
+                ),
+                other if other.starts_with("indeterminate") => {
+                    ("删除命令没有在时限内给出结果。", true)
                 }
-                other if other.starts_with("indeterminate") => "删除命令没有在时限内给出结果。",
-                _ => "删除命令没有成功。",
+                _ => ("删除命令没有成功。", true),
             };
-            format!("账户 {} 仍然存在，没有改动。{reason}", planned.username)
+            let hint = if suspect {
+                format!(" {}", account_tool_suspect_hint("userdel"))
+            } else {
+                String::new()
+            };
+            format!(
+                "账户 {} 仍然存在，没有改动。{reason}{hint}",
+                planned.username
+            )
         }
         Some(_) => format!(
-            "账户 {} 仍然存在，但它的 UID、主目录或状态已和确认时不同，请刷新后核对。",
-            planned.username
+            "账户 {} 仍然存在，但它的 UID、主目录或状态已和确认时不同，请刷新后核对。{}",
+            planned.username,
+            account_tool_suspect_hint("userdel")
         ),
     }
 }
@@ -11503,6 +11561,12 @@ mod tests {
         let mut moved = planned.clone();
         moved.uid = 1001;
         assert!(user_account_delete_detail(&planned, Some(&moved), "x: accepted").contains("不同"));
+        // Unexplained failure suspects the tool; an explained refusal does not.
+        assert!(
+            user_account_delete_detail(&planned, Some(&planned), "x: rejected-exit-Some(1)")
+                .contains(ACCOUNT_TOOL_SUSPECT)
+        );
+        assert!(!busy.contains(ACCOUNT_TOOL_SUSPECT));
         assert_eq!(
             parse_user_account_groups("alice sudo docker\n").as_deref(),
             Some("alice sudo docker")
