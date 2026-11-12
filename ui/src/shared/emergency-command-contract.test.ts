@@ -6,6 +6,9 @@ import {
   isEmergencyCommandCatalog,
   isEmergencyCommandOpaqueHandle,
   isEmergencyCommandResult,
+  isEmergencyIocReport,
+  isEmergencyPathBatchPlan,
+  isEmergencyPathBatchStep,
   isEmergencyPathDetail,
   isEmergencyPathPlan,
   isEmergencyPathReceipt,
@@ -244,14 +247,15 @@ describe("emergency command contract", () => {
     })).toBe(false);
   });
 
-  it("declares exactly nine finite methods and no raw execution arguments", () => {
+  it("declares exactly fourteen finite methods and no raw execution arguments", () => {
     const source = readFileSync(new URL("./emergency-command-contract.ts", import.meta.url), "utf8");
-    const api = source.slice(source.indexOf("export interface EmergencyCommandApi"), source.indexOf("type JsonRecord"));
-    // Nine methods: seven fit on one line, planEmergencyPathAction and
-    // runEmergencyCommand do not — the latter since it gained the container it
-    // may be pointed at.
-    expect(api.match(/^  [a-zA-Z][A-Za-z]*\(/gmu)).toHaveLength(9);
-    expect(api.match(/^\s{2}[a-zA-Z].*Promise<(?:unknown|void)>;/gmu)).toHaveLength(7);
+    const apiStart = source.indexOf("export interface EmergencyCommandApi");
+    const api = source.slice(apiStart, source.indexOf("\n}\n", apiStart));
+    // Fourteen methods: eleven fit on one line; planEmergencyPathAction,
+    // planEmergencyPathBatch and runEmergencyCommand do not — the latter since
+    // it gained the container it may be pointed at.
+    expect(api.match(/^  [a-zA-Z][A-Za-z]*\(/gmu)).toHaveLength(14);
+    expect(api.match(/^\s{2}[a-zA-Z].*Promise<(?:unknown|void)>;/gmu)).toHaveLength(11);
     expect(api).toContain("loadEmergencyCommandCatalog(bindingHandle: string)");
     // Optional, and the only thing it may be besides absent is a handle: the
     // renderer cannot name a container by id or by name.
@@ -265,6 +269,13 @@ describe("emergency command contract", () => {
     expect(api).toContain("undoEmergencyPathAction(bindingHandle: string, planHandle: string)");
     // A history record is named by its id; which check it ran never comes from the window.
     expect(api).toContain("locateEmergencyHistoryCommand(bindingHandle: string, snapshotHandle: string, historyId: string)");
+    // Leads come only from outputs the backend already holds — the page names
+    // a snapshot, it never sends output text for the backend to scan.
+    expect(api).toContain("extractEmergencyCommandIocs(bindingHandle: string, snapshotHandle: string)");
+    // A batch names offered handles and one action — never paths.
+    expect(api).toContain("confirmEmergencyPathBatch(bindingHandle: string, batchHandle: string)");
+    expect(api).toContain("stepEmergencyPathBatch(bindingHandle: string, batchHandle: string)");
+    expect(api).toContain("cancelEmergencyPathBatch(bindingHandle: string, batchHandle: string)");
     // Every parameter is a handle or the closed action name. A window cannot
     // put a path of its own into any of these.
     expect(api).not.toMatch(/\b(?:commandId|family|sessionId|generation|guard|host|shell|commandText)\b/u);
@@ -403,5 +414,106 @@ describe("emergency command contract", () => {
     expect(isEmergencyPathUndoResult({ ...undone, extra: true })).toBe(false);
     const { detail: _detail, ...withoutDetail } = undone;
     expect(isEmergencyPathUndoResult(withoutDetail)).toBe(false);
+  });
+
+  it("bounds a lead report to typed, capped entries", () => {
+    const entry = { kind: "ipv4", value: "198.51.100.7", scope: "public", hits: 3, sources: ["检查计划任务"], common: false };
+    const report = { entries: [entry], truncated: false };
+    expect(isEmergencyIocReport(report)).toBe(true);
+    expect(isEmergencyIocReport({ entries: [], truncated: true })).toBe(true);
+    // Exact fields: a missing flag or an extra one both fail.
+    const { common: _common, ...noCommon } = entry;
+    expect(isEmergencyIocReport({ entries: [noCommon], truncated: false })).toBe(false);
+    expect(isEmergencyIocReport({ entries: [{ ...entry, extra: true }], truncated: false })).toBe(false);
+    expect(isEmergencyIocReport({ ...report, count: 1 })).toBe(false);
+    // Closed kind and scope sets.
+    expect(isEmergencyIocReport({ entries: [{ ...entry, kind: "hostname" }], truncated: false })).toBe(false);
+    expect(isEmergencyIocReport({ entries: [{ ...entry, scope: "internet" }], truncated: false })).toBe(false);
+    // Bounded numbers, text and lists.
+    expect(isEmergencyIocReport({ entries: [{ ...entry, hits: -1 }], truncated: false })).toBe(false);
+    expect(isEmergencyIocReport({ entries: [{ ...entry, hits: 3.5 }], truncated: false })).toBe(false);
+    expect(isEmergencyIocReport({ entries: [{ ...entry, common: "yes" }], truncated: false })).toBe(false);
+    expect(isEmergencyIocReport({ entries: [{ ...entry, value: "x".repeat(513) }], truncated: false })).toBe(false);
+    expect(isEmergencyIocReport({ entries: [{ ...entry, sources: ["s".repeat(129)] }], truncated: false })).toBe(false);
+    expect(isEmergencyIocReport({ entries: [{ ...entry, sources: Array(9).fill("a") }], truncated: false })).toBe(false);
+    expect(isEmergencyIocReport({ entries: Array(501).fill(entry), truncated: true })).toBe(false);
+    expect(isEmergencyIocReport({ entries: [entry], truncated: "no" })).toBe(false);
+    expect(isEmergencyIocReport({ entries: [entry] })).toBe(false);
+  });
+
+  it("bounds a batch plan to typed rows where plan and refusal never mix", () => {
+    const plannedItem = {
+      pathHandle: "ph-planned", path: "/tmp/.x", kind: "file", size: "12", mode: "0755",
+      executable: true, planHandle: "plan-a", summary: "将该文件移入隔离区",
+      restoreDescription: "把文件放回原位置", refusal: null,
+    };
+    const refusedItem = {
+      pathHandle: "ph-refused", path: "/tmp/.y", kind: "file", size: "4", mode: "0644",
+      executable: false, planHandle: null, summary: null, restoreDescription: null,
+      refusal: "not-executable",
+    };
+    const staleItem = {
+      pathHandle: "ph-stale", path: "", kind: "", size: "", mode: null,
+      executable: false, planHandle: null, summary: null, restoreDescription: null,
+      refusal: "path-stale",
+    };
+    const plan = {
+      batchHandle: "batch-1", action: "quarantine",
+      items: [plannedItem, refusedItem, staleItem],
+      planned: 1, refused: 2, state: "planned", expiresInSeconds: 300,
+    };
+    expect(isEmergencyPathBatchPlan(plan)).toBe(true);
+    expect(isEmergencyPathBatchPlan({ ...plan, state: "confirmed" })).toBe(true);
+    // Exact fields, closed sets and counted rows.
+    expect(isEmergencyPathBatchPlan({ ...plan, extra: 1 })).toBe(false);
+    // Single-path-only actions are not a batch answer the backend makes.
+    expect(isEmergencyPathBatchPlan({ ...plan, action: "remove-capabilities" })).toBe(false);
+    expect(isEmergencyPathBatchPlan({ ...plan, action: "restore-residue" })).toBe(false);
+    expect(isEmergencyPathBatchPlan({ ...plan, action: "wipe" })).toBe(false);
+    expect(isEmergencyPathBatchPlan({ ...plan, items: [] })).toBe(false);
+    expect(isEmergencyPathBatchPlan({ ...plan, items: Array(51).fill(plannedItem), planned: 51, refused: 0 })).toBe(false);
+    expect(isEmergencyPathBatchPlan({ ...plan, planned: 2 })).toBe(false);
+    expect(isEmergencyPathBatchPlan({ ...plan, refused: 0 })).toBe(false);
+    expect(isEmergencyPathBatchPlan({ ...plan, state: "running" })).toBe(false);
+    expect(isEmergencyPathBatchPlan({ ...plan, expiresInSeconds: 0 })).toBe(false);
+    // A planned row must carry plan facts and nothing of a refusal; a refused
+    // row the other way round.
+    expect(isEmergencyPathBatchPlan({ ...plan, items: [{ ...plannedItem, planHandle: null }] })).toBe(false);
+    expect(isEmergencyPathBatchPlan({ ...plan, items: [{ ...plannedItem, refusal: "x" }] })).toBe(false);
+    expect(isEmergencyPathBatchPlan({ ...plan, items: [{ ...refusedItem, planHandle: "p" }] })).toBe(false);
+    expect(isEmergencyPathBatchPlan({ ...plan, items: [{ ...refusedItem, refusal: "x".repeat(65) }] })).toBe(false);
+    expect(isEmergencyPathBatchPlan({ ...plan, items: [{ ...plannedItem, path: "relative" }] })).toBe(false);
+    expect(isEmergencyPathBatchPlan({ ...plan, items: [{ ...plannedItem, mode: "8888" }] })).toBe(false);
+    const { summary: _s, ...noSummary } = plannedItem;
+    expect(isEmergencyPathBatchPlan({ ...plan, items: [noSummary, refusedItem, staleItem] })).toBe(false);
+  });
+
+  it("bounds a batch step to a receipt that belongs to the batch", () => {
+    const receipt = {
+      planHandle: "plan-a", path: "/tmp/.x", action: "quarantine", passed: true,
+      detail: "已移入隔离区并核对", restored: false, untouched: false, undoable: true,
+    };
+    expect(isEmergencyPathBatchStep({
+      batchHandle: "batch-1", receipt, remaining: 1, refused: 0, finished: false,
+    })).toBe(true);
+    expect(isEmergencyPathBatchStep({
+      batchHandle: "batch-1", receipt: null, remaining: 0, refused: 1, finished: true,
+    })).toBe(true);
+    // An unfinished step must have run something; a finished one has nothing left.
+    expect(isEmergencyPathBatchStep({
+      batchHandle: "batch-1", receipt: null, remaining: 1, refused: 0, finished: false,
+    })).toBe(false);
+    expect(isEmergencyPathBatchStep({
+      batchHandle: "batch-1", receipt, remaining: 1, refused: 0, finished: true,
+    })).toBe(false);
+    expect(isEmergencyPathBatchStep({
+      batchHandle: "batch-1", receipt: { ...receipt, extra: true }, remaining: 0, refused: 0, finished: true,
+    })).toBe(false);
+    expect(isEmergencyPathBatchStep({
+      batchHandle: "batch-1", receipt, remaining: 51, refused: 0, finished: false,
+    })).toBe(false);
+    expect(isEmergencyPathBatchStep({
+      batchHandle: "batch-1", receipt, remaining: 0, refused: 0, finished: true, extra: 1,
+    })).toBe(false);
   });
 });

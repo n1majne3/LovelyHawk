@@ -394,6 +394,134 @@ pub fn read_manifest(dir: &Path) -> CoreResult<LocalScanManifest> {
     })
 }
 
+/// A member of the fetched tree a CLI engine's output named.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngineMention {
+    /// The member path inside the staging content dir, `/`-separated and
+    /// starting at the fetch base — the same shape manifest `entries` use.
+    pub member: String,
+    /// The output line the member name was read from, trimmed and bounded.
+    pub line: String,
+}
+
+/// Longest mention list one engine run can report.
+pub const MAX_ENGINE_MENTIONS: usize = 100;
+const MAX_MENTION_LINE_BYTES: usize = 512;
+/// Whitespace tokens worth a filesystem resolution. Engine output is already
+/// byte-bounded; this bounds the `canonicalize` calls it can still trigger.
+const MAX_MENTION_TOKENS: usize = 2000;
+
+/// Scans bounded engine output for tokens that resolve to members of the
+/// fetched content tree. A token never counts as a path on its own: it is
+/// joined against `content_dir` when relative, canonicalized, and must land
+/// on a real member inside that directory. Absolute paths outside the
+/// directory, `..` traversals and names nothing fetched are ignored.
+pub fn scan_engine_mentions(output: &str, content_dir: &Path) -> Vec<EngineMention> {
+    let Ok(root) = content_dir.canonicalize() else {
+        return Vec::new();
+    };
+    let mut seen = BTreeSet::new();
+    let mut mentions = Vec::new();
+    let mut tokens = 0usize;
+    'scan: for line in output.lines() {
+        for raw in line.split_whitespace() {
+            tokens += 1;
+            if tokens > MAX_MENTION_TOKENS || mentions.len() >= MAX_ENGINE_MENTIONS {
+                break 'scan;
+            }
+            if raw.len() > 2048 {
+                continue;
+            }
+            let token = raw
+                .trim_matches(|c: char| "\"'([{<".contains(c))
+                .trim_end_matches(|c: char| "\"')]}>,;:".contains(c));
+            if token.is_empty() {
+                continue;
+            }
+            if let Some(member) = resolve_mention(&root, content_dir, token)
+                && seen.insert(member.clone())
+            {
+                mentions.push(EngineMention {
+                    member,
+                    line: mention_line(line),
+                });
+            }
+        }
+    }
+    mentions
+}
+
+/// Resolves one output token to a `/`-separated member path relative to the
+/// canonicalized content root, or None when it does not name a member. A
+/// `\`-separated relative token is retried with `/` separators so Windows
+/// engine output reads the same on either host platform.
+fn resolve_mention(root: &Path, content_dir: &Path, token: &str) -> Option<String> {
+    let normalized = token.replace('\\', "/");
+    let candidates = if normalized == token {
+        vec![token.to_string()]
+    } else {
+        vec![token.to_string(), normalized]
+    };
+    for text in candidates {
+        let candidate = Path::new(&text);
+        let joined = if candidate.is_absolute() {
+            candidate.to_path_buf()
+        } else {
+            content_dir.join(candidate)
+        };
+        let Ok(resolved) = joined.canonicalize() else {
+            continue;
+        };
+        if resolved == root || !resolved.starts_with(root) {
+            continue;
+        }
+        let member = resolved
+            .strip_prefix(root)
+            .ok()?
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/");
+        if !member.is_empty() {
+            return Some(member);
+        }
+    }
+    None
+}
+
+fn mention_line(line: &str) -> String {
+    let trimmed = line.trim();
+    if trimmed.len() <= MAX_MENTION_LINE_BYTES {
+        return trimmed.to_owned();
+    }
+    let mut end = MAX_MENTION_LINE_BYTES;
+    while !trimmed.is_char_boundary(end) {
+        end -= 1;
+    }
+    trimmed[..end].to_owned()
+}
+
+/// Maps a fetched member back to the remote path it came from, through the
+/// manifest's recorded source and fetch scope. The answer is only as good as
+/// the manifest: a member the fetch never recorded maps to nothing.
+pub fn manifest_member_remote(manifest: &LocalScanManifest, member: &str) -> Option<String> {
+    if member.is_empty()
+        || member.len() > 4096
+        || member
+            .split('/')
+            .any(|part| part.is_empty() || matches!(part, "." | ".."))
+    {
+        return None;
+    }
+    let scope = LocalScanScope::parse(&manifest.scope)?;
+    let source = RemotePath::new(manifest.source_path.clone()).ok()?;
+    let root = fetch_root(&source, scope).ok()?;
+    let remote = format!("{}/{}", root.directory_side.as_str(), member);
+    RemotePath::new(remote)
+        .ok()
+        .map(|path| path.as_str().to_owned())
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct FetchExtractReport {
     pub files: usize,
@@ -1220,5 +1348,87 @@ mod tests {
         };
         let (_, argv) = engine_launch(&real, dir).unwrap();
         assert_eq!(argv, vec![dir.to_string_lossy().into_owned()]);
+    }
+
+    fn manifest_stub(source: &str, scope: &str) -> LocalScanManifest {
+        LocalScanManifest {
+            version: 1,
+            source_path: source.to_owned(),
+            origin: "host".to_owned(),
+            origin_label: String::new(),
+            source_kind: "directory".to_owned(),
+            scope: scope.to_owned(),
+            target_label: "lab".to_owned(),
+            fetched_at: "2026-01-01T00:00:00Z".to_owned(),
+            transport: "sftp".to_owned(),
+            archive_sha256: "0".repeat(64),
+            archive_bytes: 0,
+            files: 0,
+            directories: 0,
+            bytes: 0,
+            skipped: 0,
+            truncated: false,
+            entries: Vec::new(),
+            limitations: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn mention_scan_maps_only_members_inside_the_content_dir() {
+        let (dir, content) = stage();
+        fs::create_dir_all(content.join("html")).unwrap();
+        fs::write(content.join("html/up.php"), b"x").unwrap();
+        fs::write(content.join("index.php"), b"x").unwrap();
+        let absolute = content.join("html/up.php");
+        let output = format!(
+            "HIT {} suspicious\nfound index.php here\noutside /etc/passwd\n\
+             traversal ../escape.php\nmissing html/gone.php\nalt html\\up.php again\n",
+            absolute.display()
+        );
+        let mentions = scan_engine_mentions(&output, &content);
+        let members: Vec<&str> = mentions.iter().map(|m| m.member.as_str()).collect();
+        assert_eq!(members, ["html/up.php", "index.php"], "{mentions:?}");
+        assert!(mentions[0].line.contains("HIT"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mention_scan_reads_windows_absolute_paths() {
+        let (dir, content) = stage();
+        fs::create_dir_all(content.join("html")).unwrap();
+        fs::write(content.join("html/up.php"), b"x").unwrap();
+        let absolute = format!("{}\\html\\up.php", content.display());
+        let mentions = scan_engine_mentions(&format!("hit {absolute}\n"), &content);
+        assert_eq!(
+            mentions
+                .iter()
+                .map(|m| m.member.as_str())
+                .collect::<Vec<_>>(),
+            ["html/up.php"]
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn member_remote_maps_through_manifest_and_refuses_nonmembers() {
+        let dir_fetch = manifest_stub("/var/www/html", "file");
+        assert_eq!(
+            manifest_member_remote(&dir_fetch, "html/up.php").as_deref(),
+            Some("/var/www/html/up.php")
+        );
+        let parent_fetch = manifest_stub("/var/www/html/up.php", "directory");
+        assert_eq!(
+            manifest_member_remote(&parent_fetch, "html/up.php").as_deref(),
+            Some("/var/www/html/up.php")
+        );
+        let file_fetch = manifest_stub("/var/www/x.php", "file");
+        assert_eq!(
+            manifest_member_remote(&file_fetch, "x.php").as_deref(),
+            Some("/var/www/x.php")
+        );
+        for bad in ["", "../x", "a//b", "a/./b", "/etc/passwd"] {
+            assert_eq!(manifest_member_remote(&dir_fetch, bad), None, "{bad}");
+        }
     }
 }

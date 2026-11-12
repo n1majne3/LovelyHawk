@@ -4189,14 +4189,15 @@ impl SystemInfoService {
             operation.restore(&self.target, &executor, journal).await?;
             true
         };
+        let tool_suspect = executor
+            .tool_suspect
+            .load(std::sync::atomic::Ordering::Relaxed);
         Ok(UserAccountOutcome {
             username: plan.snapshot.username,
             action: plan.action,
             verification,
             restored_after_failed_verification,
-            tool_suspect: executor
-                .tool_suspect
-                .load(std::sync::atomic::Ordering::Relaxed),
+            tool_suspect,
         })
     }
 
@@ -7480,15 +7481,28 @@ fn user_account_delete_summary(snapshot: &UserAccountSnapshot, groups: Option<&s
 /// summary ends with how the command was received (`accepted`,
 /// `rejected-exit-8`, …), which is the only clue to *why* an account is still
 /// there.
-/// Marker embedded in a failed verification detail: the account tool on the
-/// target may have been replaced. The page strips it and offers the package
-/// verify check and the residue restore instead of guessing.
-pub(crate) const ACCOUNT_TOOL_SUSPECT: &str = "code:account-tool-suspect";
-
-fn account_tool_suspect_hint(tool: &str) -> String {
-    format!(
-        "目标机上的 {tool} 可能没有按预期工作，不排除已被替换。可在应急命令页运行「软件包完整性核对」核对 {tool} 所属软件包，或在操作记录中按残留还原。〔{ACCOUNT_TOOL_SUSPECT}〕"
-    )
+/// Whether an account that is still there after `userdel` points at the tool
+/// itself rather than at a reason the tool reported. Explained refusals
+/// (still-running processes, missing tool, no root, root no longer UID 0)
+/// say the tool worked as designed; anything unexplained, or a snapshot that
+/// no longer matches what was confirmed, makes the tool suspect.
+fn user_account_delete_suspect(
+    planned: &UserAccountSnapshot,
+    observed: Option<&UserAccountSnapshot>,
+    receipt_summary: &str,
+) -> bool {
+    let dispatch = receipt_summary.rsplit(": ").next().unwrap_or_default();
+    match observed {
+        None => false,
+        Some(snapshot) if snapshot == planned => !matches!(
+            dispatch,
+            "rejected-exit-Some(8)"
+                | "rejected-exit-Some(77)"
+                | "rejected-exit-Some(78)"
+                | "rejected-exit-Some(79)"
+        ),
+        Some(_) => true,
+    }
 }
 
 fn user_account_delete_detail(
@@ -7506,38 +7520,23 @@ fn user_account_delete_detail(
             // An explained refusal (still-running processes, missing tool,
             // no root) says the tool worked as designed; only unexplained
             // failure makes the tool itself suspect.
-            let (reason, suspect) = match dispatch {
-                "rejected-exit-Some(8)" => (
-                    "userdel 退出码 8：该账户还有进程在运行。先在进程页结束这些进程，或改为锁定账户。",
-                    false,
-                ),
-                "rejected-exit-Some(77)" => {
-                    ("需要 root 权限，或当前账户无法免密使用 sudo。", false)
+            let reason = match dispatch {
+                "rejected-exit-Some(8)" => {
+                    "userdel 退出码 8：该账户还有进程在运行。先在进程页结束这些进程，或改为锁定账户。"
                 }
-                "rejected-exit-Some(78)" => ("目标机上既没有 userdel 也没有 deluser。", false),
-                "rejected-exit-Some(79)" => (
-                    "目标机上 root 已不是 UID 0，为免失去 root 账户没有执行，请先人工检查 /etc/passwd。",
-                    false,
-                ),
-                other if other.starts_with("indeterminate") => {
-                    ("删除命令没有在时限内给出结果。", true)
+                "rejected-exit-Some(77)" => "需要 root 权限，或当前账户无法免密使用 sudo。",
+                "rejected-exit-Some(78)" => "目标机上既没有 userdel 也没有 deluser。",
+                "rejected-exit-Some(79)" => {
+                    "目标机上 root 已不是 UID 0，为免失去 root 账户没有执行，请先人工检查 /etc/passwd。"
                 }
-                _ => ("删除命令没有成功。", true),
+                other if other.starts_with("indeterminate") => "删除命令没有在时限内给出结果。",
+                _ => "删除命令没有成功。",
             };
-            let hint = if suspect {
-                format!(" {}", account_tool_suspect_hint("userdel"))
-            } else {
-                String::new()
-            };
-            format!(
-                "账户 {} 仍然存在，没有改动。{reason}{hint}",
-                planned.username
-            )
+            format!("账户 {} 仍然存在，没有改动。{reason}", planned.username)
         }
         Some(_) => format!(
-            "账户 {} 仍然存在，但它的 UID、主目录或状态已和确认时不同，请刷新后核对。{}",
-            planned.username,
-            account_tool_suspect_hint("userdel")
+            "账户 {} 仍然存在，但它的 UID、主目录或状态已和确认时不同，请刷新后核对。",
+            planned.username
         ),
     }
 }
@@ -11562,11 +11561,28 @@ mod tests {
         moved.uid = 1001;
         assert!(user_account_delete_detail(&planned, Some(&moved), "x: accepted").contains("不同"));
         // Unexplained failure suspects the tool; an explained refusal does not.
-        assert!(
-            user_account_delete_detail(&planned, Some(&planned), "x: rejected-exit-Some(1)")
-                .contains(ACCOUNT_TOOL_SUSPECT)
-        );
-        assert!(!busy.contains(ACCOUNT_TOOL_SUSPECT));
+        assert!(user_account_delete_suspect(
+            &planned,
+            Some(&planned),
+            "x: rejected-exit-Some(1)"
+        ));
+        assert!(user_account_delete_suspect(
+            &planned,
+            Some(&planned),
+            "x: indeterminate-timeout"
+        ));
+        assert!(user_account_delete_suspect(
+            &planned,
+            Some(&moved),
+            "x: accepted"
+        ));
+        assert!(!user_account_delete_suspect(
+            &planned,
+            Some(&planned),
+            "x: rejected-exit-Some(8)"
+        ));
+        assert!(!user_account_delete_suspect(&planned, None, "x: accepted"));
+        assert!(!busy.contains("code:"));
         assert_eq!(
             parse_user_account_groups("alice sudo docker\n").as_deref(),
             Some("alice sudo docker")

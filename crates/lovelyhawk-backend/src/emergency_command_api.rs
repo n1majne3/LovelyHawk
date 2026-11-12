@@ -5,7 +5,7 @@
 //! remain sidecar-owned.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fmt,
     sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant},
@@ -18,6 +18,7 @@ use lovelyhawk_core::{
         SystemFamily, catalog_history_entry,
     },
     docker::{ContainerIdentity, ContainerSummary},
+    ioc_extract::{self, IocKind, IocScope},
     kubernetes::{KubernetesExecTarget, KubernetesPod, KubernetesScope},
     ssh::BoundSshSession,
     target::TargetGuard,
@@ -43,6 +44,10 @@ const MAX_TIMEOUT_SECONDS: u64 = 60;
 const MAX_CATALOGS: usize = 8;
 const MAX_CATALOG_BYTES: usize = 256 * 1024;
 const MAX_REGISTRY_BYTES: usize = 2 * 1024 * 1024;
+/// Finished runs kept per catalogue so leads can be mined without the page
+/// sending output back. Eviction is oldest-first, like catalogues.
+const MAX_STORED_RESULTS: usize = 64;
+const MAX_STORED_RESULT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_ACTIVE_LOADS: usize = 2;
 const MAX_ACTIVE_RUNS: usize = 4;
 const MAX_CORE_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
@@ -317,6 +322,10 @@ impl EmergencyCommandApi {
                 .paths
                 .offer(&scope.to_path_scope(), &dto.output, &clipped_lines);
         }
+        // Keep what the window will show so lead extraction can later mine it;
+        // a page never has to send output back across the boundary.
+        self.lock_registry()?
+            .store_result(&access, command.title.clone(), dto.output.clone());
         ensure_serialized_bound(&dto, MAX_RUN_RESPONSE_BYTES)?;
         self.validate_binding(&scope)?;
         self.verify_run(&access, &command)?;
@@ -524,6 +533,43 @@ impl EmergencyCommandApi {
     /// The record names a catalogue entry, never a program, and the handle
     /// comes from this snapshot like any other: running it is an ordinary run
     /// of the catalogue of the moment. The entry itself never reaches the page.
+    /// Address-like leads mined from the outputs this snapshot's runs left in
+    /// the registry — leads to check, not confirmed indicators.
+    pub(crate) fn ioc_report(
+        &self,
+        binding_handle: &str,
+        snapshot_handle: &str,
+    ) -> Result<EmergencyIocReportDto, EmergencyCommandApiError> {
+        validate_handle(snapshot_handle)?;
+        let (_session, scope) = self.capture_binding(binding_handle)?;
+        let stored = {
+            let registry = self.lock_registry()?;
+            registry.stored_results(&scope, snapshot_handle)?
+        };
+        let report = ioc_extract::extract_iocs(
+            stored
+                .iter()
+                .map(|(title, output)| (title.as_str(), output.as_str())),
+        );
+        let dto = EmergencyIocReportDto {
+            entries: report
+                .entries
+                .into_iter()
+                .map(|entry| EmergencyIocEntryDto {
+                    kind: ioc_kind_key(entry.kind),
+                    value: entry.value,
+                    scope: ioc_scope_key(entry.scope),
+                    hits: entry.hits,
+                    sources: entry.sources,
+                    common: entry.common,
+                })
+                .collect(),
+            truncated: report.truncated,
+        };
+        ensure_serialized_bound(&dto, MAX_RUN_RESPONSE_BYTES)?;
+        Ok(dto)
+    }
+
     pub(crate) fn locate_history(
         &self,
         binding_handle: &str,
@@ -801,6 +847,44 @@ pub(crate) struct EmergencyCommandResultDto {
     pub(crate) paths: Vec<EmergencyPathDto>,
 }
 
+/// One extracted lead, in words the contract shares.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EmergencyIocEntryDto {
+    kind: &'static str,
+    value: String,
+    scope: &'static str,
+    hits: u32,
+    sources: Vec<String>,
+    common: bool,
+}
+
+/// The leads found in a snapshot's stored outputs.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EmergencyIocReportDto {
+    entries: Vec<EmergencyIocEntryDto>,
+    truncated: bool,
+}
+
+fn ioc_kind_key(kind: IocKind) -> &'static str {
+    match kind {
+        IocKind::Ipv4 => "ipv4",
+        IocKind::Ipv6 => "ipv6",
+        IocKind::Domain => "domain",
+        IocKind::Url => "url",
+    }
+}
+
+fn ioc_scope_key(scope: IocScope) -> &'static str {
+    match scope {
+        IocScope::Public => "public",
+        IocScope::Private => "private",
+        IocScope::Loopback => "loopback",
+        IocScope::Reserved => "reserved",
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 struct StoredCommand {
     command_handle: String,
@@ -870,6 +954,13 @@ impl StoredContainer {
     }
 }
 
+/// The projected output of one finished run, kept so indicator extraction can
+/// work over what the operator actually saw — never text sent back by a page.
+struct StoredResult {
+    title: String,
+    output: String,
+}
+
 struct CatalogSnapshot {
     snapshot_handle: String,
     token: Uuid,
@@ -879,6 +970,9 @@ struct CatalogSnapshot {
     /// Empty when the target has no container runtime, which is the ordinary
     /// case and not an error.
     containers: Vec<StoredContainer>,
+    /// Results in arrival order; the oldest are evicted past the bounds.
+    results: VecDeque<StoredResult>,
+    results_bytes: usize,
     stored_bytes: usize,
     created_at: Instant,
     expires_at: Instant,
@@ -1023,6 +1117,52 @@ impl EmergencyRegistry {
             },
         );
         Ok((access, command, catalog.family))
+    }
+
+    /// Keeps one finished run's projected output against its catalogue, or
+    /// drops it when the catalogue was replaced between run and return.
+    fn store_result(&mut self, access: &RunAccess, title: String, output: String) {
+        let Some(catalog) = self.catalogs.get_mut(&access.snapshot_handle) else {
+            return;
+        };
+        if catalog.token != access.snapshot_token {
+            return;
+        }
+        catalog.results_bytes = catalog
+            .results_bytes
+            .saturating_add(title.len() + output.len());
+        catalog.results.push_back(StoredResult { title, output });
+        while catalog.results.len() > MAX_STORED_RESULTS
+            || catalog.results_bytes > MAX_STORED_RESULT_BYTES
+        {
+            let Some(evicted) = catalog.results.pop_front() else {
+                break;
+            };
+            catalog.results_bytes = catalog
+                .results_bytes
+                .saturating_sub(evicted.title.len() + evicted.output.len());
+        }
+    }
+
+    /// The stored outputs of a live catalogue, cloned while the lock is held
+    /// so extraction runs without it.
+    fn stored_results(
+        &self,
+        scope: &BindingScope,
+        snapshot_handle: &str,
+    ) -> Result<Vec<(String, String)>, EmergencyCommandApiError> {
+        let catalog = self
+            .catalogs
+            .get(snapshot_handle)
+            .ok_or(EmergencyCommandApiError::CatalogStale)?;
+        if &catalog.scope != scope || catalog.expires_at <= Instant::now() {
+            return Err(EmergencyCommandApiError::CatalogStale);
+        }
+        Ok(catalog
+            .results
+            .iter()
+            .map(|result| (result.title.clone(), result.output.clone()))
+            .collect())
     }
 
     /// The handle this snapshot gave a catalogue entry, if it offers that
@@ -1240,6 +1380,8 @@ fn build_catalog(
         family,
         commands,
         containers: stored_containers,
+        results: VecDeque::new(),
+        results_bytes: 0,
         stored_bytes,
         created_at: now,
         expires_at: now + CATALOG_TTL,

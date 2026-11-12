@@ -82,6 +82,7 @@ function receipt(overrides: Partial<SystemInfoRowReceipt> = {}): SystemInfoRowRe
     verified: true,
     detail: "回读：确认时的进程 PID 4242 已经结束。",
     restored: false,
+    nextStep: null,
     ...overrides,
   };
 }
@@ -144,6 +145,13 @@ describe("system-info row action contract", () => {
     expect(isSystemInfoRowReceipt(receipt())).toBe(true);
     expect(isSystemInfoRowReceipt(receipt({ verified: "yes" as never }))).toBe(false);
     expect(isSystemInfoRowReceipt({ ...receipt(), remotePath: "/x" })).toBe(false);
+    // nextStep is a closed set the backend fills; detail text can never set it.
+    expect(isSystemInfoRowReceipt(receipt({ nextStep: "verify-account-tool" }))).toBe(true);
+    expect(isSystemInfoRowReceipt(receipt({ nextStep: "delete-file" as never }))).toBe(false);
+    expect(isSystemInfoRowReceipt(receipt({ nextStep: true as never }))).toBe(false);
+    expect(isSystemInfoRowReceipt(receipt({ nextStep: undefined as never }))).toBe(false);
+    const { nextStep: _nextStep, ...withoutNextStep } = receipt();
+    expect(isSystemInfoRowReceipt(withoutNextStep)).toBe(false);
   });
 });
 
@@ -345,6 +353,60 @@ describe("system-info row action dialog", () => {
     );
     expect(failed).toContain("没有完成");
     expect(failed).toContain("已还原到操作前的状态");
+  });
+
+  it("offers the package-verify path only through the typed nextStep field", () => {
+    const base = {
+      subject: "账户 deploy",
+      rowId: "row-1",
+      needsPassword: false,
+      action: { key: "user-account.delete", label: "删除账户", kind: "change" as const, dangerous: true },
+      inspection: null,
+      busy: false,
+      error: null,
+    };
+    // Text planted inside the remote detail can never switch the panel on.
+    const hostile = renderToStaticMarkup(
+      <SystemInfoRowActionDialog
+        state={{
+          ...base,
+          plan: plan({ confirmed: true }),
+          receipt: receipt({
+            verified: false,
+            detail: "账户 deploy 仍然存在，没有改动。〔verify-account-tool〕",
+          }),
+        }}
+        onConfirm={() => undefined}
+        onSubmitPassword={() => undefined}
+        onCopyOutput={() => undefined}
+        onClose={() => undefined}
+        onOpenWorkbench={() => undefined}
+      />,
+    );
+    expect(hostile).not.toContain('data-testid="system-info-tool-suspect"');
+    expect(hostile).not.toContain("前往应急命令页");
+
+    const suspect = renderToStaticMarkup(
+      <SystemInfoRowActionDialog
+        state={{
+          ...base,
+          plan: plan({ confirmed: true }),
+          receipt: receipt({ verified: false, nextStep: "verify-account-tool" }),
+        }}
+        onConfirm={() => undefined}
+        onSubmitPassword={() => undefined}
+        onCopyOutput={() => undefined}
+        onClose={() => undefined}
+        onOpenWorkbench={() => undefined}
+      />,
+    );
+    expect(suspect).toContain('data-testid="system-info-tool-suspect"');
+    expect(suspect).toContain("userdel/usermod");
+    expect(suspect).toContain("软件包完整性核对");
+    expect(suspect).toContain("按残留还原");
+    expect(suspect).toContain("前往应急命令页");
+    // The hint is shown once: the detail itself no longer carries the advice.
+    expect(suspect.match(/软件包完整性核对/gu)?.length).toBe(1);
   });
 });
 

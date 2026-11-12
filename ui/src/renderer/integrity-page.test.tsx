@@ -30,6 +30,11 @@ const api: IntegrityApi & EmergencyCommandApi & FileEvidenceApi = {
   cancelEmergencyPathAction: async () => undefined,
   undoEmergencyPathAction: async () => ({}),
   locateEmergencyHistoryCommand: async () => ({}),
+  extractEmergencyCommandIocs: async () => ({ entries: [], truncated: false }),
+  planEmergencyPathBatch: async () => { throw new Error(); },
+  confirmEmergencyPathBatch: async () => { throw new Error(); },
+  stepEmergencyPathBatch: async () => { throw new Error(); },
+  cancelEmergencyPathBatch: async (): Promise<void> => { throw new Error(); },
   fileEvidence: async () => null,
 };
 

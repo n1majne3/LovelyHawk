@@ -6,6 +6,7 @@ import {
   isEmergencyCommandCatalog,
   isEmergencyCommandResult,
   isEmergencyHistoryLocation,
+  isEmergencyIocReport,
   type EmergencyCommandApi,
   type EmergencyHistoryLocationStatus,
   type EmergencyCommandCatalog,
@@ -13,6 +14,10 @@ import {
   type EmergencyCommandCategory,
   type EmergencyCommandPathOffer,
   type EmergencyCommandResult,
+  type EmergencyIocEntry,
+  type EmergencyIocKind,
+  type EmergencyIocReport,
+  type EmergencyIocScope,
 } from "../shared/emergency-command-contract";
 import {
   emergencyCommandCategoryLabel,
@@ -44,13 +49,16 @@ import {
 import { EmergencyPathDialog, EmergencyPathProperties } from "./EmergencyPathDialog";
 import { EmergencyPathMenu } from "./EmergencyPathMenu";
 import { useEmergencyPathActions } from "./emergency-path-actions";
+import { EmergencyPathBatchDialog } from "./EmergencyPathBatchDialog";
 import { FileEvidenceDialog } from "./FileEvidenceDialog";
 import type { FileEvidenceApi } from "../shared/file-evidence-contract";
 import { LocalScanDialog } from "./LocalScanDialog";
 import { pathOfferScanTransport } from "./local-scan-controller";
 import type { LocalScanApi } from "../shared/local-scan-contract";
 import { useListExpiry } from "./use-list-expiry";
+import { useModalScrim } from "./modal-scrim";
 import "./emergency-commands.css";
+import "./emergency-path.css";
 
 export interface EmergencyCommandsPageProps {
   bindingHandle: string | null;
@@ -82,7 +90,10 @@ const RERUN_MISSING: Record<Exclude<EmergencyHistoryLocationStatus, "found">, st
 export function EmergencyCommandsPage({ bindingHandle, api, writeClipboard, rerun = null, runIn = null }: EmergencyCommandsPageProps) {
   const [evidence, setEvidence] = useState<{ offer: EmergencyCommandPathOffer; binding: string; api: FileEvidenceApi; returnFocus: HTMLElement | null } | null>(null);
   const [localScan, setLocalScan] = useState<{ offer: EmergencyCommandPathOffer; binding: string; api: LocalScanApi; returnFocus: HTMLElement | null } | null>(null);
-  useEffect(() => { setEvidence(null); setLocalScan(null); }, [api, bindingHandle]);
+  // Handles picked for the batch dialog. A target switch or a new bridge
+  // must not carry a selection minted for another host.
+  const [batchHandles, setBatchHandles] = useState<readonly string[] | null>(null);
+  useEffect(() => { setEvidence(null); setLocalScan(null); setBatchHandles(null); }, [api, bindingHandle]);
   const [state, dispatch] = useReducer(emergencyCommandReducer, undefined, createEmergencyCommandState);
   const [refreshVersion, setRefreshVersion] = useState(0);
   const [runVersion, setRunVersion] = useState(0);
@@ -105,6 +116,8 @@ export function EmergencyCommandsPage({ bindingHandle, api, writeClipboard, reru
   const requestRef = useRef(0);
   const consumedRunVersion = useRef(0);
   const consumedGroupRunVersion = useRef(0);
+  const [iocVersion, setIocVersion] = useState(0);
+  const consumedIocVersion = useRef(0);
   const scope = bindingHandle === null ? null : emergencyCommandScope(bindingHandle);
   const pathActions = useEmergencyPathActions(api, bindingHandle);
   // What came of the last request from command history, for this target only.
@@ -275,6 +288,31 @@ export function EmergencyCommandsPage({ bindingHandle, api, writeClipboard, reru
   }, [api, bindingHandle, runVersion, scope, state.catalog, state.scope, state.selectedCommandHandle]);
 
   useEffect(() => {
+    if (iocVersion === 0 || consumedIocVersion.current === iocVersion || scope === null || bindingHandle === null ||
+      state.scope !== scope || state.catalog === null) return;
+    consumedIocVersion.current = iocVersion;
+    const request = { id: ++requestRef.current, snapshotHandle: state.catalog.snapshotHandle };
+    let cancelled = false;
+    dispatch({ type: "iocs-started", scope, request });
+    void api.extractEmergencyCommandIocs(bindingHandle, request.snapshotHandle).then((value) => {
+      if (cancelled) return;
+      if (!isEmergencyIocReport(value)) throw new Error();
+      dispatch({ type: "iocs-loaded", scope, request, report: value });
+    }).catch((reason: unknown) => {
+      if (cancelled) return;
+      dispatch({
+        type: "iocs-failed",
+        scope,
+        request,
+        error: targetFailureMessage(reason, "无法汇总已运行检查的线索；命令列表可能已过期、目标已切换，或远端读取失败。"),
+      });
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [api, bindingHandle, iocVersion, scope, state.catalog, state.scope]);
+
+  useEffect(() => {
     if (groupRun === null || consumedGroupRunVersion.current === groupRun.version || scope === null ||
       bindingHandle === null || state.scope !== scope || state.catalog === null) return;
     consumedGroupRunVersion.current = groupRun.version;
@@ -410,6 +448,12 @@ export function EmergencyCommandsPage({ bindingHandle, api, writeClipboard, reru
               这台机器没能及时报出自己是什么系统，下面给的是通用命令，比按发行版挑的要粗一些。可以重新加载再试。
             </span>
           )}
+          <button type="button" className="emergency-commands-iocs"
+            disabled={!current || state.catalog === null || state.iocStatus === "loading"}
+            title="汇总这次命令列表下已运行检查输出里的地址线索（IP、域名、URL），供人工核查，不是确认的入侵指标。"
+            onClick={() => setIocVersion((value) => value + 1)}>
+            {state.iocStatus === "loading" ? "汇总中…" : "线索汇总"}
+          </button>
           <button type="button" className={catalogExpired ? "emergency-commands-reload is-attention" : "emergency-commands-reload"}
             disabled={!current || state.catalogStatus === "loading" || busy}
             onClick={() => setRefreshVersion((value) => value + 1)}>
@@ -471,6 +515,7 @@ export function EmergencyCommandsPage({ bindingHandle, api, writeClipboard, reru
             dispatch({ type: "group-run-stop-requested", scope, runId: state.groupRun.id });
           }}
           onPathMenu={pathActions.openMenu}
+          onBatchStart={bindingHandle === null ? undefined : (handles) => setBatchHandles(handles)}
           writeClipboard={writeClipboard}
         />
       )}
@@ -496,6 +541,9 @@ export function EmergencyCommandsPage({ bindingHandle, api, writeClipboard, reru
           }
         }}
         onDismiss={pathActions.dismissMenu} />}
+      {batchHandles !== null && bindingHandle !== null ? <EmergencyPathBatchDialog
+        key={bindingHandle} api={api} bindingHandle={bindingHandle} pathHandles={batchHandles}
+        onClose={() => setBatchHandles(null)} /> : null}
       {evidence !== null && evidence.binding === bindingHandle && evidence.api === api ? <FileEvidenceDialog
         key={`${evidence.binding}:${evidence.offer.pathHandle}`} api={api} binding={evidence.binding}
         offer={evidence.offer} returnFocus={evidence.returnFocus} onClose={() => setEvidence(null)} /> : null}
@@ -503,6 +551,7 @@ export function EmergencyCommandsPage({ bindingHandle, api, writeClipboard, reru
         key={`${localScan.binding}:${localScan.offer.pathHandle}`}
         transport={pathOfferScanTransport(api, localScan.binding, localScan.offer)}
         subject={{ path: localScan.offer.path, entryKind: "file" }}
+        onLocate={(event, offer) => pathActions.openMenu(event, offer)}
         returnFocus={localScan.returnFocus} onClose={() => setLocalScan(null)} /> : null}
       {acting !== null && (acting.action === null ? <EmergencyPathProperties
         path={acting.offer.path}
@@ -521,13 +570,25 @@ export function EmergencyCommandsPage({ bindingHandle, api, writeClipboard, reru
         onConfirm={() => void pathActions.confirm()}
         onUndo={() => void pathActions.undo()}
         onClose={pathActions.close} />)}
+      {(state.iocStatus !== "idle" || state.iocReport !== null) && scope !== null && (
+        <EmergencyIocPanel
+          status={state.iocStatus}
+          report={state.iocReport}
+          error={state.iocError}
+          writeClipboard={writeClipboard}
+          onClose={() => {
+            if (scope === null) return;
+            dispatch({ type: "iocs-closed", scope });
+          }}
+        />
+      )}
     </main>
   );
 }
 
 export function EmergencyCommandWorkbench({ groups, commands = [], collapsed = [], selected, selectedHandle,
   runStatus, result, runError, search, elapsedMs = null, groupRun = null, busy = false, blockedReason = null,
-  onToggleCategory = () => undefined, onSelect, onRun, onRunGroup = () => undefined, onStopGroup, onPathMenu,
+  onToggleCategory = () => undefined, onSelect, onRun, onRunGroup = () => undefined, onStopGroup, onPathMenu, onBatchStart,
   writeClipboard }: {
   groups: EmergencyCommandGroup[];
   commands?: readonly EmergencyCommandCatalogItem[];
@@ -549,6 +610,7 @@ export function EmergencyCommandWorkbench({ groups, commands = [], collapsed = [
   onRunGroup?: (category: EmergencyCommandCategory) => void;
   onStopGroup?: (() => void) | undefined;
   onPathMenu?: ((event: MouseEvent, offer: EmergencyCommandPathOffer) => void) | undefined;
+  onBatchStart?: ((pathHandles: readonly string[]) => void) | undefined;
   writeClipboard?: ((text: string) => Promise<void>) | undefined;
 }) {
   return (
@@ -565,7 +627,8 @@ export function EmergencyCommandWorkbench({ groups, commands = [], collapsed = [
       </aside>
       <section className="emergency-command-detail">
         {groupRun !== null ? <EmergencyCommandGroupView run={groupRun} commands={commands}
-          onStop={onStopGroup} onPathMenu={onPathMenu} writeClipboard={writeClipboard} /> :
+          onStop={onStopGroup} onPathMenu={onPathMenu} onBatchStart={onBatchStart}
+          writeClipboard={writeClipboard} /> :
           selected === null ? <EmergencyCommandEmpty title="未选择调查项" detail="从左侧选择一项内置命令。" /> : (
           <>
             <header>
@@ -597,7 +660,7 @@ export function EmergencyCommandWorkbench({ groups, commands = [], collapsed = [
               runStatus === "error" ? <EmergencyCommandError message={runError ?? "命令执行失败。"} compact /> :
                 result === null ? <EmergencyCommandEmpty title="尚未执行" detail="结果将在这里以纯文本显示。" compact /> :
                   <EmergencyCommandResultView result={result} elapsedMs={elapsedMs}
-                    onPathMenu={onPathMenu} writeClipboard={writeClipboard} />}
+                    onPathMenu={onPathMenu} onBatchStart={onBatchStart} writeClipboard={writeClipboard} />}
           </>) }
       </section>
     </div>
@@ -653,11 +716,12 @@ function EmergencyCommandBranch({ group, collapsed, selectedHandle, busy, blocke
 }
 
 /** Sequential group run: one result block per finished step. */
-export function EmergencyCommandGroupView({ run, commands, onStop, onPathMenu, writeClipboard }: {
+export function EmergencyCommandGroupView({ run, commands, onStop, onPathMenu, onBatchStart, writeClipboard }: {
   run: EmergencyCommandGroupRun;
   commands: readonly EmergencyCommandCatalogItem[];
   onStop?: (() => void) | undefined;
   onPathMenu?: ((event: MouseEvent, offer: EmergencyCommandPathOffer) => void) | undefined;
+  onBatchStart?: ((pathHandles: readonly string[]) => void) | undefined;
   writeClipboard?: ((text: string) => Promise<void>) | undefined;
 }) {
   const total = run.commandHandles.length;
@@ -711,7 +775,7 @@ export function EmergencyCommandGroupView({ run, commands, onStop, onPathMenu, w
             {entry.error !== null ? <EmergencyCommandError message={entry.error} compact /> :
               entry.result === null ? null :
                 <EmergencyCommandResultView result={entry.result} elapsedMs={entry.elapsedMs}
-                  onPathMenu={onPathMenu} writeClipboard={writeClipboard} />}
+                  onPathMenu={onPathMenu} onBatchStart={onBatchStart} writeClipboard={writeClipboard} />}
           </details>
         </li>)}
         {pending !== null && <li>
@@ -728,16 +792,29 @@ type ResultViewTab = "all" | "findings" | "raw" | "command";
 /** The clipboard bridge refuses anything over this, so longer text hides the button instead. */
 const CLIPBOARD_LIMIT_BYTES = 128 * 1_024;
 
-export function EmergencyCommandResultView({ result, elapsedMs = null, onPathMenu, writeClipboard }: {
+export function EmergencyCommandResultView({ result, elapsedMs = null, onPathMenu, onBatchStart, writeClipboard }: {
   result: EmergencyCommandResult;
   elapsedMs?: number | null;
   onPathMenu?: ((event: MouseEvent, offer: EmergencyCommandPathOffer) => void) | undefined;
+  /** Opens the batch dialog with the handles the operator ticked. */
+  onBatchStart?: ((pathHandles: readonly string[]) => void) | undefined;
   writeClipboard?: ((text: string) => Promise<void>) | undefined;
 }) {
   const successful = result.resultKind === "success" || result.resultKind === "empty";
   const [tab, setTab] = useState<ResultViewTab>("all");
+  const [batchMode, setBatchMode] = useState(false);
+  const [batchSelection, setBatchSelection] = useState<ReadonlySet<string>>(new Set());
+  // A rerun is a new result: lines and handles from the last one cannot be
+  // acted on, so a selection made against them goes away with it.
+  const previousResult = useRef(result);
+  if (previousResult.current !== result) {
+    previousResult.current = result;
+    setBatchMode(false);
+    setBatchSelection(new Set());
+  }
   const focusFindings = tab === "findings";
   const hasFindings = result.findingLines.length > 0;
+  const offerable = new Set(result.paths.map((offer) => offer.pathHandle));
   return (
     <div className={`emergency-command-result ${successful ? hasFindings ? "is-attention" : "is-success" : "is-failure"}`}>
       <header>
@@ -753,6 +830,24 @@ export function EmergencyCommandResultView({ result, elapsedMs = null, onPathMen
         {onPathMenu !== undefined && result.paths.length > 0 && <span className="emergency-command-counts">
           {result.paths.length} 行可右键处置
         </span>}
+        {onBatchStart !== undefined && result.paths.length > 0 ? (
+          <>
+            <button type="button" className="emergency-command-batch-toggle" aria-pressed={batchMode}
+              onClick={() => {
+                setBatchMode((value) => !value);
+                setBatchSelection(new Set());
+              }}>
+              批量选择
+            </button>
+            {batchMode ? (
+              <button type="button" className="emergency-command-batch-start"
+                disabled={batchSelection.size === 0}
+                onClick={() => onBatchStart([...batchSelection])}>
+                批量处置{batchSelection.size === 0 ? "…" : ` ${batchSelection.size} 项`}
+              </button>
+            ) : null}
+          </>
+        ) : null}
         <span className="emergency-command-counts">exit {emergencyExitCodeLabel(result.exitCode)}</span>
         <span className="emergency-command-counts">{result.displayedLineCount}/{result.observedLineCount} 行</span>
       </header>
@@ -779,7 +874,17 @@ export function EmergencyCommandResultView({ result, elapsedMs = null, onPathMen
         result.output.length === 0 ? <EmergencyCommandEmpty title="命令没有输出"
           detail="没有可显示的内容；请结合执行状态、权限和工具情况判断，不能据此确认没有风险。" compact /> :
           <EmergencyCommandOutput output={result.output} findingLines={result.findingLines}
-            focusFindings={focusFindings} paths={result.paths} onPathMenu={onPathMenu} />}
+            focusFindings={focusFindings} paths={result.paths} onPathMenu={onPathMenu}
+            batchSelected={batchMode ? batchSelection : undefined}
+            onToggleBatch={batchMode ? (offer, selected) => {
+              if (!offerable.has(offer.pathHandle)) return;
+              setBatchSelection((current) => {
+                const next = new Set(current);
+                if (selected) next.add(offer.pathHandle);
+                else next.delete(offer.pathHandle);
+                return next;
+              });
+            } : undefined} />}
     </div>
   );
 }
@@ -792,12 +897,15 @@ export function EmergencyCommandResultView({ result, elapsedMs = null, onPathMen
  * through the handle that came back with the result, so the window never names
  * a path of its own.
  */
-export function EmergencyCommandOutput({ output, findingLines = [], paths = [], focusFindings = false, onPathMenu }: {
+export function EmergencyCommandOutput({ output, findingLines = [], paths = [], focusFindings = false, onPathMenu, batchSelected, onToggleBatch }: {
   output: string;
   findingLines?: readonly number[];
   paths?: readonly EmergencyCommandPathOffer[];
   focusFindings?: boolean;
   onPathMenu?: ((event: MouseEvent, offer: EmergencyCommandPathOffer) => void) | undefined;
+  /** Path handles picked for the batch dialog; undefined hides the checkboxes. */
+  batchSelected?: ReadonlySet<string> | undefined;
+  onToggleBatch?: ((offer: EmergencyCommandPathOffer, selected: boolean) => void) | undefined;
 }) {
   const abnormal = new Set(findingLines);
   const lines = output.split("\n").map((line, index) => ({ line, index })).filter(({ line, index }) =>
@@ -820,7 +928,11 @@ export function EmergencyCommandOutput({ output, findingLines = [], paths = [], 
         return <span key={index} className={marks.length === 0 ? undefined : marks.join(" ")}
           title={offer === undefined ? undefined : `右键可对 ${offer.path} 处置`}
           onContextMenu={offer === undefined || onPathMenu === undefined ? undefined
-            : (event) => onPathMenu(event.nativeEvent, offer)}>{line}{offer !== undefined && onPathMenu !== undefined ? <button
+            : (event) => onPathMenu(event.nativeEvent, offer)}>{offer !== undefined && onToggleBatch !== undefined ? <input
+              type="checkbox" className="emergency-path-batch-check"
+              aria-label={`选择 ${offer.path} 加入批量处置`}
+              checked={batchSelected?.has(offer.pathHandle) ?? false}
+              onChange={(event) => onToggleBatch(offer, event.target.checked)} /> : null}{line}{offer !== undefined && onPathMenu !== undefined ? <button
               type="button" className="emergency-path-open" data-path-handle={offer.pathHandle}
               aria-label={`文件操作：${offer.path}`} onClick={(event) => onPathMenu(event.nativeEvent, offer)}>文件操作</button> : null}{"\n"}</span>;
       })}</pre>
@@ -879,4 +991,163 @@ export function EmergencyCommandEmpty({ title, detail, compact = false }: {
   return <div className={compact ? "emergency-command-empty is-compact" : "emergency-command-empty"}>
     <strong>{title}</strong><p>{detail}</p>
   </div>;
+}
+
+const IOC_KIND_LABELS: Record<EmergencyIocKind, string> = {
+  ipv4: "IPv4",
+  ipv6: "IPv6",
+  domain: "域名",
+  url: "URL",
+};
+
+const IOC_SCOPE_LABELS: Record<EmergencyIocScope, string> = {
+  public: "公网",
+  private: "内网",
+  loopback: "回环",
+  reserved: "保留",
+};
+
+/** Neutralise a value so pasting it cannot open or resolve anything. */
+function defangIocValue(value: string): string {
+  let out = value.startsWith("http") ? `hxxp${value.slice(4)}` : value;
+  if (!out.startsWith("hxxp") && out.startsWith("ftp")) out = `fxp${out.slice(3)}`;
+  return out.replaceAll(".", "[.]");
+}
+
+/**
+ * The leads panel: every address-like token the finished checks printed,
+ * deduplicated and scoped. These are leads to check by hand — the backend
+ * mined text, it did not confirm an intrusion — and the panel says so.
+ */
+export function EmergencyIocPanel({ status, report, error, writeClipboard, onClose }: {
+  status: EmergencyCommandLoadStatus;
+  report: EmergencyIocReport | null;
+  error: string | null;
+  writeClipboard?: ((text: string) => Promise<void>) | undefined;
+  onClose: () => void;
+}) {
+  useModalScrim();
+  const [kindFilter, setKindFilter] = useState<EmergencyIocKind | "all">("all");
+  const [scopeFilter, setScopeFilter] = useState<EmergencyIocScope | "all">("all");
+  const [textFilter, setTextFilter] = useState("");
+  const entries = (report?.entries ?? []).filter((entry) =>
+    (kindFilter === "all" || entry.kind === kindFilter) &&
+    (scopeFilter === "all" || entry.scope === scopeFilter) &&
+    (textFilter.trim() === "" ||
+      entry.value.includes(textFilter.trim()) ||
+      entry.sources.some((source) => source.includes(textFilter.trim()))));
+  const copyText = (defanged: boolean) =>
+    entries.map((entry) => defanged ? defangIocValue(entry.value) : entry.value).join("\n");
+  return (
+    <div className="emergency-path-backdrop" role="presentation">
+      <section
+        className="emergency-path-dialog emergency-ioc-panel"
+        role="dialog"
+        aria-modal="true"
+        aria-label="线索汇总"
+        data-testid="emergency-ioc-panel"
+      >
+        <header>
+          <h2>线索汇总</h2>
+          <p>已运行检查输出中的地址与域名线索，供人工核查。这些是待核查的线索，不是已确认的入侵指标。</p>
+        </header>
+        {status === "loading" ? <EmergencyCommandStatus label="正在汇总已运行检查的输出…" compact /> : null}
+        {status === "error" ? <EmergencyCommandError message={error ?? "无法汇总线索。"} compact /> : null}
+        {report !== null && status === "ready" ? (
+          <>
+            <div className="emergency-ioc-filters">
+              <input
+                type="search"
+                placeholder="按值或来源命令过滤"
+                value={textFilter}
+                onChange={(event) => setTextFilter(event.target.value)}
+                data-testid="emergency-ioc-filter"
+              />
+              <select
+                aria-label="按类型过滤"
+                value={kindFilter}
+                onChange={(event) => setKindFilter(event.target.value as EmergencyIocKind | "all")}
+              >
+                <option value="all">全部类型</option>
+                <option value="ipv4">IPv4</option>
+                <option value="ipv6">IPv6</option>
+                <option value="domain">域名</option>
+                <option value="url">URL</option>
+              </select>
+              <select
+                aria-label="按范围过滤"
+                value={scopeFilter}
+                onChange={(event) => setScopeFilter(event.target.value as EmergencyIocScope | "all")}
+              >
+                <option value="all">全部范围</option>
+                <option value="public">公网</option>
+                <option value="private">内网</option>
+                <option value="loopback">回环</option>
+                <option value="reserved">保留</option>
+              </select>
+            </div>
+            {report.truncated ? (
+              <p className="emergency-command-warning" role="status">
+                线索数量超过上限，只列出了按范围与出现次数排序的前一部分。
+              </p>
+            ) : null}
+            {entries.length === 0 ? (
+              <EmergencyCommandEmpty
+                title={report.entries.length === 0 ? "没有发现线索" : "没有匹配线索"}
+                detail={report.entries.length === 0
+                  ? "已运行的检查输出里没有出现可汇总的地址或域名。线索不存在不代表目标没有异常。"
+                  : "调整过滤条件后重试。"}
+                compact
+              />
+            ) : (
+              <table className="emergency-ioc-table">
+                <thead>
+                  <tr><th>类型</th><th>线索</th><th>范围</th><th>次数</th><th>来源命令</th><th></th></tr>
+                </thead>
+                <tbody>
+                  {entries.map((entry) => (
+                    <tr key={`${entry.kind}:${entry.value}`} data-testid="emergency-ioc-row">
+                      <td>{IOC_KIND_LABELS[entry.kind]}</td>
+                      <td><code>{entry.value}</code>{entry.common ? <span className="emergency-ioc-common">常见</span> : null}</td>
+                      <td>{IOC_SCOPE_LABELS[entry.scope]}</td>
+                      <td>{entry.hits}</td>
+                      <td>{entry.sources.join("、")}</td>
+                      <td>
+                        {writeClipboard !== undefined ? (
+                          <button
+                            type="button"
+                            className="is-link"
+                            onClick={() => void writeClipboard(entry.value)}
+                          >
+                            复制
+                          </button>
+                        ) : null}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </>
+        ) : null}
+        <footer>
+          {writeClipboard !== undefined && report !== null && entries.length > 0 ? (
+            <>
+              <button type="button" onClick={() => void writeClipboard(copyText(false))}>
+                复制全部
+              </button>
+              <button
+                type="button"
+                title="把网址和地址改成 hxxp / [.] 形式，粘贴到别处也不会被点开或解析。"
+                onClick={() => void writeClipboard(copyText(true))}
+              >
+                复制防误触格式
+              </button>
+            </>
+          ) : null}
+          <button type="button" className="is-primary" onClick={onClose}>关闭</button>
+        </footer>
+      </section>
+    </div>
+  );
 }

@@ -196,6 +196,92 @@ export interface EmergencyCommandApi {
    * back, or why there is none.
    */
   locateEmergencyHistoryCommand(bindingHandle: string, snapshotHandle: string, historyId: string): Promise<unknown>;
+  /**
+   * Leads mined from the outputs this snapshot's runs left in the backend.
+   * The page sends no output text; it only names the snapshot.
+   */
+  extractEmergencyCommandIocs(bindingHandle: string, snapshotHandle: string): Promise<unknown>;
+  /**
+   * Plans the same containment action for up to fifty offered handles. Each
+   * row comes back with its own plan or its own refusal; one confirmation
+   * covers the previewed set.
+   */
+  planEmergencyPathBatch(
+    bindingHandle: string,
+    pathHandles: readonly string[],
+    action: EmergencyPathAction,
+  ): Promise<unknown>;
+  confirmEmergencyPathBatch(bindingHandle: string, batchHandle: string): Promise<unknown>;
+  stepEmergencyPathBatch(bindingHandle: string, batchHandle: string): Promise<unknown>;
+  cancelEmergencyPathBatch(bindingHandle: string, batchHandle: string): Promise<void>;
+}
+
+export const emergencyPathBatchStates = ["planned", "confirmed"] as const;
+export type EmergencyPathBatchState = typeof emergencyPathBatchStates[number];
+
+/**
+ * One row of a batch preview: the file as it stood, and either what would
+ * happen to it or the refusal key standing instead.
+ */
+export interface EmergencyPathBatchItem {
+  pathHandle: string;
+  /** The stored path; empty where the offered handle already went stale. */
+  path: string;
+  /** Empty where the handle was stale before the file could be read. */
+  kind: "file" | "directory" | "symlink" | "other" | "";
+  size: string;
+  mode: string | null;
+  executable: boolean;
+  /** The item's own plan identity — receipts and undo still name it. */
+  planHandle: string | null;
+  summary: string | null;
+  restoreDescription: string | null;
+  refusal: string | null;
+}
+
+export interface EmergencyPathBatchPlan {
+  batchHandle: string;
+  action: EmergencyPathAction;
+  items: EmergencyPathBatchItem[];
+  planned: number;
+  refused: number;
+  state: EmergencyPathBatchState;
+  expiresInSeconds: number;
+}
+
+/** One finished item's own receipt plus where the batch stands after it. */
+export interface EmergencyPathBatchStep {
+  batchHandle: string;
+  receipt: EmergencyPathReceipt | null;
+  remaining: number;
+  refused: number;
+  finished: boolean;
+}
+
+export const emergencyIocKinds = ["ipv4", "ipv6", "domain", "url"] as const;
+export const emergencyIocScopes = ["public", "private", "loopback", "reserved"] as const;
+export type EmergencyIocKind = typeof emergencyIocKinds[number];
+export type EmergencyIocScope = typeof emergencyIocScopes[number];
+
+/**
+ * One address-like lead and where it was seen. A lead is something to check,
+ * never a confirmed indicator — the report carries no verdict.
+ */
+export interface EmergencyIocEntry {
+  kind: EmergencyIocKind;
+  value: string;
+  scope: EmergencyIocScope;
+  /** How many times the value occurred across all stored output. */
+  hits: number;
+  /** Titles of the checks whose output contained it. */
+  sources: string[];
+  /** A well-known distro/package name — kept, but marked. */
+  common: boolean;
+}
+
+export interface EmergencyIocReport {
+  entries: EmergencyIocEntry[];
+  truncated: boolean;
 }
 
 export const emergencyHistoryLocationStatuses = ["found", "missing", "not-recorded", "not-in-catalog"] as const;
@@ -447,6 +533,90 @@ export function isEmergencyPathUndoResult(value: unknown): value is EmergencyPat
   return record(value) && exact(value, ["planHandle", "path", "undone", "detail"]) &&
     isEmergencyCommandOpaqueHandle(value.planHandle) && offeredPath(value.path) &&
     typeof value.undone === "boolean" && catalogText(value.detail, 512);
+}
+
+const iocKindSet = new Set<string>(emergencyIocKinds);
+const iocScopeSet = new Set<string>(emergencyIocScopes);
+const MAX_IOC_ENTRIES = 500;
+const MAX_IOC_SOURCES = 8;
+const MAX_IOC_VALUE_BYTES = 512;
+const MAX_IOC_SOURCE_BYTES = 128;
+
+function iocEntry(value: unknown): value is EmergencyIocEntry {
+  return record(value) && exact(value, ["kind", "value", "scope", "hits", "sources", "common"]) &&
+    typeof value.kind === "string" && iocKindSet.has(value.kind) &&
+    catalogText(value.value, MAX_IOC_VALUE_BYTES) &&
+    typeof value.scope === "string" && iocScopeSet.has(value.scope) &&
+    unsigned(value.hits, 0xffff_ffff) &&
+    Array.isArray(value.sources) && value.sources.length <= MAX_IOC_SOURCES &&
+    (value.sources as unknown[]).every((source) => catalogText(source, MAX_IOC_SOURCE_BYTES)) &&
+    typeof value.common === "boolean";
+}
+
+export function isEmergencyIocReport(value: unknown): value is EmergencyIocReport {
+  return record(value) && exact(value, ["entries", "truncated"]) &&
+    Array.isArray(value.entries) && value.entries.length <= MAX_IOC_ENTRIES &&
+    (value.entries as unknown[]).every(iocEntry) &&
+    typeof value.truncated === "boolean";
+}
+
+const batchStateSet = new Set<string>(emergencyPathBatchStates);
+// Restore and capability edits stay single-path decisions; a batch can only
+// ever be one of the two containment actions.
+const batchActionSet = new Set<string>(["disarm", "quarantine"]);
+const MAX_BATCH_ITEMS = 50;
+const MAX_BATCH_REFUSAL_BYTES = 64;
+
+function batchItem(value: unknown): value is EmergencyPathBatchItem {
+  if (!record(value) || !exact(value, [
+    "pathHandle", "path", "kind", "size", "mode", "executable",
+    "planHandle", "summary", "restoreDescription", "refusal",
+  ]) || !isEmergencyCommandOpaqueHandle(value.pathHandle)) return false;
+  const refused = value.refusal !== null;
+  // A refused row carries only the refusal; a planned one carries the plan
+  // facts. Neither may borrow the other's fields, and a stale row's empty
+  // path stays empty.
+  if (refused && (
+    typeof value.refusal !== "string" || !catalogText(value.refusal, MAX_BATCH_REFUSAL_BYTES) ||
+    value.planHandle !== null || value.summary !== null || value.restoreDescription !== null)) {
+    return false;
+  }
+  if (!refused && (
+    !isEmergencyCommandOpaqueHandle(value.planHandle) || !catalogText(value.summary, 512) ||
+    !(value.restoreDescription === null || catalogText(value.restoreDescription, 512)))) {
+    return false;
+  }
+  return (value.path === "" || offeredPath(value.path)) &&
+    typeof value.kind === "string" && (pathKindSet.has(value.kind) || refused && value.kind === "") &&
+    typeof value.size === "string" && (/^\d{1,20}$/u.test(value.size) || refused && value.size === "") &&
+    (value.mode === null || typeof value.mode === "string" && /^[0-7]{4}$/u.test(value.mode)) &&
+    typeof value.executable === "boolean";
+}
+
+export function isEmergencyPathBatchPlan(value: unknown): value is EmergencyPathBatchPlan {
+  if (!record(value) || !exact(value, [
+    "batchHandle", "action", "items", "planned", "refused", "state", "expiresInSeconds",
+  ]) || !isEmergencyCommandOpaqueHandle(value.batchHandle) ||
+    typeof value.action !== "string" || !batchActionSet.has(value.action) ||
+    !Array.isArray(value.items) || value.items.length === 0 || value.items.length > MAX_BATCH_ITEMS ||
+    !(value.items as unknown[]).every(batchItem) ||
+    !unsigned(value.planned, MAX_BATCH_ITEMS) || !unsigned(value.refused, MAX_BATCH_ITEMS) ||
+    typeof value.state !== "string" || !batchStateSet.has(value.state) ||
+    !unsigned(value.expiresInSeconds, 300) || value.expiresInSeconds === 0) return false;
+  // The counts have to add up to the rows that are actually here.
+  const items = value.items as EmergencyPathBatchItem[];
+  const planned = items.filter((item) => item.refusal === null).length;
+  return value.planned === planned && value.refused === items.length - planned;
+}
+
+export function isEmergencyPathBatchStep(value: unknown): value is EmergencyPathBatchStep {
+  return record(value) && exact(value, ["batchHandle", "receipt", "remaining", "refused", "finished"]) &&
+    isEmergencyCommandOpaqueHandle(value.batchHandle) &&
+    (value.receipt === null || isEmergencyPathReceipt(value.receipt)) &&
+    unsigned(value.remaining, MAX_BATCH_ITEMS) && unsigned(value.refused, MAX_BATCH_ITEMS) &&
+    typeof value.finished === "boolean" &&
+    // A finished batch has nothing left to run; a step with nothing run is the end.
+    (!value.finished || value.remaining === 0) && (value.finished || value.receipt !== null);
 }
 
 export function isEmergencyPathAction(value: unknown): value is EmergencyPathAction {

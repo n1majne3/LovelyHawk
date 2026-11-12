@@ -7,6 +7,8 @@ import type {
   EmergencyCommandApi,
   EmergencyCommandCatalogItem,
   EmergencyCommandResult,
+  EmergencyPathBatchItem,
+  EmergencyPathReceipt,
 } from "../shared/emergency-command-contract";
 import {
   EmergencyCommandEmpty,
@@ -18,7 +20,9 @@ import {
   EmergencyCommandsPage,
   EmergencyCommandStatus,
   EmergencyCommandWorkbench,
+  EmergencyIocPanel,
 } from "./EmergencyCommandsPage";
+import { EmergencyPathBatchChoose, EmergencyPathBatchDialog, EmergencyPathBatchItems } from "./EmergencyPathBatchDialog";
 import { EmergencyPathDialog, EmergencyPathOutcome, EmergencyPathProperties, symbolicMode } from "./EmergencyPathDialog";
 import { EmergencyPathMenu } from "./EmergencyPathMenu";
 
@@ -34,6 +38,11 @@ const api: EmergencyCommandApi & import("../shared/file-evidence-contract").File
   cancelEmergencyPathAction: async () => { throw new Error(); },
   undoEmergencyPathAction: async () => { throw new Error(); },
   locateEmergencyHistoryCommand: async () => { throw new Error(); },
+  extractEmergencyCommandIocs: async () => { throw new Error(); },
+  planEmergencyPathBatch: async () => { throw new Error(); },
+  confirmEmergencyPathBatch: async () => { throw new Error(); },
+  stepEmergencyPathBatch: async () => { throw new Error(); },
+  cancelEmergencyPathBatch: async (): Promise<void> => { throw new Error(); },
 };
 
 const command: EmergencyCommandCatalogItem = {
@@ -577,8 +586,8 @@ describe("EmergencyCommandsPage", () => {
       .filter((name) => /className="[^"]*emergency-path-(?:backdrop|dialog|menu)\b/u
         .test(readFileSync(new URL(name, directory), "utf8")));
     expect(users.sort()).toEqual([
-      "EmergencyPathDialog.tsx", "EmergencyPathMenu.tsx", "FileEvidenceDialog.tsx", "LocalScanDialog.tsx",
-      "LogRulesDialog.tsx",
+      "EmergencyCommandsPage.tsx", "EmergencyPathBatchDialog.tsx", "EmergencyPathDialog.tsx",
+      "EmergencyPathMenu.tsx", "FileEvidenceDialog.tsx", "LocalScanDialog.tsx", "LogRulesDialog.tsx",
     ]);
     for (const name of users) {
       expect(readFileSync(new URL(name, directory), "utf8"), name).toContain('import "./emergency-path.css";');
@@ -634,6 +643,156 @@ describe("EmergencyCommandsPage", () => {
     // The button hands the exact field to the bridge, nothing else.
     const source = readFileSync(new URL("./EmergencyCommandsPage.tsx", import.meta.url), "utf8");
     expect(source).toContain("void writeClipboard(text)");
+  });
+
+  it("renders mined leads as plain text with scope, sources and a warning that they are leads", () => {
+    const report = {
+      entries: [
+        { kind: "url" as const, value: "http://1.2.3.4:8080/x|sh", scope: "public" as const, hits: 2,
+          sources: ["检查计划任务", "查看网络连接"], common: false },
+        { kind: "domain" as const, value: "evil.example.com", scope: "public" as const, hits: 1,
+          sources: ["查看网络连接"], common: false },
+        { kind: "ipv4" as const, value: "192.168.4.4", scope: "private" as const, hits: 4,
+          sources: ["查看进程"], common: false },
+        { kind: "domain" as const, value: "deb.debian.org", scope: "public" as const, hits: 1,
+          sources: ["查看进程"], common: true },
+      ],
+      truncated: false,
+    };
+    const html = renderToStaticMarkup(<EmergencyIocPanel
+      status="ready" report={report} error={null}
+      writeClipboard={async () => undefined} onClose={() => undefined} />);
+    expect(html).toContain("线索汇总");
+    expect(html).toContain("待核查的线索，不是已确认的入侵指标");
+    for (const value of ["http://1.2.3.4:8080/x|sh", "evil.example.com", "192.168.4.4", "deb.debian.org"]) {
+      expect(html).toContain(value);
+    }
+    // Untrusted values render escaped; a hostile one stays text.
+    const hostile = renderToStaticMarkup(<EmergencyIocPanel
+      status="ready" report={{ entries: [
+        { kind: "url" as const, value: "<script>steal()</script>", scope: "public" as const,
+          hits: 1, sources: ["a"], common: false },
+      ], truncated: false }} error={null} onClose={() => undefined} />);
+    expect(hostile).not.toContain("<script>");
+    expect(hostile).toContain("&lt;script&gt;steal()");
+    // Scopes and kinds label in Chinese; a well-known host is marked, not hidden.
+    for (const label of ["URL", "域名", "IPv4", "公网", "内网", "常见"]) expect(html).toContain(label);
+    expect(html).toContain("检查计划任务");
+    expect(html).toContain("复制全部");
+    expect(html).toContain("复制防误触格式");
+    // Filters are present for the expert; without the clipboard bridge there
+    // is nothing to copy with.
+    expect(html).toContain("按值或来源命令过滤");
+    const silent = renderToStaticMarkup(<EmergencyIocPanel
+      status="ready" report={report} error={null} onClose={() => undefined} />);
+    expect(silent).not.toContain("复制全部");
+    // Empty, loading, truncated and error states each say what they are.
+    const empty = renderToStaticMarkup(<EmergencyIocPanel
+      status="ready" report={{ entries: [], truncated: false }} error={null}
+      onClose={() => undefined} />);
+    expect(empty).toContain("没有发现线索");
+    expect(empty).toContain("不代表目标没有异常");
+    const truncated = renderToStaticMarkup(<EmergencyIocPanel
+      status="ready" report={{ entries: report.entries, truncated: true }} error={null}
+      onClose={() => undefined} />);
+    expect(truncated).toContain("超过上限");
+    const loading = renderToStaticMarkup(<EmergencyIocPanel
+      status="loading" report={null} error={null} onClose={() => undefined} />);
+    expect(loading).toContain("正在汇总");
+    const failed = renderToStaticMarkup(<EmergencyIocPanel
+      status="error" report={null} error="快照已过期" onClose={() => undefined} />);
+    expect(failed).toContain("快照已过期");
+  });
+
+  it("asks the backend for leads by snapshot handle alone, never with output text", () => {
+    const source = readFileSync(new URL("./EmergencyCommandsPage.tsx", import.meta.url), "utf8");
+    expect(source).toContain("api.extractEmergencyCommandIocs(bindingHandle, request.snapshotHandle)");
+    expect(source).not.toMatch(/extractEmergencyCommandIocs\([^)]*(?:output|result|text)/u);
+  });
+
+  it("previews a batch per item and keeps partial failure visible", () => {
+    const items: EmergencyPathBatchItem[] = [
+      {
+        pathHandle: "ph-a", path: "/tmp/.a.php", kind: "file" as const, size: "21", mode: "0755",
+        executable: true, planHandle: "plan-a", summary: "将该文件移入隔离区",
+        restoreDescription: "把文件放回原位置", refusal: null,
+      },
+      {
+        pathHandle: "ph-b", path: "/tmp/.b.php", kind: "file" as const, size: "4", mode: "0644",
+        executable: false, planHandle: null, summary: null, restoreDescription: null,
+        refusal: "path-stale",
+      },
+      {
+        pathHandle: "ph-c", path: "/tmp/.c.php", kind: "file" as const, size: "9", mode: "0755",
+        executable: true, planHandle: "plan-c", summary: "将该文件移入隔离区",
+        restoreDescription: null, refusal: null,
+      },
+    ];
+    // Before any step: facts and plan-or-refusal per row.
+    const preview = renderToStaticMarkup(<EmergencyPathBatchItems
+      items={items} receipts={[]} undone={new Map()} onUndo={() => undefined} />);
+    for (const path of ["/tmp/.a.php", "/tmp/.b.php", "/tmp/.c.php"]) {
+      expect(preview).toContain(path);
+    }
+    expect(preview).toContain("将该文件移入隔离区");
+    expect(preview).toContain("把文件放回原位置");
+    expect(preview).toContain("条目已过期");
+    expect(preview).toContain("可执行");
+    expect(preview).not.toContain("撤销");
+    // After the run: a passed row offers its own undo, a failed row keeps
+    // its refusal text — partial failure stays visible.
+    const receipts: EmergencyPathReceipt[] = [
+      { planHandle: "plan-a", path: "/tmp/.a.php", action: "quarantine" as const, passed: true,
+        detail: "已移入隔离区并核对", restored: false, untouched: false, undoable: true },
+      { planHandle: "plan-c", path: "/tmp/.c.php", action: "quarantine" as const, passed: false,
+        detail: "文件在计划后已被替换，未改动。", restored: false, untouched: true, undoable: false },
+    ];
+    const done = renderToStaticMarkup(<EmergencyPathBatchItems
+      items={items} receipts={receipts} undone={new Map()} onUndo={() => undefined} />);
+    expect(done).toContain("已完成并核对");
+    expect(done).toContain("已移入隔离区并核对");
+    expect(done).toContain("被拒绝，文件未改动");
+    expect(done).toContain("文件在计划后已被替换");
+    expect(done).toContain("撤销");
+    // Only the undoable row offers it — the rejected item has nothing to undo.
+    expect(done).not.toContain("plan-c');>撤销");
+    // An undone row reports the undo and drops the button.
+    const undoneRows = renderToStaticMarkup(<EmergencyPathBatchItems
+      items={items} receipts={receipts}
+      undone={new Map([["plan-a", "文件已恢复原位置并核对"]])} onUndo={() => undefined} />);
+    expect(undoneRows).toContain("撤销：文件已恢复原位置并核对");
+    // Hostile text in a receipt or path stays text.
+    const hostile = renderToStaticMarkup(<EmergencyPathBatchItems
+      items={[{ ...items[0] as EmergencyPathBatchItem, path: "<img src=x onerror=steal()>" }]}
+      receipts={[{ ...receipts[0] as EmergencyPathReceipt, detail: "<script>x()</script>" }]}
+      undone={new Map()} onUndo={() => undefined} />);
+    expect(hostile).not.toContain("<script>");
+    expect(hostile).not.toContain("<img src=x");
+    // The pick stage offers the two containment actions and nothing else.
+    const choose = renderToStaticMarkup(<EmergencyPathBatchChoose count={2} onPick={() => undefined} />);
+    expect(choose).toContain("批量隔离");
+    expect(choose).toContain("批量去执行位");
+    expect(choose).not.toContain("按残留还原");
+    // The dialog itself: the one confirmation and the stop-between-items path.
+    const dialog = renderToStaticMarkup(<EmergencyPathBatchDialog
+      api={api} bindingHandle="binding" pathHandles={["ph-a", "ph-b"]} onClose={() => undefined} />);
+    expect(dialog).toContain("批量处置");
+    const source = readFileSync(new URL("./EmergencyPathBatchDialog.tsx", import.meta.url), "utf8");
+    // Handles go in, paths never do; steps run one at a time and a stop
+    // between items cancels what has not run.
+    expect(source).toContain("api.planEmergencyPathBatch(bindingHandle, pathHandles, action)");
+    expect(source).toContain("api.stepEmergencyPathBatch(bindingHandle, batchHandle)");
+    expect(source).toContain("stopRef.current");
+    expect(source).toContain("api.cancelEmergencyPathBatch(bindingHandle, batchHandle)");
+    expect(source).toContain("api.undoEmergencyPathAction(bindingHandle, planHandle)");
+  });
+
+  it("lets the batch dialog carry the shared dialog styles", () => {
+    const source = readFileSync(new URL("./EmergencyPathBatchDialog.tsx", import.meta.url), "utf8");
+    expect(source).toContain('import "./emergency-path.css";');
+    const css = readFileSync(new URL("./emergency-path.css", import.meta.url), "utf8");
+    expect(css).toContain(".emergency-path-batch");
+    expect(css).not.toMatch(/#[0-9a-f]{3,8}|rgba?\(|hsla?\(/iu);
   });
 
   it("uses global theme tokens with no color literals", () => {

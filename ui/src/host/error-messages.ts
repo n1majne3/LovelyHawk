@@ -123,6 +123,9 @@ export const BACKEND_ERROR_MESSAGES: Readonly<Record<string, string>> = Object.f
   "emergency-path-restore-location": "只能恢复 /bin、/sbin、/usr/bin 等系统命令目录里的命令，这个位置不在范围内。",
   "emergency-path-restore-empty": "同目录下没有找到可用于恢复的备份残留。",
   "emergency-path-restore-ambiguous": "同目录下有多个备份残留，无法自动判断来源，请先人工核实该用哪一个。",
+  "emergency-path-batch-size": "一次批量处置最多 50 个路径，请减少选择后再试。",
+  "emergency-path-batch-action": "该操作不支持批量执行，请逐个处理。",
+  "emergency-path-not-executable": "该文件没有执行权限可去除，无需处理。",
 
   // Baseline and audits.
   "baseline-binding-unavailable": "目标连接已断开或已切换，基线检查没有执行。",

@@ -1844,6 +1844,16 @@ impl BackendState {
                     Err(failure) => Err(failure),
                 }
             }
+            RpcMethod::EmergencyCommandIocs => {
+                match parse_params::<EmergencyCommandIocsParams>(request.params) {
+                    Ok(params) => self
+                        .emergency_command
+                        .ioc_report(&params.binding_handle, &params.snapshot_handle)
+                        .map(to_value)
+                        .map_err(emergency_command_failure),
+                    Err(failure) => Err(failure),
+                }
+            }
             RpcMethod::EmergencyCommandPathInspect => {
                 match parse_params::<EmergencyCommandPathParams>(request.params) {
                     Ok(params) => self
@@ -1910,6 +1920,52 @@ impl BackendState {
                         .undo(&params.binding_handle, &params.plan_handle)
                         .await
                         .map(to_value)
+                        .map_err(emergency_path_failure),
+                    Err(failure) => Err(failure),
+                }
+            }
+            RpcMethod::EmergencyCommandPathBatchPlan => {
+                match parse_params::<EmergencyCommandPathBatchPlanParams>(request.params) {
+                    Ok(params) => self
+                        .emergency_command
+                        .paths()
+                        .plan_batch(&params.binding_handle, &params.path_handles, params.action)
+                        .await
+                        .map(to_value)
+                        .map_err(emergency_path_failure),
+                    Err(failure) => Err(failure),
+                }
+            }
+            RpcMethod::EmergencyCommandPathBatchConfirm => {
+                match parse_params::<EmergencyCommandPathBatchHandleParams>(request.params) {
+                    Ok(params) => self
+                        .emergency_command
+                        .paths()
+                        .confirm_batch(&params.binding_handle, &params.batch_handle)
+                        .map(to_value)
+                        .map_err(emergency_path_failure),
+                    Err(failure) => Err(failure),
+                }
+            }
+            RpcMethod::EmergencyCommandPathBatchStep => {
+                match parse_params::<EmergencyCommandPathBatchHandleParams>(request.params) {
+                    Ok(params) => self
+                        .emergency_command
+                        .paths()
+                        .step_batch(&params.binding_handle, &params.batch_handle)
+                        .await
+                        .map(to_value)
+                        .map_err(emergency_path_failure),
+                    Err(failure) => Err(failure),
+                }
+            }
+            RpcMethod::EmergencyCommandPathBatchCancel => {
+                match parse_params::<EmergencyCommandPathBatchHandleParams>(request.params) {
+                    Ok(params) => self
+                        .emergency_command
+                        .paths()
+                        .cancel_batch(&params.binding_handle, &params.batch_handle)
+                        .map(|()| to_value(()))
                         .map_err(emergency_path_failure),
                     Err(failure) => Err(failure),
                 }
@@ -3041,6 +3097,8 @@ enum RpcMethod {
     EmergencyCommandRun,
     #[serde(rename = "emergency-command.history.locate")]
     EmergencyCommandHistoryLocate,
+    #[serde(rename = "emergency-command.iocs")]
+    EmergencyCommandIocs,
     #[serde(rename = "emergency-command.path.inspect")]
     EmergencyCommandPathInspect,
     #[serde(rename = "emergency-command.path.plan")]
@@ -3053,6 +3111,14 @@ enum RpcMethod {
     EmergencyCommandPathCancel,
     #[serde(rename = "emergency-command.path.undo")]
     EmergencyCommandPathUndo,
+    #[serde(rename = "emergency-command.path.batch.plan")]
+    EmergencyCommandPathBatchPlan,
+    #[serde(rename = "emergency-command.path.batch.confirm")]
+    EmergencyCommandPathBatchConfirm,
+    #[serde(rename = "emergency-command.path.batch.step")]
+    EmergencyCommandPathBatchStep,
+    #[serde(rename = "emergency-command.path.batch.cancel")]
+    EmergencyCommandPathBatchCancel,
     #[serde(rename = "sftp-browser.open")]
     SftpBrowserOpen,
     #[serde(rename = "sftp-browser.directory.list")]
@@ -3752,6 +3818,15 @@ struct EmergencyCommandRunParams {
     container_handle: Option<String>,
 }
 
+/// The snapshot whose stored outputs are mined for leads. No output text
+/// crosses back over the boundary.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EmergencyCommandIocsParams {
+    binding_handle: String,
+    snapshot_handle: String,
+}
+
 /// A history record and the catalogue to find its check in; the record's own
 /// entry never comes from the page.
 #[derive(Deserialize)]
@@ -3782,6 +3857,21 @@ struct EmergencyCommandPathPlanParams {
 struct EmergencyCommandPathPlanHandleParams {
     binding_handle: String,
     plan_handle: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EmergencyCommandPathBatchPlanParams {
+    binding_handle: String,
+    path_handles: Vec<String>,
+    action: EmergencyPathAction,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EmergencyCommandPathBatchHandleParams {
+    binding_handle: String,
+    batch_handle: String,
 }
 
 #[derive(Deserialize)]
@@ -6190,6 +6280,18 @@ fn emergency_path_failure(error: EmergencyPathApiError) -> RpcFailure {
             public_message: "The emergency command operation exceeded its deadline.",
             source: None,
         },
+        EmergencyPathApiError::BatchSize => RpcFailure {
+            operation: "bound emergency path batch",
+            code: "emergency-path-batch-size",
+            public_message: "A batch file action needs between 1 and 50 file entries.",
+            source: None,
+        },
+        EmergencyPathApiError::UnsupportedBatchAction => RpcFailure {
+            operation: "validate emergency path batch action",
+            code: "emergency-path-batch-action",
+            public_message: "That action is only offered one file at a time.",
+            source: None,
+        },
         EmergencyPathApiError::Refused(refusal) => match refusal {
             PathRefusal::Tools => RpcFailure {
                 operation: "plan a capability removal",
@@ -6213,6 +6315,12 @@ fn emergency_path_failure(error: EmergencyPathApiError) -> RpcFailure {
                 operation: "plan a capability removal",
                 code: "emergency-path-capability-empty",
                 public_message: "That file currently has no capabilities to remove.",
+                source: None,
+            },
+            PathRefusal::NotExecutable => RpcFailure {
+                operation: "plan an execute-bit removal",
+                code: "emergency-path-not-executable",
+                public_message: "That file has no execute bits to remove.",
                 source: None,
             },
             PathRefusal::RestoreTools => RpcFailure {

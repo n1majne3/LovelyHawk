@@ -191,6 +191,12 @@ export interface SystemInfoRowReceipt {
   verified: boolean;
   detail: string;
   restored: boolean;
+  /**
+   * A typed follow-up the page may offer, or none. This is a field, not a
+   * marker inside `detail`: remote-controlled text never switches UI
+   * affordances.
+   */
+  nextStep: "verify-account-tool" | null;
 }
 
 export type SystemInfoFirewallDirection = "inbound" | "outbound" | "both";
@@ -613,7 +619,7 @@ export function isSystemInfoRowReceipt(value: unknown): value is SystemInfoRowRe
   return (
     isRecord(value) &&
     exact(value, [
-      "planHandle", "tab", "rowId", "action", "label", "subject", "verified", "detail", "restored",
+      "planHandle", "tab", "rowId", "action", "label", "subject", "verified", "detail", "restored", "nextStep",
     ]) &&
     isSystemInfoOpaqueHandle(value.planHandle) &&
     isSystemInfoTabKey(value.tab) &&
@@ -623,6 +629,7 @@ export function isSystemInfoRowReceipt(value: unknown): value is SystemInfoRowRe
     isRowSubject(value.subject) &&
     typeof value.verified === "boolean" &&
     utf8(value.detail, MAX_ROW_PLAN_TEXT_BYTES, true) &&
-    typeof value.restored === "boolean"
+    typeof value.restored === "boolean" &&
+    (value.nextStep === null || value.nextStep === "verify-account-tool")
   );
 }

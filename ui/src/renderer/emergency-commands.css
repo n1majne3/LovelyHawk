@@ -946,3 +946,69 @@
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+
+.emergency-ioc-panel {
+  max-width: 860px;
+  width: min(860px, 94vw);
+}
+
+.emergency-ioc-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 0 10px;
+}
+
+.emergency-ioc-filters input,
+.emergency-ioc-filters select {
+  background: var(--field-bg);
+  border: 1px solid var(--field-border);
+  border-radius: var(--radius-control);
+  color: var(--text);
+  font: inherit;
+  padding: 5px 9px;
+}
+
+.emergency-ioc-filters input {
+  flex: 1 1 220px;
+  min-width: 0;
+}
+
+.emergency-ioc-filters input:focus-visible,
+.emergency-ioc-filters select:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.emergency-ioc-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--font-small);
+}
+
+.emergency-ioc-table th,
+.emergency-ioc-table td {
+  text-align: left;
+  padding: 4px 8px 4px 0;
+  vertical-align: top;
+}
+
+.emergency-ioc-table th {
+  color: var(--text-muted);
+  font-weight: 600;
+  border-bottom: 1px solid var(--field-border);
+}
+
+.emergency-ioc-table td code {
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+.emergency-ioc-common {
+  margin-left: 8px;
+  padding: 0 6px;
+  border-radius: var(--radius-control);
+  border: 1px solid var(--field-border);
+  color: var(--text-muted);
+  font-size: var(--font-caption);
+}

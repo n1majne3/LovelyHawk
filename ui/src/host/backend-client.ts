@@ -78,9 +78,12 @@ import {
   type EmergencyPathAction,
   type EmergencyPathDetail,
   type EmergencyPathPlan,
+  type EmergencyPathBatchPlan,
+  type EmergencyPathBatchStep,
   type EmergencyPathReceipt,
   type EmergencyPathUndoResult,
   type EmergencyHistoryLocation,
+  type EmergencyIocReport,
   type SftpDirectorySnapshot,
   type SftpOperationInput,
   type SftpOperationPlan,
@@ -241,11 +244,14 @@ import {
   isEmergencyCommandOpaqueHandle,
   isEmergencyCommandResult,
   isEmergencyPathAction,
+  isEmergencyPathBatchPlan,
+  isEmergencyPathBatchStep,
   isEmergencyPathDetail,
   isEmergencyPathPlan,
   isEmergencyPathReceipt,
   isEmergencyPathUndoResult,
   isEmergencyHistoryLocation,
+  isEmergencyIocReport,
   isSftpBrowserOpaqueHandle,
   isSftpDirectorySnapshot,
   isSftpOperationPlan,
@@ -534,6 +540,11 @@ export const EMERGENCY_COMMAND_RPC_METHODS = Object.freeze({
   cancelPath: "emergency-command.path.cancel",
   undoPath: "emergency-command.path.undo",
   locateHistory: "emergency-command.history.locate",
+  iocs: "emergency-command.iocs",
+  batchPlanPath: "emergency-command.path.batch.plan",
+  batchConfirmPath: "emergency-command.path.batch.confirm",
+  batchStepPath: "emergency-command.path.batch.step",
+  batchCancelPath: "emergency-command.path.batch.cancel",
 } as const);
 
 export const SFTP_BROWSER_RPC_METHODS = Object.freeze({
@@ -2130,6 +2141,70 @@ export class BackendClient {
     return value;
   }
 
+  async planEmergencyPathBatch(
+    bindingHandle: string,
+    pathHandles: readonly string[],
+    action: EmergencyPathAction,
+  ): Promise<EmergencyPathBatchPlan> {
+    if (!isEmergencyCommandOpaqueHandle(bindingHandle) ||
+      pathHandles.length === 0 || pathHandles.length > 50 ||
+      !pathHandles.every(isEmergencyCommandOpaqueHandle) ||
+      new Set(pathHandles).size !== pathHandles.length ||
+      !isEmergencyPathAction(action)) {
+      throw new Error("The emergency path batch plan request is invalid.");
+    }
+    const value = await this.#request(EMERGENCY_COMMAND_RPC_METHODS.batchPlanPath, {
+      bindingHandle,
+      pathHandles: [...pathHandles],
+      action,
+    });
+    if (!isEmergencyPathBatchPlan(value) || value.action !== action) {
+      throw new Error("The backend returned an invalid emergency path batch plan.");
+    }
+    return value;
+  }
+
+  async confirmEmergencyPathBatch(
+    bindingHandle: string,
+    batchHandle: string,
+  ): Promise<EmergencyPathBatchPlan> {
+    if (![bindingHandle, batchHandle].every(isEmergencyCommandOpaqueHandle)) {
+      throw new Error("The emergency path batch confirmation is invalid.");
+    }
+    const value = await this.#request(EMERGENCY_COMMAND_RPC_METHODS.batchConfirmPath, {
+      bindingHandle,
+      batchHandle,
+    });
+    if (!isEmergencyPathBatchPlan(value) || value.batchHandle !== batchHandle) {
+      throw new Error("The backend returned an invalid emergency path batch confirmation.");
+    }
+    return value;
+  }
+
+  async stepEmergencyPathBatch(
+    bindingHandle: string,
+    batchHandle: string,
+  ): Promise<EmergencyPathBatchStep> {
+    if (![bindingHandle, batchHandle].every(isEmergencyCommandOpaqueHandle)) {
+      throw new Error("The emergency path batch step request is invalid.");
+    }
+    const value = await this.#request(EMERGENCY_COMMAND_RPC_METHODS.batchStepPath, {
+      bindingHandle,
+      batchHandle,
+    }, EMERGENCY_COMMAND_RUN_TIMEOUT_MS);
+    if (!isEmergencyPathBatchStep(value) || value.batchHandle !== batchHandle) {
+      throw new Error("The backend returned an invalid emergency path batch step.");
+    }
+    return value;
+  }
+
+  async cancelEmergencyPathBatch(bindingHandle: string, batchHandle: string): Promise<void> {
+    if (![bindingHandle, batchHandle].every(isEmergencyCommandOpaqueHandle)) {
+      throw new Error("The emergency path batch cancellation is invalid.");
+    }
+    await this.#request(EMERGENCY_COMMAND_RPC_METHODS.batchCancelPath, { bindingHandle, batchHandle });
+  }
+
   async locateEmergencyHistoryCommand(
     bindingHandle: string,
     snapshotHandle: string,
@@ -2145,6 +2220,23 @@ export class BackendClient {
     });
     if (!isEmergencyHistoryLocation(value)) {
       throw new Error("The backend returned an invalid emergency history location.");
+    }
+    return value;
+  }
+
+  async extractEmergencyCommandIocs(
+    bindingHandle: string,
+    snapshotHandle: string,
+  ): Promise<EmergencyIocReport> {
+    if (![bindingHandle, snapshotHandle].every(isEmergencyCommandOpaqueHandle)) {
+      throw new Error("The emergency indicator request is invalid.");
+    }
+    const value = await this.#request(EMERGENCY_COMMAND_RPC_METHODS.iocs, {
+      bindingHandle,
+      snapshotHandle,
+    });
+    if (!isEmergencyIocReport(value)) {
+      throw new Error("The backend returned an invalid emergency indicator report.");
     }
     return value;
   }

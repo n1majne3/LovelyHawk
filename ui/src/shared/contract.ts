@@ -152,6 +152,9 @@ import type {
   EmergencyPathReceipt,
   EmergencyPathUndoResult,
   EmergencyHistoryLocation,
+  EmergencyIocReport,
+  EmergencyPathBatchPlan,
+  EmergencyPathBatchStep,
 } from "./emergency-command-contract.js";
 import type {
   LocalDirectorySnapshot,
@@ -800,6 +803,18 @@ export interface LovelyHawkApi {
     snapshotHandle: string,
     historyId: string,
   ): Promise<EmergencyHistoryLocation>;
+  extractEmergencyCommandIocs(
+    bindingHandle: string,
+    snapshotHandle: string,
+  ): Promise<EmergencyIocReport>;
+  planEmergencyPathBatch(
+    bindingHandle: string,
+    pathHandles: readonly string[],
+    action: EmergencyPathAction,
+  ): Promise<EmergencyPathBatchPlan>;
+  confirmEmergencyPathBatch(bindingHandle: string, batchHandle: string): Promise<EmergencyPathBatchPlan>;
+  stepEmergencyPathBatch(bindingHandle: string, batchHandle: string): Promise<EmergencyPathBatchStep>;
+  cancelEmergencyPathBatch(bindingHandle: string, batchHandle: string): Promise<void>;
   listPacketCaptureInterfaces(bindingHandle: string): Promise<PacketCaptureInterfaceList>;
   startPacketCapture(
     bindingHandle: string,

@@ -14,8 +14,8 @@ export interface SystemInfoRowActionDialogProps {
   onOpenWorkbench?: (() => void) | undefined;
 }
 
-/** Marker the core embeds when a delete/lock failure may mean a replaced tool. */
-const ACCOUNT_TOOL_SUSPECT = "code:account-tool-suspect";
+/** The backend sets `nextStep` when a delete/lock failure may mean a replaced tool. */
+const VERIFY_ACCOUNT_TOOL = "verify-account-tool";
 
 /**
  * One dialog for both kinds of row action.
@@ -36,9 +36,7 @@ export function SystemInfoRowActionDialog({
 }: SystemInfoRowActionDialogProps) {
   useModalScrim();
   const { action, subject, inspection, plan, receipt, busy, error, needsPassword } = state;
-  const toolSuspect = receipt !== null && receipt.detail.includes(ACCOUNT_TOOL_SUSPECT);
-  const receiptDetail =
-    receipt === null ? "" : receipt.detail.replace(`〔${ACCOUNT_TOOL_SUSPECT}〕`, "").trim();
+  const toolSuspect = receipt !== null && receipt.nextStep === VERIFY_ACCOUNT_TOOL;
   const [password, setPassword] = useState("");
   const [passwordAgain, setPasswordAgain] = useState("");
   const isChange = action.kind === "change";
@@ -185,12 +183,12 @@ export function SystemInfoRowActionDialog({
                 {receipt.verified ? "已完成，并在目标机上核对过。" : "没有完成。"}
               </p>
               <dl>
-                <div><dt>目标机反馈</dt><dd>{receiptDetail}</dd></div>
+                <div><dt>目标机反馈</dt><dd>{receipt.detail}</dd></div>
                 {toolSuspect ? (
                   <div data-testid="system-info-tool-suspect">
                     <dt>下一步建议</dt>
                     <dd>
-                      目标机上的 userdel/usermod 可能已被替换。建议先在应急命令页运行「软件包完整性核对」核对相关软件包，或在操作记录中按残留还原。
+                      目标机上的 userdel/usermod 可能没有按预期工作，不排除已被替换。建议先在应急命令页运行「软件包完整性核对」核对相关软件包；确认文件被替换后，可在该命令的文件结果菜单中选择「按残留还原」恢复。
                       {onOpenWorkbench !== undefined ? (
                         <button
                           type="button"

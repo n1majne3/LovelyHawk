@@ -34,8 +34,8 @@ const fetched: LocalScanFetchDto = {
 };
 const enginesResult = { kind: "engines", engines: [engine, cliEngine] };
 const fetchResult = { kind: "fetch", fetch: fetched };
-const runResult = { kind: "run", state: "finished", engineName: "clamscan", exitCode: 1, output: "FOUND\n", detail: "已退出" };
-const launchedResult = { kind: "run", state: "launched", engineName: "D盾网页查杀", exitCode: null, output: null, detail: "已启动" };
+const runResult = { kind: "run", state: "finished", engineName: "clamscan", exitCode: 1, output: "FOUND\n", hits: [], detail: "已退出" };
+const launchedResult = { kind: "run", state: "launched", engineName: "D盾网页查杀", exitCode: null, output: null, hits: [], detail: "已启动" };
 const doneResult = { kind: "done", detail: "已删除本次取回的本地副本。" };
 
 describe("local scan boundary", () => {
@@ -93,6 +93,11 @@ describe("local scan boundary", () => {
     expect(isLocalScanResult(fetchResult)).toBe(true);
     expect(isLocalScanResult(runResult)).toBe(true);
     expect(isLocalScanResult(launchedResult)).toBe(true);
+    expect(isLocalScanResult({
+      kind: "run", state: "finished", engineName: "clamscan", exitCode: 0, output: "HIT x", detail: "已退出",
+      hits: [{ remotePath: "/var/www/html/a.php", member: "html/a.php", line: "HIT /tmp/q/html/a.php", pathHandle: "h-1" },
+        { remotePath: "/var/www/html/b.php", member: "html/b.php", line: "", pathHandle: null }],
+    })).toBe(true);
     expect(isLocalScanResult(doneResult)).toBe(true);
 
     for (const bad of [
@@ -112,9 +117,17 @@ describe("local scan boundary", () => {
       { kind: "fetch", fetch: { ...fetched, origin: "host", originLabel: "web（a1b2，docker）" } },
       { kind: "fetch", fetch: { ...fetched, origin: "runtime" } },
       { kind: "fetch", fetch: { ...fetched, extra: true } },
-      { kind: "run", state: "running", engineName: "x", exitCode: null, output: null, detail: "" },
-      { kind: "run", state: "finished", engineName: "", exitCode: 0, output: null, detail: "" },
-      { kind: "run", state: "finished", engineName: "x", exitCode: 0, output: null, detail: "", extra: 1 },
+      { kind: "run", state: "running", engineName: "x", exitCode: null, output: null, hits: [], detail: "" },
+      { kind: "run", state: "finished", engineName: "", exitCode: 0, output: null, hits: [], detail: "" },
+      { kind: "run", state: "finished", engineName: "x", exitCode: 0, output: null, hits: [], detail: "", extra: 1 },
+      { kind: "run", state: "finished", engineName: "x", exitCode: 0, output: null, detail: "" },
+      { kind: "run", state: "finished", engineName: "x", exitCode: 0, output: null, hits: "yes", detail: "" },
+      { kind: "run", state: "finished", engineName: "x", exitCode: 0, output: null, detail: "",
+        hits: [{ remotePath: "relative/path", member: "a.php", line: "l", pathHandle: "h" }] },
+      { kind: "run", state: "finished", engineName: "x", exitCode: 0, output: null, detail: "",
+        hits: [{ remotePath: "/var/www/a.php", member: "a.php", line: "l", pathHandle: 7 }] },
+      { kind: "run", state: "finished", engineName: "x", exitCode: 0, output: null, detail: "",
+        hits: [{ remotePath: "/var/www/a.php", member: "a.php", line: "l", pathHandle: "h", extra: 1 }] },
       { kind: "done", detail: "x".repeat(2049) },
       { kind: "done" },
       { kind: "done", detail: "x", extra: true },

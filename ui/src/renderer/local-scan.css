@@ -30,7 +30,7 @@
 
 .local-scan-scope legend {
   padding: 0 4px;
-  color: var(--muted);
+  color: var(--text-muted);
   font-size: var(--font-caption);
 }
 
@@ -83,7 +83,7 @@
 
 .local-scan-actions p {
   margin: 0;
-  color: var(--muted);
+  color: var(--text-muted);
   font-size: var(--font-caption);
 }
 
@@ -94,7 +94,7 @@
 
 .local-scan-engines > p {
   margin: 0 0 8px;
-  color: var(--muted);
+  color: var(--text-muted);
   font-size: var(--font-small);
 }
 
@@ -140,13 +140,13 @@
 
 .local-scan-engine-kind {
   flex: none;
-  color: var(--muted);
+  color: var(--text-muted);
   font-size: var(--font-caption);
 }
 
 .local-scan-engine-list code {
   overflow: hidden;
-  color: var(--muted);
+  color: var(--text-muted);
   font-size: var(--font-caption);
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -172,7 +172,7 @@
   display: flex;
   flex-direction: column;
   gap: 4px;
-  color: var(--muted);
+  color: var(--text-muted);
   font-size: var(--font-caption);
 }
 
@@ -230,7 +230,7 @@
 .local-scan-skipped {
   margin: 10px 0 0;
   padding-left: 18px;
-  color: var(--muted);
+  color: var(--text-muted);
   font-size: var(--font-caption);
 }
 
@@ -239,7 +239,7 @@
 }
 
 .local-scan-entries summary {
-  color: var(--muted);
+  color: var(--text-muted);
   font-size: var(--font-caption);
   cursor: pointer;
 }
@@ -265,4 +265,51 @@
   font-size: var(--font-caption);
   white-space: pre-wrap;
   word-break: break-all;
+}
+
+.local-scan-hits {
+  margin: 8px 0;
+}
+
+.local-scan-hits h3 {
+  margin: 0 0 4px;
+  font-size: var(--font-body);
+}
+
+.local-scan-hits ul {
+  margin: 6px 0 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.local-scan-hits li {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.local-scan-hit-path {
+  font-family: "Cascadia Mono", monospace;
+  font-size: var(--font-caption);
+  word-break: break-all;
+}
+
+.local-scan-hit-line {
+  color: var(--text-muted);
+  font-size: var(--font-caption);
+  word-break: break-all;
+}
+
+.local-scan-hit-line::before {
+  content: "输出：";
+}
+
+.local-scan-hits button {
+  align-self: flex-start;
 }

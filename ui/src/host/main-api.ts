@@ -936,6 +936,50 @@ export function createMainApi(transport: BackendTransport = hostBackendTransport
         !isCommandHistoryId(historyId)) refuse("Invalid emergency history lookup.");
       return backend.locateEmergencyHistoryCommand(bindingHandle, snapshotHandle, historyId);
     },
+    extractEmergencyCommandIocs: async (...values: unknown[]) => {
+      requireArity(values, 2, "Invalid emergency indicator request.");
+      const [bindingHandle, snapshotHandle] = values;
+      if (!isEmergencyCommandOpaqueHandle(bindingHandle) || !isEmergencyCommandOpaqueHandle(snapshotHandle)) {
+        refuse("Invalid emergency indicator request.");
+      }
+      return backend.extractEmergencyCommandIocs(bindingHandle, snapshotHandle);
+    },
+    planEmergencyPathBatch: async (...values: unknown[]) => {
+      requireArity(values, 3, "Invalid emergency path batch plan request.");
+      const [bindingHandle, pathHandles, action] = values;
+      if (!isEmergencyCommandOpaqueHandle(bindingHandle) ||
+        !Array.isArray(pathHandles) || pathHandles.length === 0 || pathHandles.length > 50 ||
+        !pathHandles.every(isEmergencyCommandOpaqueHandle) ||
+        new Set(pathHandles).size !== pathHandles.length ||
+        typeof action !== "string" || !isEmergencyPathAction(action)) {
+        refuse("Invalid emergency path batch plan request.");
+      }
+      return backend.planEmergencyPathBatch(bindingHandle, pathHandles as string[], action);
+    },
+    confirmEmergencyPathBatch: async (...values: unknown[]) => {
+      requireArity(values, 2, "Invalid emergency path batch confirmation.");
+      const [bindingHandle, batchHandle] = values;
+      if (!isEmergencyCommandOpaqueHandle(bindingHandle) || !isEmergencyCommandOpaqueHandle(batchHandle)) {
+        refuse("Invalid emergency path batch confirmation.");
+      }
+      return backend.confirmEmergencyPathBatch(bindingHandle, batchHandle);
+    },
+    stepEmergencyPathBatch: async (...values: unknown[]) => {
+      requireArity(values, 2, "Invalid emergency path batch step request.");
+      const [bindingHandle, batchHandle] = values;
+      if (!isEmergencyCommandOpaqueHandle(bindingHandle) || !isEmergencyCommandOpaqueHandle(batchHandle)) {
+        refuse("Invalid emergency path batch step request.");
+      }
+      return backend.stepEmergencyPathBatch(bindingHandle, batchHandle);
+    },
+    cancelEmergencyPathBatch: async (...values: unknown[]) => {
+      requireArity(values, 2, "Invalid emergency path batch cancellation.");
+      const [bindingHandle, batchHandle] = values;
+      if (!isEmergencyCommandOpaqueHandle(bindingHandle) || !isEmergencyCommandOpaqueHandle(batchHandle)) {
+        refuse("Invalid emergency path batch cancellation.");
+      }
+      return backend.cancelEmergencyPathBatch(bindingHandle, batchHandle);
+    },
     listPacketCaptureInterfaces: async (...values: unknown[]) => {
       requireArity(values, 1, "Invalid packet capture interface request.");
       if (!isPacketCaptureOpaqueHandle(values[0])) refuse("Invalid packet capture interface request.");

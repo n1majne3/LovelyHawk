@@ -573,6 +573,10 @@ pub(crate) struct SystemInfoRowReceiptDto {
     verified: bool,
     detail: String,
     restored: bool,
+    /// A typed follow-up the page may offer, or none. This is a field, not a
+    /// marker inside `detail`: remote-controlled text never switches UI
+    /// affordances.
+    next_step: Option<&'static str>,
 }
 
 impl fmt::Debug for SystemInfoRowReceiptDto {
@@ -1003,17 +1007,19 @@ impl SystemInfoApi {
             plan,
             ..
         } = stored;
-        let outcome: Result<CoreResult<(VerificationResult, bool)>, _> =
+        let outcome: Result<CoreResult<(VerificationResult, bool, Option<&'static str>)>, _> =
             timeout(EXECUTE_DEADLINE, async move {
                 match plan {
                     RowPlan::ProcessSignal(plan) => service
                         .execute_process_signal(&session, plan, confirmation, journal)
                         .await
-                        .map(|outcome| (outcome.verification, false)),
+                        .map(|outcome| (outcome.verification, false, None)),
                     RowPlan::ProcessRestart(plan) => service
                         .execute_process_restart(&session, plan, confirmation, journal)
                         .await
-                        .map(|outcome| (outcome.verification, outcome.relaunched_after_failure)),
+                        .map(|outcome| {
+                            (outcome.verification, outcome.relaunched_after_failure, None)
+                        }),
                     RowPlan::ServiceRuntime(plan) => service
                         .execute_service_runtime(&session, plan, confirmation, journal)
                         .await
@@ -1021,6 +1027,7 @@ impl SystemInfoApi {
                             (
                                 outcome.verification,
                                 outcome.restored_after_failed_verification,
+                                None,
                             )
                         }),
                     RowPlan::BootScriptRuntime(plan) => service
@@ -1030,6 +1037,7 @@ impl SystemInfoApi {
                             (
                                 outcome.verification,
                                 outcome.restored_after_failed_verification,
+                                None,
                             )
                         }),
                     RowPlan::UserAccount(plan) => service
@@ -1039,6 +1047,7 @@ impl SystemInfoApi {
                             (
                                 outcome.verification,
                                 outcome.restored_after_failed_verification,
+                                outcome.tool_suspect.then_some("verify-account-tool"),
                             )
                         }),
                     RowPlan::UserPassword(plan) => service
@@ -1048,12 +1057,13 @@ impl SystemInfoApi {
                             (
                                 outcome.verification,
                                 outcome.restored_after_failed_verification,
+                                None,
                             )
                         }),
                     RowPlan::NetworkDisconnect(plan) => service
                         .execute_network_disconnect(&session, plan, confirmation, journal)
                         .await
-                        .map(|outcome| (outcome.verification, false)),
+                        .map(|outcome| (outcome.verification, false, None)),
                     RowPlan::ArtifactMutation(plan) => service
                         .execute_artifact_mutation(&session, plan, confirmation, journal)
                         .await
@@ -1061,6 +1071,7 @@ impl SystemInfoApi {
                             (
                                 outcome.verification,
                                 outcome.restored_after_failed_verification,
+                                None,
                             )
                         }),
                 }
@@ -1068,28 +1079,38 @@ impl SystemInfoApi {
             .await;
         self.validate_scope(&scope)?;
 
-        let receipt = |verified: bool, detail: String, restored: bool| SystemInfoRowReceiptDto {
-            plan_handle: plan_handle.clone(),
-            tab: tab_key(tab),
-            row_id: row_id.clone(),
-            action: action.key(),
-            label: action.label(),
-            subject: subject.clone(),
-            verified,
-            detail,
-            restored,
-        };
+        let receipt =
+            |verified: bool, detail: String, restored: bool, next_step: Option<&'static str>| {
+                SystemInfoRowReceiptDto {
+                    plan_handle: plan_handle.clone(),
+                    tab: tab_key(tab),
+                    row_id: row_id.clone(),
+                    action: action.key(),
+                    label: action.label(),
+                    subject: subject.clone(),
+                    verified,
+                    detail,
+                    restored,
+                    next_step,
+                }
+            };
         match outcome {
             Err(_) => Err(SystemInfoApiError::Deadline),
             // The core restores on failed verification itself and journals
             // whatever it got to, so a failure here is reported rather than
             // retried: retrying a half-applied change is worse than telling
             // the operator to look.
-            Ok(Err(error)) => Ok(receipt(false, execution_failure_detail(&error), false)),
-            Ok(Ok((verification, restored))) => Ok(receipt(
+            Ok(Err(error)) => Ok(receipt(
+                false,
+                execution_failure_detail(&error),
+                false,
+                None,
+            )),
+            Ok(Ok((verification, restored, next_step))) => Ok(receipt(
                 verification.passed,
                 bounded_text(&verification.detail, MAX_PLAN_TEXT_BYTES),
                 restored,
+                next_step,
             )),
         }
     }

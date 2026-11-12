@@ -18,11 +18,12 @@ use lovelyhawk_core::{
     docker::ContainerIdentity,
     file_evidence::FileEvidenceProgress,
     local_scan::{
-        FETCH_KIND_REFUSAL, FETCH_SIZE_REFUSAL, FETCH_TOOLS_REFUSAL, FetchKind, FetchRoot,
-        LocalScanEngine, LocalScanEngineKind, LocalScanManifest, LocalScanScope,
+        EngineMention, FETCH_KIND_REFUSAL, FETCH_SIZE_REFUSAL, FETCH_TOOLS_REFUSAL, FetchKind,
+        FetchRoot, LocalScanEngine, LocalScanEngineKind, LocalScanManifest, LocalScanScope,
         container_fetch_bundle_command, create_fetch_staging, engine_launch, extract_fetch_archive,
-        fetch_bundle_command, fetch_probe_command, fetch_root, parse_fetch_bundle,
-        parse_fetch_probe, validate_engine, write_manifest,
+        fetch_bundle_command, fetch_probe_command, fetch_root, manifest_member_remote,
+        parse_fetch_bundle, parse_fetch_probe, read_manifest, scan_engine_mentions,
+        validate_engine, write_manifest,
     },
     sftp::RemotePath,
     ssh::SshCommandOutput,
@@ -34,7 +35,7 @@ use uuid::Uuid;
 
 use crate::{
     docker_read_api::DockerReadApi,
-    emergency_path_api::{EmergencyPathApi, PathScope},
+    emergency_path_api::{EmergencyPathApi, PathOfferSource, PathScope},
     sftp_browser_api::SftpBrowserApi,
     ssh_api::SshApi,
 };
@@ -124,6 +125,7 @@ pub(crate) enum LocalScanResponse {
         engine_name: String,
         exit_code: Option<i32>,
         output: Option<String>,
+        hits: Vec<EngineHitDto>,
         detail: String,
     },
     Done {
@@ -138,6 +140,18 @@ pub(crate) struct EngineDto {
     name: String,
     kind: String,
     program_name: String,
+}
+
+/// One fetched member a CLI engine named in its output, mapped back to the
+/// remote path through the fetch manifest. `pathHandle` is minted only for
+/// host-origin fetches; container hits stay display-only.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EngineHitDto {
+    remote_path: String,
+    member: String,
+    line: String,
+    path_handle: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -856,7 +870,7 @@ impl LocalScanApi {
         if !valid_field(engine_id, 64) {
             return Err(LocalScanError::Invalid);
         }
-        let (_, _, content_dir) = self.live_entry(binding, fetch_id)?;
+        let (owner, dir, content_dir) = self.live_entry(binding, fetch_id)?;
         let settings = self
             .services
             .settings()
@@ -880,6 +894,7 @@ impl LocalScanApi {
                         engine_name: engine.name.clone(),
                         exit_code: None,
                         output: None,
+                        hits: Vec::new(),
                         detail: format!(
                             "已启动 {}；请在引擎窗口中选择目录 {}",
                             engine.name,
@@ -907,11 +922,14 @@ impl LocalScanApi {
                     String::from_utf8_lossy(&output.stdout),
                     String::from_utf8_lossy(&output.stderr)
                 );
+                let text = bounded_output(&text);
+                let hits = self.engine_hits(&owner, &dir, &content_dir, &text);
                 Ok(LocalScanResponse::Run {
                     state: "finished".to_owned(),
                     engine_name: engine.name.clone(),
                     exit_code: output.status.code(),
-                    output: Some(bounded_output(&text)),
+                    output: Some(text),
+                    hits,
                     detail: format!(
                         "{} 已退出，退出码 {:?}；输出已截断到 {} 字节",
                         engine.name,
@@ -921,6 +939,47 @@ impl LocalScanApi {
                 })
             }
         }
+    }
+
+    /// Maps engine-named members of this fetch's staging tree back to remote
+    /// paths through the manifest, minting a path handle per hit for
+    /// host-origin fetches. Raw output text never supplies a path by itself:
+    /// a token only counts when `scan_engine_mentions` resolved it to a real
+    /// member of the extraction dir, and the remote path only ever comes
+    /// from the manifest's recorded source and scope.
+    fn engine_hits(
+        &self,
+        owner: &FetchOwner,
+        dir: &Path,
+        content_dir: &Path,
+        output: &str,
+    ) -> Vec<EngineHitDto> {
+        let Ok(manifest) = read_manifest(dir) else {
+            return Vec::new();
+        };
+        let pairs: Vec<(EngineMention, String)> = scan_engine_mentions(output, content_dir)
+            .into_iter()
+            .filter_map(|mention| {
+                manifest_member_remote(&manifest, &mention.member).map(|remote| (mention, remote))
+            })
+            .collect();
+        let remotes: Vec<String> = pairs.iter().map(|(_, remote)| remote.clone()).collect();
+        let handles = if manifest.origin == "host" {
+            self.paths
+                .offer_paths(&owner.to_path_scope(), PathOfferSource::LocalScan, &remotes)
+        } else {
+            vec![None; remotes.len()]
+        };
+        pairs
+            .into_iter()
+            .zip(handles)
+            .map(|((mention, remote), path_handle)| EngineHitDto {
+                remote_path: remote,
+                member: mention.member,
+                line: mention.line,
+                path_handle,
+            })
+            .collect()
     }
 
     fn reveal(&self, binding: &str, fetch_id: &str) -> Result<LocalScanResponse, LocalScanError> {

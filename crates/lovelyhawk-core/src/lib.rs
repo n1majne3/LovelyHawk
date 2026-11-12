@@ -42,6 +42,7 @@ pub mod firewall_block;
 pub mod haproxy_config;
 pub mod integrity;
 pub mod investigation;
+pub mod ioc_extract;
 pub mod java;
 pub mod kubernetes;
 pub mod line_config_visual;

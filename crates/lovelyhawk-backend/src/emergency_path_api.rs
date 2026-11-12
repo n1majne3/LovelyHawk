@@ -11,7 +11,7 @@
 //! most once, and is put back when verification fails.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt,
     sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant},
@@ -45,6 +45,10 @@ const MAX_HANDLE_BYTES: usize = 128;
 /// most 500; keep earlier group results usable without an unbounded cache.
 const MAX_STORED_PATHS: usize = 2_000;
 const MAX_PLANS: usize = 16;
+/// One batch never previews more files than the operator can still read.
+const MAX_BATCH_ITEMS: usize = 50;
+/// A binding drives one batch dialog at a time; older ones are dropped.
+const MAX_BATCHES: usize = 8;
 const MAX_PATH_DISPLAY_BYTES: usize = 1_024;
 const MAX_PLAN_TEXT_BYTES: usize = 512;
 /// Long enough to read a page of results and decide, short enough that a stale
@@ -194,6 +198,49 @@ pub(crate) struct EmergencyPathUndoDto {
     pub(crate) detail: String,
 }
 
+/// One row of a batch preview: the file as it stood, and either what would
+/// happen to it or the refusal that stands instead.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EmergencyPathBatchItemDto {
+    path_handle: String,
+    /// The stored path, or nothing where the handle already went stale.
+    path: String,
+    kind: String,
+    size: String,
+    mode: Option<String>,
+    executable: bool,
+    plan_handle: Option<String>,
+    summary: Option<String>,
+    restore_description: Option<String>,
+    refusal: Option<String>,
+}
+
+/// The whole batch as one preview, and the state the shared confirmation is in.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EmergencyPathBatchPlanDto {
+    batch_handle: String,
+    action: String,
+    items: Vec<EmergencyPathBatchItemDto>,
+    planned: u32,
+    refused: u32,
+    /// `planned` while it waits for approval, `confirmed` while it steps.
+    state: String,
+    expires_in_seconds: u32,
+}
+
+/// One finished item's own receipt plus where the batch stands after it.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EmergencyPathBatchStepDto {
+    batch_handle: String,
+    receipt: Option<EmergencyPathReceiptDto>,
+    remaining: u32,
+    refused: u32,
+    finished: bool,
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct PathScope {
     pub(crate) binding_handle: String,
@@ -212,6 +259,8 @@ pub(crate) enum PathOfferSource {
     Integrity,
     /// Log files a log investigation listed as sources.
     LogAnalysis,
+    /// Fetched members a local-scan engine named in its output.
+    LocalScan,
 }
 
 struct StoredPath {
@@ -229,6 +278,95 @@ struct PlannedPath {
     scope: PathScope,
     operation: PathOperation,
     expires_at: Instant,
+}
+
+/// One member of a batch: the file as it looked at preview time, and either
+/// the immutable plan waiting for one shared confirmation or the reason the
+/// plan refused to exist.
+struct StoredBatchItem {
+    path_handle: String,
+    path: String,
+    plan_handle: String,
+    kind: String,
+    size: String,
+    mode: Option<String>,
+    executable: bool,
+    operation: Option<PathOperation>,
+    /// Why no plan was made — a stable key the page translates.
+    refusal: Option<&'static str>,
+    finished: bool,
+}
+
+/// A confirmed-once set of per-path plans the operator steps through one at
+/// a time. Each item keeps its own plan handle, so a finished item's undo is
+/// the same undo a single action would leave behind.
+struct StoredBatch {
+    batch_handle: String,
+    scope: PathScope,
+    action: EmergencyPathAction,
+    items: Vec<StoredBatchItem>,
+    confirmed: bool,
+    expires_at: Instant,
+}
+
+impl StoredBatchItem {
+    /// A row that never got a plan. Whatever was already known about the
+    /// file still shows — a stale handle shows nothing but the refusal.
+    fn refused(path_handle: &str, path: String, refusal: &'static str) -> Self {
+        Self {
+            path_handle: path_handle.to_owned(),
+            path,
+            plan_handle: String::new(),
+            kind: String::new(),
+            size: String::new(),
+            mode: None,
+            executable: false,
+            operation: None,
+            refusal: Some(refusal),
+            finished: true,
+        }
+    }
+
+    /// Fills in what a preview stat learned, so a refused row still names
+    /// the file it was refused for.
+    fn with_metadata(mut self, metadata: &lovelyhawk_core::sftp::SftpMetadata) -> Self {
+        let permissions = metadata.permissions.map(|mode| mode & PERMISSION_BITS);
+        self.kind = match metadata.kind {
+            SftpFileKind::File => "file",
+            SftpFileKind::Directory => "directory",
+            SftpFileKind::Symlink => "symlink",
+            SftpFileKind::Other => "other",
+        }
+        .to_owned();
+        self.size = metadata.size.to_string();
+        self.mode = permissions.map(|mode| format!("{mode:04o}"));
+        self.executable = permissions.is_some_and(|mode| mode & 0o111 != 0);
+        self
+    }
+
+    /// The row's immutable plan, minted with its own handle so its receipt
+    /// and undo name exactly what a single action's would.
+    fn planned(mut self, operation: SftpPlannedOperation) -> Self {
+        self.plan_handle = Uuid::new_v4().to_string();
+        self.operation = Some(PathOperation::Sftp(operation));
+        self.refusal = None;
+        self.finished = false;
+        self
+    }
+}
+
+impl StoredBatch {
+    /// Items still waiting to run — refused ones finished before it began.
+    fn pending_count(&self) -> u32 {
+        self.items.iter().filter(|item| !item.finished).count() as u32
+    }
+
+    fn refused_count(&self) -> u32 {
+        self.items
+            .iter()
+            .filter(|item| item.refusal.is_some())
+            .count() as u32
+    }
 }
 
 /// The one lifecycle a stored plan goes through, whichever transport carries
@@ -336,6 +474,7 @@ struct PathRegistry {
     /// Verified and reversible: kept for a while so the operator can undo
     /// them from the receipt.
     done: HashMap<String, PlannedPath>,
+    batches: HashMap<String, StoredBatch>,
 }
 
 impl PathRegistry {
@@ -343,6 +482,7 @@ impl PathRegistry {
         self.paths.retain(|_, stored| stored.expires_at > now);
         self.plans.retain(|_, plan| plan.expires_at > now);
         self.done.retain(|_, plan| plan.expires_at > now);
+        self.batches.retain(|_, batch| batch.expires_at > now);
     }
 
     fn close_binding(&mut self, binding_handle: &str) {
@@ -352,6 +492,36 @@ impl PathRegistry {
             .retain(|_, plan| plan.scope.binding_handle != binding_handle);
         self.done
             .retain(|_, plan| plan.scope.binding_handle != binding_handle);
+        self.batches
+            .retain(|_, batch| batch.scope.binding_handle != binding_handle);
+    }
+
+    /// One batch per binding — an earlier one the window walked away from
+    /// must not keep its plans armed.
+    fn store_batch(&mut self, batch: StoredBatch) -> Result<(), EmergencyPathApiError> {
+        self.batches
+            .retain(|_, stored| stored.scope.binding_handle != batch.scope.binding_handle);
+        if self.batches.len() >= MAX_BATCHES {
+            return Err(EmergencyPathApiError::Capacity);
+        }
+        self.batches.insert(batch.batch_handle.clone(), batch);
+        Ok(())
+    }
+
+    fn batch_mut(
+        &mut self,
+        scope: &PathScope,
+        batch_handle: &str,
+        now: Instant,
+    ) -> Result<&mut StoredBatch, EmergencyPathApiError> {
+        let batch = self
+            .batches
+            .get_mut(batch_handle)
+            .ok_or(EmergencyPathApiError::PlanStale)?;
+        if batch.scope != *scope || batch.expires_at <= now {
+            return Err(EmergencyPathApiError::PlanStale);
+        }
+        Ok(batch)
     }
 
     /// Keeps the newest; the oldest undo offer goes first.
@@ -506,6 +676,10 @@ pub(crate) enum EmergencyPathApiError {
     Capacity,
     Deadline,
     RegistryUnavailable,
+    /// The batch held zero items or more than the preview can show.
+    BatchSize,
+    /// The action asked of a batch is a single-path decision only.
+    UnsupportedBatchAction,
     /// A read the core ran while planning said the file cannot be changed as
     /// asked. The code tells the page which reason to show.
     Refused(PathRefusal),
@@ -518,12 +692,31 @@ pub(crate) enum PathRefusal {
     Privilege,
     Kind,
     Empty,
+    /// Disarming a file that has no execute bit set would change nothing.
+    NotExecutable,
     RestoreTools,
     RestorePrivilege,
     RestoreKind,
     RestoreLocation,
     RestoreEmpty,
     RestoreAmbiguous,
+}
+
+/// The refusal key a batch item carries back to the page.
+fn path_refusal_key(refusal: PathRefusal) -> &'static str {
+    match refusal {
+        PathRefusal::Tools => "tools",
+        PathRefusal::Privilege => "privilege",
+        PathRefusal::Kind => "kind",
+        PathRefusal::Empty => "empty",
+        PathRefusal::NotExecutable => "not-executable",
+        PathRefusal::RestoreTools => "restore-tools",
+        PathRefusal::RestorePrivilege => "restore-privilege",
+        PathRefusal::RestoreKind => "restore-kind",
+        PathRefusal::RestoreLocation => "restore-location",
+        PathRefusal::RestoreEmpty => "restore-empty",
+        PathRefusal::RestoreAmbiguous => "restore-ambiguous",
+    }
 }
 
 /// Plan-time refusals the page can translate; anything else stays behind the
@@ -571,6 +764,8 @@ impl fmt::Debug for EmergencyPathApiError {
             Self::Capacity => "Capacity",
             Self::Deadline => "Deadline",
             Self::RegistryUnavailable => "RegistryUnavailable",
+            Self::BatchSize => "BatchSize",
+            Self::UnsupportedBatchAction => "UnsupportedBatchAction",
             Self::Refused(_) => "Refused",
         })
     }
@@ -780,12 +975,23 @@ impl EmergencyPathApi {
         let scope = self.capture_binding(binding_handle)?;
         // The plan leaves the registry before the await, so the lock is never
         // held across it and the plan can never run twice.
-        let mut plan = {
+        let plan = {
             let now = Instant::now();
             let mut registry = self.lock_registry()?;
             registry.prune(now);
             registry.take_confirmed_plan(&scope, plan_handle, now)?
         };
+        self.execute_plan(plan).await
+    }
+
+    /// The confirmed operation's one run: execute, verify, and put back on
+    /// failure. A single action and each batch item share this, so a batch
+    /// receipt means exactly what a single receipt does.
+    async fn execute_plan(
+        &self,
+        mut plan: PlannedPath,
+    ) -> Result<EmergencyPathReceiptDto, EmergencyPathApiError> {
+        let scope = plan.scope.clone();
         let outcome = timeout(EXECUTE_DEADLINE, plan.operation.execute_and_verify()).await;
         self.validate_binding(&scope)?;
         let verification = match outcome {
@@ -896,6 +1102,240 @@ impl EmergencyPathApi {
         Ok(())
     }
 
+    /// Plans every offered handle for the same containment action. Each item
+    /// is the same immutable plan a single action would make — SFTP mutations
+    /// on one shared session — and an item that cannot be planned is refused
+    /// in place rather than failing the batch the operator is still previewing.
+    pub(crate) async fn plan_batch(
+        &self,
+        binding_handle: &str,
+        path_handles: &[String],
+        action: EmergencyPathAction,
+    ) -> Result<EmergencyPathBatchPlanDto, EmergencyPathApiError> {
+        // Restore and capability edits each need their own reading of what
+        // the plan found; they stay single-path decisions.
+        if !matches!(
+            action,
+            EmergencyPathAction::Disarm | EmergencyPathAction::Quarantine
+        ) {
+            return Err(EmergencyPathApiError::UnsupportedBatchAction);
+        }
+        validate_batch_request(path_handles)?;
+        let scope = self.capture_binding(binding_handle)?;
+        let session = self.bind_sftp(&scope).await?;
+
+        let mut items = Vec::with_capacity(path_handles.len());
+        for path_handle in path_handles {
+            let path = {
+                let now = Instant::now();
+                let mut registry = self.lock_registry()?;
+                registry.prune(now);
+                registry.path(&scope, path_handle, now)
+            };
+            let Ok(path) = path else {
+                items.push(StoredBatchItem::refused(
+                    path_handle,
+                    String::new(),
+                    "path-stale",
+                ));
+                continue;
+            };
+            // What the preview shows about the file comes from the same stat
+            // a single inspect would make; a file that cannot be read cannot
+            // be previewed, and that is its refusal.
+            let metadata = timeout(
+                INSPECT_DEADLINE,
+                self.services.sftp().metadata(&session, &path, false),
+            )
+            .await
+            .ok()
+            .and_then(std::result::Result::ok);
+            let Some(metadata) = metadata else {
+                items.push(StoredBatchItem::refused(
+                    path_handle,
+                    path.as_str().to_owned(),
+                    "inspect-failed",
+                ));
+                continue;
+            };
+            let mutation = match self.sftp_mutation(&session, &path, action).await {
+                Ok(mutation) => mutation,
+                Err(EmergencyPathApiError::Refused(refusal)) => {
+                    items.push(
+                        StoredBatchItem::refused(
+                            path_handle,
+                            path.as_str().to_owned(),
+                            path_refusal_key(refusal),
+                        )
+                        .with_metadata(&metadata),
+                    );
+                    continue;
+                }
+                Err(_) => {
+                    items.push(
+                        StoredBatchItem::refused(
+                            path_handle,
+                            path.as_str().to_owned(),
+                            "unavailable",
+                        )
+                        .with_metadata(&metadata),
+                    );
+                    continue;
+                }
+            };
+            match self.services.sftp().plan(&session, mutation) {
+                Ok(operation) => {
+                    items.push(
+                        StoredBatchItem::refused(
+                            path_handle,
+                            path.as_str().to_owned(),
+                            "unavailable",
+                        )
+                        .with_metadata(&metadata)
+                        .planned(operation),
+                    );
+                }
+                Err(_) => items.push(
+                    StoredBatchItem::refused(path_handle, path.as_str().to_owned(), "unavailable")
+                        .with_metadata(&metadata),
+                ),
+            }
+        }
+        self.validate_binding(&scope)?;
+
+        let batch = StoredBatch {
+            batch_handle: Uuid::new_v4().to_string(),
+            scope,
+            action,
+            items,
+            confirmed: false,
+            expires_at: Instant::now() + PLAN_TTL,
+        };
+        let now = Instant::now();
+        let dto = batch_dto(&batch, now)?;
+        let mut registry = self.lock_registry()?;
+        registry.prune(now);
+        registry.store_batch(batch)?;
+        Ok(dto)
+    }
+
+    /// The one confirmation the whole preview asked for. An item whose own
+    /// plan can no longer be confirmed is refused in place; the rest still
+    /// stand behind the approval the operator just gave.
+    pub(crate) fn confirm_batch(
+        &self,
+        binding_handle: &str,
+        batch_handle: &str,
+    ) -> Result<EmergencyPathBatchPlanDto, EmergencyPathApiError> {
+        validate_handle(batch_handle)?;
+        let scope = self.capture_binding(binding_handle)?;
+        let now = Instant::now();
+        let mut registry = self.lock_registry()?;
+        registry.prune(now);
+        let batch = registry.batch_mut(&scope, batch_handle, now)?;
+        if batch.confirmed {
+            return Err(EmergencyPathApiError::PlanStale);
+        }
+        for item in &mut batch.items {
+            let Some(operation) = item.operation.as_mut() else {
+                continue;
+            };
+            let confirmation = DangerousConfirmation::approve(operation.definition());
+            if operation.confirm(confirmation).is_err() {
+                item.operation = None;
+                item.refusal = Some("confirm-failed");
+                item.finished = true;
+            }
+        }
+        batch.confirmed = true;
+        batch_dto(batch, now)
+    }
+
+    /// Executes the next pending item, exactly one per call, so the operator
+    /// can stop between items. Refused items are already done and stay
+    /// visible in the preview the dialog keeps.
+    pub(crate) async fn step_batch(
+        &self,
+        binding_handle: &str,
+        batch_handle: &str,
+    ) -> Result<EmergencyPathBatchStepDto, EmergencyPathApiError> {
+        validate_handle(batch_handle)?;
+        let scope = self.capture_binding(binding_handle)?;
+        let plan = {
+            let now = Instant::now();
+            let mut registry = self.lock_registry()?;
+            registry.prune(now);
+            let batch = registry.batch_mut(&scope, batch_handle, now)?;
+            if !batch.confirmed {
+                return Err(EmergencyPathApiError::PlanStale);
+            }
+            let mut taken = None;
+            for item in &mut batch.items {
+                if item.finished {
+                    continue;
+                }
+                item.finished = true;
+                if let Some(operation) = item.operation.take() {
+                    taken = Some(PlannedPath {
+                        plan_handle: item.plan_handle.clone(),
+                        path_handle: item.path_handle.clone(),
+                        path: item.path.clone(),
+                        action: batch.action,
+                        scope: batch.scope.clone(),
+                        operation,
+                        expires_at: batch.expires_at,
+                    });
+                    break;
+                }
+            }
+            taken
+        };
+        let Some(plan) = plan else {
+            let mut registry = self.lock_registry()?;
+            let batch = registry.batches.get_mut(batch_handle);
+            return Ok(EmergencyPathBatchStepDto {
+                batch_handle: batch_handle.to_owned(),
+                receipt: None,
+                remaining: 0,
+                refused: batch.map_or(0, |stored| stored.refused_count()),
+                finished: true,
+            });
+        };
+        let receipt = self.execute_plan(plan).await?;
+        let mut registry = self.lock_registry()?;
+        let batch = registry.batches.get_mut(batch_handle);
+        let (remaining, refused) = batch.map_or((0, 0), |stored| {
+            (stored.pending_count(), stored.refused_count())
+        });
+        Ok(EmergencyPathBatchStepDto {
+            batch_handle: batch_handle.to_owned(),
+            receipt: Some(receipt),
+            remaining,
+            refused,
+            finished: remaining == 0,
+        })
+    }
+
+    /// Drops the items the operator did not run. Finished items keep their
+    /// undo entries; only what never ran goes away.
+    pub(crate) fn cancel_batch(
+        &self,
+        binding_handle: &str,
+        batch_handle: &str,
+    ) -> Result<(), EmergencyPathApiError> {
+        validate_handle(batch_handle)?;
+        let scope = self.capture_binding(binding_handle)?;
+        let mut registry = self.lock_registry()?;
+        if registry
+            .batches
+            .get(batch_handle)
+            .is_some_and(|batch| batch.scope == scope)
+        {
+            registry.batches.remove(batch_handle);
+        }
+        Ok(())
+    }
+
     /// Turns a capability and an action into the one planned operation the
     /// core takes. SFTP mutations go through the file service; capability
     /// removal and command restore plan over the bound SSH channel instead —
@@ -940,39 +1380,7 @@ impl EmergencyPathApi {
             }
             _ => {
                 let session = self.bind_sftp(scope).await?;
-                let mutation = match action {
-                    EmergencyPathAction::Disarm => {
-                        let metadata = timeout(
-                            INSPECT_DEADLINE,
-                            self.services.sftp().metadata(&session, path, false),
-                        )
-                        .await
-                        .map_err(|_| EmergencyPathApiError::Deadline)?
-                        .map_err(|_| EmergencyPathApiError::Core)?;
-                        let expected_mode = metadata
-                            .permissions
-                            .map(|mode| mode & PERMISSION_BITS)
-                            .ok_or(EmergencyPathApiError::Core)?;
-                        // Nothing to disarm, and a chmod to the mode it already
-                        // has would verify as a change that never happened.
-                        if expected_mode & EXECUTE_BITS == 0 {
-                            return Err(EmergencyPathApiError::Core);
-                        }
-                        // The expected mode makes the change fail rather than
-                        // apply to a file altered between reading and acting.
-                        SftpMutation::ChmodIfMode {
-                            path: path.clone(),
-                            expected_mode,
-                            mode: expected_mode & !EXECUTE_BITS,
-                        }
-                    }
-                    EmergencyPathAction::Quarantine => SftpMutation::Remove { path: path.clone() },
-                    // SSH-carried actions are matched above the SFTP arm; a
-                    // new variant must pick a transport there, not fall into
-                    // this match silently.
-                    EmergencyPathAction::RemoveCapabilities
-                    | EmergencyPathAction::RestoreResidue => unreachable!(),
-                };
+                let mutation = self.sftp_mutation(&session, path, action).await?;
                 self.validate_binding(scope)?;
                 let operation = self
                     .services
@@ -982,6 +1390,54 @@ impl EmergencyPathApi {
                 Ok(PathOperation::Sftp(operation))
             }
         }
+    }
+
+    /// The SFTP-carried mutation an action plans. Batch items call this with
+    /// the one session the whole batch shares; a single action binds its own.
+    /// Only Disarm and Quarantine reach it — the SSH-carried variants are
+    /// matched above the SFTP arm in `build_operation`, and a batch plan
+    /// refuses them before any item is read.
+    async fn sftp_mutation(
+        &self,
+        session: &BoundSftpSession,
+        path: &RemotePath,
+        action: EmergencyPathAction,
+    ) -> Result<SftpMutation, EmergencyPathApiError> {
+        let mutation = match action {
+            EmergencyPathAction::Disarm => {
+                let metadata = timeout(
+                    INSPECT_DEADLINE,
+                    self.services.sftp().metadata(session, path, false),
+                )
+                .await
+                .map_err(|_| EmergencyPathApiError::Deadline)?
+                .map_err(|_| EmergencyPathApiError::Core)?;
+                let expected_mode = metadata
+                    .permissions
+                    .map(|mode| mode & PERMISSION_BITS)
+                    .ok_or(EmergencyPathApiError::Core)?;
+                // Nothing to disarm, and a chmod to the mode it already
+                // has would verify as a change that never happened.
+                if expected_mode & EXECUTE_BITS == 0 {
+                    return Err(EmergencyPathApiError::Refused(PathRefusal::NotExecutable));
+                }
+                // The expected mode makes the change fail rather than
+                // apply to a file altered between reading and acting.
+                SftpMutation::ChmodIfMode {
+                    path: path.clone(),
+                    expected_mode,
+                    mode: expected_mode & !EXECUTE_BITS,
+                }
+            }
+            EmergencyPathAction::Quarantine => SftpMutation::Remove { path: path.clone() },
+            // SSH-carried actions are matched above the SFTP arm; a
+            // new variant must pick a transport there, not fall into
+            // this match silently.
+            EmergencyPathAction::RemoveCapabilities | EmergencyPathAction::RestoreResidue => {
+                unreachable!()
+            }
+        };
+        Ok(mutation)
     }
 
     /// The SSH session behind the stored scope, checked against the session
@@ -1071,6 +1527,57 @@ impl EmergencyPathApi {
     }
 }
 
+/// The batch as the preview dialog draws it. Refused rows carry their reason;
+/// planned rows carry the same summary text a single-path dialog would show.
+fn batch_dto(
+    batch: &StoredBatch,
+    now: Instant,
+) -> Result<EmergencyPathBatchPlanDto, EmergencyPathApiError> {
+    let remaining = batch.expires_at.saturating_duration_since(now).as_secs();
+    Ok(EmergencyPathBatchPlanDto {
+        batch_handle: batch.batch_handle.clone(),
+        action: batch.action.label().to_owned(),
+        items: batch
+            .items
+            .iter()
+            .map(|item| {
+                let definition = item
+                    .operation
+                    .as_ref()
+                    .map(|operation| operation.definition());
+                EmergencyPathBatchItemDto {
+                    path_handle: item.path_handle.clone(),
+                    path: item.path.clone(),
+                    kind: item.kind.clone(),
+                    size: item.size.clone(),
+                    mode: item.mode.clone(),
+                    executable: item.executable,
+                    plan_handle: item.operation.as_ref().map(|_| item.plan_handle.clone()),
+                    summary: definition.map(|planned| bounded_text(&planned.summary)),
+                    restore_description: definition.and_then(|planned| {
+                        planned.restore_description.as_deref().map(bounded_text)
+                    }),
+                    refusal: item.refusal.map(str::to_owned),
+                }
+            })
+            .collect(),
+        planned: batch
+            .items
+            .iter()
+            .filter(|item| item.operation.is_some())
+            .count() as u32,
+        refused: batch.refused_count(),
+        state: if batch.confirmed {
+            "confirmed"
+        } else {
+            "planned"
+        }
+        .to_owned(),
+        expires_in_seconds: u32::try_from(remaining.max(1))
+            .map_err(|_| EmergencyPathApiError::Core)?,
+    })
+}
+
 fn plan_dto(
     plan: &PlannedPath,
     now: Instant,
@@ -1127,6 +1634,23 @@ fn still_live(stored: &PathScope, expires_at: Instant, asking: &PathScope, now: 
 fn validate_handle(handle: &str) -> Result<(), EmergencyPathApiError> {
     if handle.is_empty() || handle.len() > MAX_HANDLE_BYTES {
         return Err(EmergencyPathApiError::InvalidHandle);
+    }
+    Ok(())
+}
+
+/// Request-level checks on the handles a batch names. The page only ever
+/// sends minted handles; an empty, oversized, malformed or repeated list is a
+/// broken caller, so the whole request fails rather than half-planning it.
+fn validate_batch_request(path_handles: &[String]) -> Result<(), EmergencyPathApiError> {
+    if path_handles.is_empty() || path_handles.len() > MAX_BATCH_ITEMS {
+        return Err(EmergencyPathApiError::BatchSize);
+    }
+    let mut seen = HashSet::with_capacity(path_handles.len());
+    for path_handle in path_handles {
+        validate_handle(path_handle)?;
+        if !seen.insert(path_handle) {
+            return Err(EmergencyPathApiError::InvalidHandle);
+        }
     }
     Ok(())
 }
@@ -1562,5 +2086,138 @@ mod tests {
             restore_plan_failure(&io),
             EmergencyPathApiError::Core
         ));
+    }
+
+    /// A previewable row at this level has no live operation behind it —
+    /// the step path that runs one is exercised against a real target in the
+    /// lab. `finished` controls whether the row still counts as pending.
+    fn batch_item(plan_handle: &str) -> StoredBatchItem {
+        StoredBatchItem {
+            path_handle: format!("handle-{plan_handle}"),
+            path: "/tmp/.planted".to_owned(),
+            plan_handle: plan_handle.to_owned(),
+            kind: "file".to_owned(),
+            size: "12".to_owned(),
+            mode: Some("0755".to_owned()),
+            executable: true,
+            operation: None,
+            refusal: None,
+            finished: false,
+        }
+    }
+
+    fn batch(scope: &PathScope, items: Vec<StoredBatchItem>) -> StoredBatch {
+        StoredBatch {
+            batch_handle: Uuid::new_v4().to_string(),
+            scope: scope.clone(),
+            action: EmergencyPathAction::Quarantine,
+            items,
+            confirmed: false,
+            expires_at: Instant::now() + PLAN_TTL,
+        }
+    }
+
+    #[test]
+    fn a_batch_request_is_bounded_and_free_of_repeats() {
+        assert!(matches!(
+            validate_batch_request(&[]),
+            Err(EmergencyPathApiError::BatchSize),
+        ));
+        let over: Vec<String> = (0..=MAX_BATCH_ITEMS).map(|i| format!("h-{i}")).collect();
+        assert!(matches!(
+            validate_batch_request(&over),
+            Err(EmergencyPathApiError::BatchSize),
+        ));
+        let full: Vec<String> = (0..MAX_BATCH_ITEMS).map(|i| format!("h-{i}")).collect();
+        assert!(validate_batch_request(&full).is_ok());
+        assert!(matches!(
+            validate_batch_request(&["a".to_owned(), "a".to_owned()]),
+            Err(EmergencyPathApiError::InvalidHandle),
+        ));
+        assert!(matches!(
+            validate_batch_request(&["a".to_owned(), "x".repeat(129)]),
+            Err(EmergencyPathApiError::InvalidHandle),
+        ));
+        assert!(matches!(
+            validate_batch_request(&[String::new()]),
+            Err(EmergencyPathApiError::InvalidHandle),
+        ));
+    }
+
+    #[test]
+    fn a_batch_answers_only_the_binding_that_made_it() {
+        let mine = scope("binding-a", "target-a", 0);
+        let theirs = scope("binding-a", "target-b", 0);
+        let mut registry = PathRegistry::default();
+        let stored = batch(&mine, vec![batch_item("p1")]);
+        let handle = stored.batch_handle.clone();
+        registry.store_batch(stored).unwrap();
+
+        let now = Instant::now();
+        // Another binding — or the same binding after the target moved on —
+        // meets a stale plan, never the items inside it.
+        assert!(matches!(
+            registry.batch_mut(&theirs, &handle, now),
+            Err(EmergencyPathApiError::PlanStale),
+        ));
+        assert!(matches!(
+            registry.batch_mut(&mine, "forged", now),
+            Err(EmergencyPathApiError::PlanStale),
+        ));
+        assert!(registry.batch_mut(&mine, &handle, now).is_ok());
+    }
+
+    #[test]
+    fn a_new_batch_for_the_binding_walks_away_from_the_old_one() {
+        let scope = scope("binding-a", "target-a", 0);
+        let mut registry = PathRegistry::default();
+        let first = batch(&scope, vec![batch_item("p1")]);
+        let first_handle = first.batch_handle.clone();
+        registry.store_batch(first).unwrap();
+        registry
+            .store_batch(batch(&scope, vec![batch_item("p2")]))
+            .unwrap();
+        assert!(matches!(
+            registry.batch_mut(&scope, &first_handle, Instant::now()),
+            Err(EmergencyPathApiError::PlanStale),
+        ));
+    }
+
+    #[test]
+    fn batch_counts_keep_refused_rows_visible_and_pending_rows_counted() {
+        let scope = scope("binding-a", "target-a", 0);
+        let mut refused = StoredBatchItem::refused("stale-handle", String::new(), "path-stale");
+        assert!(refused.finished);
+        refused.refusal = Some("path-stale");
+        let stored = batch(&scope, vec![batch_item("p1"), refused, batch_item("p2")]);
+        assert_eq!(stored.pending_count(), 2);
+        // Refused rows finished before the batch began; without a live
+        // operation they do not count as pending work.
+        assert_eq!(stored.refused_count(), 1);
+    }
+
+    #[test]
+    fn closing_the_binding_takes_its_batches_with_it() {
+        let scope = scope("binding-a", "target-a", 0);
+        let mut registry = PathRegistry::default();
+        let stored = batch(&scope, vec![batch_item("p1")]);
+        let handle = stored.batch_handle.clone();
+        registry.store_batch(stored).unwrap();
+        registry.close_binding("binding-a");
+        assert!(matches!(
+            registry.batch_mut(&scope, &handle, Instant::now()),
+            Err(EmergencyPathApiError::PlanStale),
+        ));
+    }
+
+    #[test]
+    fn an_expired_batch_prunes_like_a_plan() {
+        let scope = scope("binding-a", "target-a", 0);
+        let mut registry = PathRegistry::default();
+        let mut stored = batch(&scope, vec![batch_item("p1")]);
+        stored.expires_at = Instant::now() - Duration::from_secs(1);
+        registry.store_batch(stored).unwrap();
+        registry.prune(Instant::now());
+        assert!(registry.batches.is_empty());
     }
 }

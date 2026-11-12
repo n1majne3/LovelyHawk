@@ -101,6 +101,11 @@ function mockApi() {
     cancelEmergencyPathAction: vi.fn(async () => undefined),
     undoEmergencyPathAction: vi.fn(async (): Promise<unknown> => undone),
     locateEmergencyHistoryCommand: vi.fn(async (): Promise<unknown> => ({ status: "missing", commandHandle: null })),
+    extractEmergencyCommandIocs: vi.fn(async (): Promise<unknown> => { throw new Error(); }),
+    planEmergencyPathBatch: vi.fn(async (): Promise<unknown> => { throw new Error(); }),
+    confirmEmergencyPathBatch: vi.fn(async (): Promise<unknown> => { throw new Error(); }),
+    stepEmergencyPathBatch: vi.fn(async (): Promise<unknown> => { throw new Error(); }),
+    cancelEmergencyPathBatch: vi.fn(async (): Promise<void> => { throw new Error(); }),
   } satisfies EmergencyCommandApi & import("../shared/file-evidence-contract").FileEvidenceApi & import("../shared/local-scan-contract").LocalScanApi;
 }
 

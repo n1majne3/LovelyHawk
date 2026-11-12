@@ -51,10 +51,17 @@ export interface LocalScanFetchDto {
   /** Who the content came from when it was not the host; empty for `host`. */
   originLabel: string;
 }
+/** A fetched member the engine output named, mapped back through the manifest. */
+export interface LocalScanHit {
+  remotePath: string;
+  member: string;
+  line: string;
+  pathHandle: string | null;
+}
 export type LocalScanResult =
   | { kind: "engines"; engines: LocalScanEngineDto[] }
   | { kind: "fetch"; fetch: LocalScanFetchDto }
-  | { kind: "run"; state: "launched" | "finished"; engineName: string; exitCode: number | null; output: string | null; detail: string }
+  | { kind: "run"; state: "launched" | "finished"; engineName: string; exitCode: number | null; output: string | null; hits: LocalScanHit[]; detail: string }
   | { kind: "done"; detail: string };
 export interface LocalScanApi {
   localScan(request: LocalScanRequest): Promise<LocalScanResult | null>;
@@ -104,6 +111,12 @@ function isEngine(value: unknown): value is LocalScanEngineDto {
   return record(value) && Object.keys(value).length === 4 && text(value.id, 64) && text(value.name, 64) &&
     (value.kind === "gui" || value.kind === "cli") && text(value.programName, 1024);
 }
+function isHit(value: unknown): value is LocalScanHit {
+  return record(value) && Object.keys(value).length === 4 &&
+    text(value.remotePath, 4096) && value.remotePath.startsWith("/") &&
+    text(value.member, 4096) && bounded(value.line, 512) &&
+    (value.pathHandle === null || text(value.pathHandle, 128));
+}
 function isFetch(value: unknown): value is LocalScanFetchDto {
   return record(value) && Object.keys(value).length === 19 &&
     (value.origin === "host" || value.origin === "container") &&
@@ -147,10 +160,11 @@ export function isLocalScanResult(value: unknown): value is LocalScanResult {
     case "fetch":
       return Object.keys(value).length === 2 && isFetch(value.fetch);
     case "run":
-      return Object.keys(value).length === 6 && (value.state === "launched" || value.state === "finished") &&
+      return Object.keys(value).length === 7 && (value.state === "launched" || value.state === "finished") &&
         text(value.engineName, 64) && bounded(value.detail, 2048) &&
         (value.exitCode === null || count(value.exitCode, 2 ** 31)) &&
-        (value.output === null || bounded(value.output, 64 * 1024));
+        (value.output === null || bounded(value.output, 64 * 1024)) &&
+        Array.isArray(value.hits) && value.hits.length <= 100 && value.hits.every(isHit);
     case "done":
       return Object.keys(value).length === 2 && bounded(value.detail, 2048);
     default: return false;

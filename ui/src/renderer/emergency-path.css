@@ -211,3 +211,82 @@
   cursor: not-allowed;
   opacity: 0.55;
 }
+
+.emergency-path-batch {
+  max-width: 780px;
+  width: min(780px, 94vw);
+}
+
+.emergency-path-batch-choose {
+  display: grid;
+  gap: 4px 16px;
+  grid-template-columns: max-content 1fr;
+  align-items: center;
+}
+
+.emergency-path-batch-choose p {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: var(--font-small);
+}
+
+.emergency-path-batch-items {
+  list-style: none;
+  margin: 0 0 10px;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+  max-height: 46vh;
+  overflow: auto;
+}
+
+.emergency-path-batch-items li {
+  border: 1px solid var(--field-border);
+  border-radius: var(--radius-control);
+  padding: 6px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.emergency-path-batch-items li.is-done {
+  border-color: var(--success-text);
+}
+
+.emergency-path-batch-items li.is-failed,
+.emergency-path-batch-error {
+  border-color: var(--danger-border);
+}
+
+.emergency-path-batch-items li.is-refused {
+  border-style: dashed;
+}
+
+.emergency-path-batch-items code {
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+.emergency-path-batch-facts {
+  color: var(--text-muted);
+  font-size: var(--font-small);
+}
+
+.emergency-path-batch-refusal {
+  color: var(--danger-text);
+  font-size: var(--font-small);
+}
+
+.emergency-path-batch-summary,
+.emergency-path-batch-error {
+  margin: 0 0 10px;
+  font-size: var(--font-small);
+}
+
+.emergency-path-batch-error {
+  color: var(--danger-text);
+}
+
+.emergency-path-batch button.is-link {
+  margin-left: 8px;
+}

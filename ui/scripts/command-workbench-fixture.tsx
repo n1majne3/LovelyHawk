@@ -56,6 +56,9 @@ export function mount() {
     confirmEmergencyPathAction: forbidden, executeEmergencyPathAction: forbidden,
     cancelEmergencyPathAction: forbidden, undoEmergencyPathAction: forbidden,
     async locateEmergencyHistoryCommand(value) { return { status: "found", commandHandle: `${value}-wrapper` }; },
+    async extractEmergencyCommandIocs() { return { entries: [], truncated: false }; },
+    planEmergencyPathBatch: forbidden, confirmEmergencyPathBatch: forbidden,
+    stepEmergencyPathBatch: forbidden, cancelEmergencyPathBatch: forbidden,
   };
   return {
     calls,

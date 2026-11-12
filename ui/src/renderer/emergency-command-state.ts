@@ -2,6 +2,7 @@ import type {
   EmergencyCommandCatalog,
   EmergencyCommandCategory,
   EmergencyCommandResult,
+  EmergencyIocReport,
 } from "../shared/emergency-command-contract";
 import { filterEmergencyCommands } from "./emergency-command-helpers";
 
@@ -44,6 +45,11 @@ export interface EmergencyCommandState {
   result: EmergencyCommandResult | null;
   runError: string | null;
   groupRun: EmergencyCommandGroupRun | null;
+  /** The leads panel: mined from outputs the backend kept for this snapshot. */
+  iocStatus: EmergencyCommandLoadStatus;
+  iocRequest: { id: number; snapshotHandle: string } | null;
+  iocReport: EmergencyIocReport | null;
+  iocError: string | null;
 }
 
 export function createEmergencyCommandState(): EmergencyCommandState {
@@ -61,6 +67,10 @@ export function createEmergencyCommandState(): EmergencyCommandState {
     result: null,
     runError: null,
     groupRun: null,
+    iocStatus: "idle",
+    iocRequest: null,
+    iocReport: null,
+    iocError: null,
   };
 }
 
@@ -85,7 +95,16 @@ export type EmergencyCommandAction =
   }
   | { type: "group-run-progress"; scope: string; runId: number; entry: EmergencyCommandGroupEntry }
   | { type: "group-run-stop-requested"; scope: string; runId: number }
-  | { type: "group-run-finished"; scope: string; runId: number; stopped?: boolean };
+  | { type: "group-run-finished"; scope: string; runId: number; stopped?: boolean }
+  | { type: "iocs-started"; scope: string; request: { id: number; snapshotHandle: string } }
+  | { type: "iocs-loaded"; scope: string; request: { id: number; snapshotHandle: string }; report: EmergencyIocReport }
+  | { type: "iocs-failed"; scope: string; request: { id: number; snapshotHandle: string }; error: string }
+  | { type: "iocs-closed"; scope: string };
+
+function sameIoc(state: EmergencyCommandState, scope: string, request: { id: number; snapshotHandle: string }): boolean {
+  return state.scope === scope && state.iocRequest?.id === request.id &&
+    state.iocRequest.snapshotHandle === request.snapshotHandle;
+}
 
 export function emergencyCommandBusy(state: EmergencyCommandState): boolean {
   return state.runStatus === "loading" || state.groupRun?.status === "loading" || state.groupRun?.status === "stopping";
@@ -120,6 +139,10 @@ export function emergencyCommandReducer(
         result: null,
         runError: null,
         groupRun: null,
+        iocStatus: "idle",
+        iocRequest: null,
+        iocReport: null,
+        iocError: null,
       };
     case "catalog-loaded": {
       if (state.scope !== action.scope || state.catalogRequest !== action.request) return state;
@@ -235,6 +258,26 @@ export function emergencyCommandReducer(
       return { ...state, groupRun: { ...run,
         status: run.entries.length === run.commandHandles.length ? "ready" : "stopped" } };
     }
+    case "iocs-started":
+      if (state.scope !== action.scope || state.catalogStatus !== "ready" ||
+        state.catalog?.snapshotHandle !== action.request.snapshotHandle ||
+        state.iocStatus === "loading") return state;
+      return {
+        ...state,
+        iocStatus: "loading",
+        iocRequest: action.request,
+        iocReport: null,
+        iocError: null,
+      };
+    case "iocs-loaded":
+      if (!sameIoc(state, action.scope, action.request)) return state;
+      return { ...state, iocStatus: "ready", iocRequest: null, iocReport: action.report, iocError: null };
+    case "iocs-failed":
+      if (!sameIoc(state, action.scope, action.request)) return state;
+      return { ...state, iocStatus: "error", iocRequest: null, iocReport: null, iocError: action.error };
+    case "iocs-closed":
+      if (state.scope !== action.scope) return state;
+      return { ...state, iocStatus: "idle", iocRequest: null, iocReport: null, iocError: null };
   }
 }
 

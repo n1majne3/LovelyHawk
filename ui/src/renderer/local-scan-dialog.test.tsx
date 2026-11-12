@@ -10,7 +10,7 @@ import type {
 import { EmergencyPathMenu } from "./EmergencyPathMenu";
 import {
   browserScanTransport, containerScanTransport,
-  LocalScanController, pathOfferScanTransport, type LocalScanState,
+  LocalScanController, pathOfferScanTransport, type LocalScanRun, type LocalScanState,
 } from "./local-scan-controller";
 import { LocalScanBody, LocalScanDialog, type LocalScanSubject } from "./LocalScanDialog";
 
@@ -49,7 +49,7 @@ function fixture() {
     switch (request.action) {
       case "engines": return enginesResult;
       case "fetch": return fetchResult;
-      case "run": return { kind: "run", state: "finished", engineName: "clamscan", exitCode: 0, output: "OK\n", detail: "已退出" };
+      case "run": return { kind: "run", state: "finished", engineName: "clamscan", exitCode: 0, output: "OK\n", hits: [], detail: "已退出" };
       case "reveal": case "discard": return { kind: "done", detail: "已处理" };
       default: return enginesResult;
     }
@@ -146,7 +146,7 @@ describe("local scan dialog", () => {
     const launched = renderToStaticMarkup(<LocalScanBody controller={controller} subject={{ path: offer.path, entryKind: "file" }} onClose={() => undefined}
       view={idleView({
         engines: [engine], selectedEngineId: engine.id, fetch: fetched,
-        run: { kind: "run", state: "launched", engineName: "D盾网页查杀", exitCode: null, output: null, detail: "已启动 D盾网页查杀" },
+        run: { kind: "run", state: "launched", engineName: "D盾网页查杀", exitCode: null, output: null, hits: [], detail: "已启动 D盾网页查杀" },
       })} />);
     expect(launched).toContain("已启动 D盾网页查杀");
     expect(launched).toContain("本页不跟踪它的进度");
@@ -155,13 +155,54 @@ describe("local scan dialog", () => {
     const finished = renderToStaticMarkup(<LocalScanBody controller={controller} subject={{ path: offer.path, entryKind: "file" }} onClose={() => undefined}
       view={idleView({
         engines: [cli], selectedEngineId: cli.id, fetch: fetched,
-        run: { kind: "run", state: "finished", engineName: "clamscan", exitCode: 1, output: "<img src=x> FOUND", detail: "clamscan 已退出" },
+        run: { kind: "run", state: "finished", engineName: "clamscan", exitCode: 1, output: "<img src=x> FOUND", hits: [], detail: "clamscan 已退出" },
       })} />);
     expect(finished).toContain("退出码 1");
     expect(finished).toContain("local-scan-output");
     // Engine output is hostile text; it is quoted, never markup.
     expect(finished).toContain("&lt;img src=x&gt; FOUND");
     expect(finished).not.toContain("<img");
+  });
+
+  it("lists engine-named members with remote paths, and locates only handled hits", () => {
+    const controller = fixture().controller;
+    const run: LocalScanRun = {
+      kind: "run", state: "finished", engineName: "fixture-cli", exitCode: 0,
+      output: "HIT ...", detail: "fixture-cli 已退出",
+      hits: [
+        { remotePath: "/var/www/html/shell.php", member: "html/shell.php", line: "HIT C:/scan/fetch-one/content/html/shell.php", pathHandle: "hit-handle-1" },
+        { remotePath: "/var/www/html/pic.php", member: "html/images/pic.php", line: "REL html/images/pic.php", pathHandle: null },
+      ],
+    };
+    const html = renderToStaticMarkup(<LocalScanBody controller={controller}
+      subject={{ path: offer.path, entryKind: "file" }} onClose={() => undefined}
+      onLocate={() => undefined}
+      view={idleView({ engines: [cli], selectedEngineId: cli.id, fetch: fetched, run })} />);
+    expect(html).toContain('data-testid="local-scan-hits"');
+    expect(html).toContain("/var/www/html/shell.php");
+    expect(html).toContain("/var/www/html/pic.php");
+    expect(html).toContain("HIT C:/scan/fetch-one/content/html/shell.php");
+    // Only the handled hit gets a locate button; the container-only row stays
+    // display-only.
+    expect(html.match(/data-testid="local-scan-hit-locate"/gu)?.length).toBe(1);
+    expect(html).toContain("在远端定位");
+    expect(html).toContain("经取回清单核对");
+  });
+
+  it("shows no locate buttons at all where the page never wired a path menu", () => {
+    const controller = fixture().controller;
+    const run: LocalScanRun = {
+      kind: "run", state: "finished", engineName: "fixture-cli", exitCode: 0,
+      output: "HIT ...", detail: "fixture-cli 已退出",
+      hits: [
+        { remotePath: "/var/www/html/shell.php", member: "html/shell.php", line: "HIT ...", pathHandle: "hit-handle-1" },
+      ],
+    };
+    const html = renderToStaticMarkup(<LocalScanBody controller={controller}
+      subject={{ path: offer.path, entryKind: "file" }} onClose={() => undefined}
+      view={idleView({ engines: [cli], selectedEngineId: cli.id, fetch: fetched, run })} />);
+    expect(html).toContain("/var/www/html/shell.php");
+    expect(html).not.toContain("local-scan-hit-locate");
   });
 
   it("renders the backend's error verbatim in its own area", () => {
@@ -293,7 +334,7 @@ describe("local scan transports", () => {
     const localScan = vi.fn(async (request: { action: string }) => {
       if (request.action === "fetch-browser") return fetchResult;
       if (request.action === "run") {
-        return { kind: "run", state: "finished", engineName: "clamscan", exitCode: 0, output: null, detail: "已退出" } as LocalScanResult;
+        return { kind: "run", state: "finished", engineName: "clamscan", exitCode: 0, output: null, hits: [], detail: "已退出" } as LocalScanResult;
       }
       return { kind: "done", detail: "已处理" } as LocalScanResult;
     });

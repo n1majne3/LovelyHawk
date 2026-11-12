@@ -90,6 +90,47 @@ try {
 
   const ran = await sidecar.call("local.scan", { action: "run", bindingHandle: binding, fetchId: dirFetch.fetch.fetchId, engineId: cli.id }, 200_000);
   check("cli engine runs against staged content with captured output", ran.kind === "run" && ran.state === "finished" && ran.exitCode === 0 && ran.output.includes("shell.php") && ran.output.includes(".hidden.php"));
+  check("`dir /b /s` prints absolute member paths that all map to remote hits",
+    Array.isArray(ran.hits) && ran.hits.some((h) => h.remotePath === "/var/www/html/shell.php" && h.member === "html/shell.php" && typeof h.pathHandle === "string"));
+
+  // A fake CLI engine naming two fetched members — one absolute, one
+  // relative — plus hostile lines that must never map: a traversal reaching
+  // the manifest's own sibling, a real absolute path outside the staging
+  // dir, a member that was never fetched, and the staging root itself.
+  const hitScript = path.join(evidence, "fixture-hits.cmd");
+  fs.writeFileSync(hitScript, [
+    "@echo off",
+    "echo HIT %~1\\html\\shell.php",
+    "echo REL html\\safe.php",
+    "echo EVIL %~1\\..\\manifest.json",
+    "echo OUT C:\\Windows\\System32\\drivers\\etc\\hosts",
+    "echo MISS html\\nothere.php",
+    "echo ROOT %~1",
+    "exit /b 0",
+    "",
+  ].join("\r\n"));
+  const hitArgs = ["/c", hitScript];
+  const hitEngine = await sidecar.call("local.scan", { action: "configure", name: "fixture-hits", kind: "cli", arguments: hitArgs, program: "C:\\Windows\\System32\\cmd.exe" });
+  const hitsId = hitEngine.engines.find((e) => e.name === "fixture-hits")?.id;
+  const hitRun = await sidecar.call("local.scan", { action: "run", bindingHandle: binding, fetchId: dirFetch.fetch.fetchId, engineId: hitsId }, 200_000);
+  check("fake engine's two member paths map through the manifest to remote paths",
+    hitRun.hits.length === 2 &&
+    hitRun.hits.some((h) => h.remotePath === "/var/www/html/shell.php" && h.member === "html/shell.php" && h.line.includes("HIT")) &&
+    hitRun.hits.some((h) => h.remotePath === "/var/www/html/safe.php" && h.member === "html/safe.php" && h.line.includes("REL")));
+  check("traversal, outside and never-fetched tokens never become hits",
+    !hitRun.hits.some((h) => h.line.includes("EVIL") || h.line.includes("OUT") || h.line.includes("MISS") || h.line.includes("ROOT")));
+  const hitHandle = hitRun.hits.find((h) => h.remotePath === "/var/www/html/shell.php")?.pathHandle;
+  check("a hit carries a backend-minted path handle", typeof hitHandle === "string" && hitHandle.length > 0);
+  // This fixture has no SFTP subsystem, so inspect reaches the transport
+  // bound and fails there — operation-failed, never stale/unavailable. The
+  // original webshell offer handle fails the same way: parity proves the
+  // hit handle resolved identically through the path registry.
+  const hitInspect = await sidecar.call("emergency-command.path.inspect", { bindingHandle: binding, pathHandle: hitHandle })
+    .then(() => "resolved", (error) => String(error.message ?? error));
+  const offerInspect = await sidecar.call("emergency-command.path.inspect", { bindingHandle: binding, pathHandle: offer.pathHandle })
+    .then(() => "resolved", (error) => String(error.message ?? error));
+  check("the hit handle resolves like the workbench offer handle (SFTP-less target limits both)",
+    hitInspect === offerInspect && hitInspect.includes("operation-failed"));
 
   const guiConfigured = await sidecar.call("local.scan", { action: "configure", name: "fixture-gui", kind: "gui", arguments: ["/c", "exit", "0"], program: "C:\\Windows\\System32\\cmd.exe" });
   const gui = guiConfigured.engines.find((e) => e.name === "fixture-gui");

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, useSyncExternalStore, type FormEvent } from "react";
 
-import type { LocalScanFetchDto } from "../shared/local-scan-contract";
+import type { LocalScanFetchDto, LocalScanHit } from "../shared/local-scan-contract";
+import type { EmergencyCommandPathOffer } from "../shared/emergency-command-contract";
 import {
   LocalScanController, type LocalScanRun, type LocalScanState, type LocalScanTransport,
 } from "./local-scan-controller";
@@ -45,9 +46,15 @@ export interface LocalScanSubject {
   entryKind: "file" | "directory";
 }
 
-export function LocalScanDialog({ transport, subject, returnFocus, onClose }: {
+export function LocalScanDialog({ transport, subject, returnFocus, onLocate, onClose }: {
   transport: LocalScanTransport; subject: LocalScanSubject;
-  returnFocus: HTMLElement | null; onClose(): void;
+  returnFocus: HTMLElement | null;
+  /** Opens the existing path menu for a hit the backend already bound to a
+      path handle. Pages without a path-menu surface leave it out and the
+      rows stay display-only. */
+  onLocate?: ((event: { clientX: number; clientY: number; preventDefault(): void },
+    offer: EmergencyCommandPathOffer) => void) | undefined;
+  onClose(): void;
 }) {
   const [controller] = useState(() => new LocalScanController(transport));
   const view = useSyncExternalStore(controller.subscribe, controller.getSnapshot, controller.getSnapshot);
@@ -86,15 +93,18 @@ export function LocalScanDialog({ transport, subject, returnFocus, onClose }: {
         <p>{subject.path}</p>
         {subject.originLabel ? <p className="emergency-path-note" data-testid="local-scan-origin">{subject.originLabel}</p> : null}
       </header>
-      <LocalScanBody controller={controller} view={view} subject={subject} onClose={onClose} />
+      <LocalScanBody controller={controller} view={view} subject={subject} onLocate={onLocate} onClose={onClose} />
       <footer><button ref={close} type="button" onClick={onClose}>关闭</button></footer>
     </section>
   </div>;
 }
 
 /** The dialog's working area; kept apart so each phase can be rendered on its own. */
-export function LocalScanBody({ controller, view, subject, onClose }: {
-  controller: LocalScanController; view: LocalScanState; subject: LocalScanSubject; onClose(): void;
+export function LocalScanBody({ controller, view, subject, onLocate, onClose }: {
+  controller: LocalScanController; view: LocalScanState; subject: LocalScanSubject;
+  onLocate?: ((event: { clientX: number; clientY: number; preventDefault(): void },
+    offer: EmergencyCommandPathOffer) => void) | undefined;
+  onClose(): void;
 }) {
   const [scope, setScope] = useState<"file" | "directory">("file");
   const [configuring, setConfiguring] = useState(false);
@@ -230,7 +240,7 @@ export function LocalScanBody({ controller, view, subject, onClose }: {
           {view.busy === "run" ? "正在启动扫描…" : "启动扫描"}
         </button>
         {selected === null && view.engines !== null ? <p className="emergency-path-note">选择一个本机引擎后才能启动扫描。</p> : null}
-        {view.run !== null ? <LocalScanRunResult run={view.run} /> : null}
+        {view.run !== null ? <LocalScanRunResult run={view.run} onLocate={onLocate} /> : null}
         <div className="local-scan-secondary">
           <button type="button" disabled={busy} data-testid="local-scan-reveal"
             onClick={() => void controller.reveal()}>
@@ -280,14 +290,19 @@ function LocalScanFetchSummary({ fetch }: { fetch: LocalScanFetchDto }) {
 }
 
 /** The launch answer: a window opened, or a command line run that already exited. */
-function LocalScanRunResult({ run }: { run: LocalScanRun }) {
+function LocalScanRunResult({ run, onLocate }: {
+  run: LocalScanRun;
+  onLocate?: ((event: { clientX: number; clientY: number; preventDefault(): void },
+    offer: EmergencyCommandPathOffer) => void) | undefined;
+}) {
   return <div className="emergency-path-panel local-scan-run-result" data-testid="local-scan-run-result">
     <p role="status">{run.detail}</p>
     {run.state === "launched" ? (
-      <p className="emergency-path-note">图形界面引擎在自己的窗口里继续，本页不跟踪它的进度。</p>
+      <p className="emergency-path-note">图形界面引擎在自己的窗口里继续，本页不跟踪它的进度，也读不到它的输出。</p>
     ) : (
       <>
         <p>引擎「{run.engineName}」已结束，退出码 {run.exitCode ?? "未取得"}。</p>
+        {run.hits.length > 0 ? <LocalScanHits hits={run.hits} onLocate={onLocate} /> : null}
         {run.output !== null && run.output !== "" ? (
           <pre className="local-scan-output" data-testid="local-scan-output">{run.output}</pre>
         ) : (
@@ -296,4 +311,35 @@ function LocalScanRunResult({ run }: { run: LocalScanRun }) {
       </>
     )}
   </div>;
+}
+
+/** Fetched members the engine output named, mapped back to their remote
+    paths through the manifest — never trusted from the raw text alone. */
+function LocalScanHits({ hits, onLocate }: {
+  hits: LocalScanHit[];
+  onLocate?: ((event: { clientX: number; clientY: number; preventDefault(): void },
+    offer: EmergencyCommandPathOffer) => void) | undefined;
+}) {
+  return (
+    <section className="local-scan-hits" aria-label="命中文件" data-testid="local-scan-hits">
+      <h3>命中文件</h3>
+      <p className="emergency-path-note">
+        引擎输出中提到的、确属本次取回内容的路径；远端位置经取回清单核对，不是直接相信引擎文本。
+      </p>
+      <ul>
+        {hits.map((hit, index) => (
+          <li key={`${hit.member}:${index}`}>
+            <div className="local-scan-hit-path" data-testid="local-scan-hit-path">{hit.remotePath}</div>
+            <div className="local-scan-hit-line">{hit.line}</div>
+            {hit.pathHandle !== null && onLocate !== undefined ? (
+              <button type="button" data-testid="local-scan-hit-locate"
+                onClick={(event) => onLocate(event, { path: hit.remotePath, pathHandle: hit.pathHandle!, line: index + 1 })}>
+                在远端定位
+              </button>
+            ) : null}
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
 }
