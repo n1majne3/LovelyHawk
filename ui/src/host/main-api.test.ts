@@ -440,6 +440,19 @@ describe("terminal-family window API", () => {
   });
 });
 
+describe("terminal window local scan", () => {
+  it("wraps every request in the single `request` argument the host commands take", async () => {
+    const calls = recordingHost((command) => command === "local_scan_child" ? { kind: "engines", engines: [] } : null);
+    const api = createTerminalApi();
+    await api.localScan({ action: "engines" });
+    await api.localScan({ action: "configure", name: "dd", kind: "gui", arguments: [] });
+    expect(calls).toEqual([
+      { command: "local_scan_child", args: { request: { action: "engines" } } },
+      { command: "local_scan_child_configure", args: { request: { action: "configure", name: "dd", kind: "gui", arguments: [] } } },
+    ]);
+  });
+});
+
 describe("editor window close handshake", () => {
   it("reports unsaved text and answers the host's close question by its number", async () => {
     const { listen } = await import("@tauri-apps/api/event");

@@ -265,7 +265,7 @@ export function createTerminalApi(): TerminalApi {
       const command = request.action === "configure" ? "local_scan_child_configure" : "local_scan_child";
       const timeoutMs = request.action === "configure" ||
         request.action === "fetch-browser" ? DIALOG_TIMEOUT_MS : TERMINAL_TIMEOUT_MS;
-      const value = await invokeHost(command, request, timeoutMs);
+      const value = await invokeHost(command, { request }, timeoutMs);
       // Null means the system program dialog was cancelled.
       if (!matchesLocalScanResult(request, value)) refuse("The local scan result is invalid.");
       return value;
