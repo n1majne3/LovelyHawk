@@ -22,7 +22,7 @@ use russh::{ChannelMsg, Disconnect};
 use russh_sftp::{client::SftpSession, protocol::OpenFlags};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 use zeroize::Zeroizing;
@@ -442,7 +442,9 @@ impl SftpTransferCancel {
         *self.0.borrow()
     }
 
-    async fn cancelled(&self) {
+    /// Answers once the switch is thrown; used to wake a sleeping or
+    /// waiting transfer stage without polling `is_cancelled`.
+    pub async fn cancelled(&self) {
         let mut receiver = self.0.subscribe();
         let _ = receiver.wait_for(|cancelled| *cancelled).await;
     }
@@ -486,6 +488,13 @@ pub(crate) enum SftpRequest {
         remote_path: String,
         local_path: PathBuf,
         maximum_bytes: u64,
+        /// Byte offset a kept `.part` already holds; 0 starts fresh. SCP
+        /// cannot resume — there this only means "the partial file goes".
+        resume_from: u64,
+        /// Bytes per second for the read loop; 0 means unlimited.
+        rate_limit_bytes_per_second: u64,
+        /// Keep the partial file on failure or cancel so a retry can resume.
+        keep_partial: bool,
         cancel: SftpTransferCancel,
     },
     CollectFileEvidence {
@@ -4291,14 +4300,37 @@ async fn scp_remote_stat(
 /// Writes transfer bytes into the freshly created local file.
 struct ScpLocalFileSink<'a> {
     file: &'a mut tokio::fs::File,
+    cancel: &'a SftpTransferCancel,
+    started: tokio::time::Instant,
+    copied: u64,
+    rate_limit_bytes_per_second: u64,
 }
 
 impl crate::scp::ScpSink for ScpLocalFileSink<'_> {
     async fn write(&mut self, bytes: &[u8]) -> CoreResult<()> {
-        self.file
-            .write_all(bytes)
-            .await
-            .map_err(|error| CoreError::ssh(crate::scp::SCP_TRANSFER_OPERATION, error.to_string()))
+        self.file.write_all(bytes).await.map_err(|error| {
+            CoreError::ssh(crate::scp::SCP_TRANSFER_OPERATION, error.to_string())
+        })?;
+        self.copied = self.copied.saturating_add(bytes.len() as u64);
+        if self.rate_limit_bytes_per_second > 0 {
+            let paced = std::time::Duration::from_secs_f64(
+                self.copied as f64 / self.rate_limit_bytes_per_second as f64,
+            );
+            let elapsed = self.started.elapsed();
+            if paced > elapsed {
+                tokio::select! {
+                    biased;
+                    () = self.cancel.cancelled() => {
+                        return Err(CoreError::validation(
+                            crate::scp::SCP_TRANSFER_OPERATION,
+                            "transfer cancelled",
+                        ));
+                    }
+                    () = tokio::time::sleep(paced - elapsed) => {}
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn finish(&mut self) -> CoreResult<()> {
@@ -4309,15 +4341,34 @@ impl crate::scp::ScpSink for ScpLocalFileSink<'_> {
     }
 }
 
+/// Optional knobs a resumable plain download passes to both the SFTP and the
+/// SCP download loops.
+#[derive(Debug, Clone, Copy, Default)]
+struct DownloadTuning {
+    /// Byte offset a kept `.part` already holds; 0 starts fresh. SCP cannot
+    /// resume — there this only means "the partial file goes".
+    resume_from: u64,
+    /// Bytes per second for the read loop; 0 means unlimited.
+    rate_limit_bytes_per_second: u64,
+    /// Keep the partial file on failure or cancel so a retry can resume.
+    keep_partial: bool,
+}
+
 async fn scp_download_new(
     handle: &Handle<ClientHandler>,
     remote_path: &str,
     local_path: &Path,
     maximum_bytes: u64,
+    tuning: DownloadTuning,
     cancel: &SftpTransferCancel,
 ) -> CoreResult<u64> {
     if cancel.is_cancelled() {
         return Err(CoreError::validation("SFTP transfer", TRANSFER_CANCELLED));
+    }
+    if tuning.resume_from > 0 {
+        // SCP cannot resume; the kept partial is removed and the file
+        // downloads again from the start.
+        let _ = tokio::fs::remove_file(local_path).await;
     }
     if tokio::fs::try_exists(local_path)
         .await
@@ -4355,10 +4406,16 @@ async fn scp_download_new(
         .map_err(|source| CoreError::io("create download file", local_path, source))?;
     let mut partial = PartialDownload {
         path: local_path,
-        finished: false,
+        finished: tuning.keep_partial,
     };
     let header = {
-        let mut sink = ScpLocalFileSink { file: &mut local };
+        let mut sink = ScpLocalFileSink {
+            file: &mut local,
+            cancel,
+            started: tokio::time::Instant::now(),
+            copied: 0,
+            rate_limit_bytes_per_second: tuning.rate_limit_bytes_per_second,
+        };
         crate::scp::run_scp_download(&mut io, &mut sink, maximum_bytes, &|| cancel.is_cancelled())
             .await?
     };
@@ -4489,10 +4546,28 @@ async fn scp_fallback_on_handle(
             remote_path,
             local_path,
             maximum_bytes,
+            resume_from,
+            rate_limit_bytes_per_second,
+            keep_partial,
             cancel,
-        } => scp_download_new(handle, &remote_path, &local_path, maximum_bytes, &cancel)
+        } => {
+            // SCP has no positioned read: a resume request becomes a restart,
+            // which is exactly what the queue reports to the operator.
+            scp_download_new(
+                handle,
+                &remote_path,
+                &local_path,
+                maximum_bytes,
+                DownloadTuning {
+                    resume_from,
+                    rate_limit_bytes_per_second,
+                    keep_partial,
+                },
+                &cancel,
+            )
             .await
-            .map(|bytes| SftpResponse::Transfer { bytes }),
+            .map(|bytes| SftpResponse::Transfer { bytes })
+        }
         SftpRequest::UploadNew {
             local_path,
             remote_path,
@@ -4949,7 +5024,7 @@ async fn sftp_request(sftp: &SftpSession, request: SftpRequest) -> CoreResult<Sf
                 .await
                 .map_err(|error| CoreError::ssh("create uploaded file", error.to_string()))?;
             let mut limited = (&mut local).take(maximum_bytes.saturating_add(1));
-            let copied = match copy_cancellable(&mut limited, &mut remote, &cancel).await {
+            let copied = match copy_cancellable(&mut limited, &mut remote, 0, &cancel).await {
                 Ok(copied) => copied,
                 Err(stop) => {
                     let _ = remote.close().await;
@@ -4995,19 +5070,35 @@ async fn sftp_request(sftp: &SftpSession, request: SftpRequest) -> CoreResult<Sf
             remote_path,
             local_path,
             maximum_bytes,
+            resume_from,
+            rate_limit_bytes_per_second,
+            keep_partial,
             cancel,
         } => {
             if cancel.is_cancelled() {
                 return Err(CoreError::validation("SFTP transfer", TRANSFER_CANCELLED));
             }
-            if tokio::fs::try_exists(&local_path)
-                .await
-                .map_err(|source| CoreError::io("inspect download target", &local_path, source))?
+            let resume = resume_from > 0;
+            if !resume
+                && tokio::fs::try_exists(&local_path).await.map_err(|source| {
+                    CoreError::io("inspect download target", &local_path, source)
+                })?
             {
                 return Err(CoreError::validation(
                     "download target",
                     "refuses to overwrite an existing local path",
                 ));
+            }
+            if resume {
+                let existing = tokio::fs::metadata(&local_path).await.map_err(|source| {
+                    CoreError::io("inspect partial download", &local_path, source)
+                })?;
+                if !existing.is_file() || existing.len() != resume_from {
+                    return Err(CoreError::validation(
+                        "partial download",
+                        "kept partial file no longer matches the recorded offset",
+                    ));
+                }
             }
             let metadata = sftp
                 .symlink_metadata(remote_path.as_str())
@@ -5033,6 +5124,11 @@ async fn sftp_request(sftp: &SftpSession, request: SftpRequest) -> CoreResult<Sf
                 &local_path,
                 maximum_bytes,
                 metadata.len(),
+                DownloadTuning {
+                    resume_from,
+                    rate_limit_bytes_per_second,
+                    keep_partial,
+                },
                 &cancel,
             )
             .await
@@ -5266,32 +5362,54 @@ async fn download_sftp_file(
     destination: &Path,
     maximum_bytes: u64,
     expected_bytes: u64,
+    tuning: DownloadTuning,
     cancel: &SftpTransferCancel,
 ) -> CoreResult<u64> {
-    let mut remote = sftp
+    let resume_from = tuning.resume_from;
+    let mut remote_file = sftp
         .open(remote_path)
         .await
-        .map_err(|error| CoreError::ssh("open download source", error.to_string()))?
-        .take(maximum_bytes.saturating_add(1));
-    let mut options = tokio::fs::OpenOptions::new();
-    options.create_new(true).write(true);
-    let mut local = options
-        .open(destination)
-        .await
-        .map_err(|source| CoreError::io("create download file", destination, source))?;
-    // Only now is the file ours to remove: create_new refused anything that
-    // was already there.
+        .map_err(|error| CoreError::ssh("open download source", error.to_string()))?;
+    let mut local;
+    if resume_from > 0 {
+        remote_file
+            .seek(tokio::io::SeekFrom::Start(resume_from))
+            .await
+            .map_err(|error| CoreError::ssh("seek download source", error.to_string()))?;
+        let mut options = tokio::fs::OpenOptions::new();
+        options.append(true);
+        local = options
+            .open(destination)
+            .await
+            .map_err(|source| CoreError::io("open partial download", destination, source))?;
+    } else {
+        let mut options = tokio::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        local = options
+            .open(destination)
+            .await
+            .map_err(|source| CoreError::io("create download file", destination, source))?;
+    }
+    let mut remote = remote_file.take(maximum_bytes.saturating_add(1));
+    // The `.part` file the caller kept survives failure and cancel so a retry
+    // can resume; a fresh download still removes itself unless it finishes.
     let mut partial = PartialDownload {
         path: destination,
-        finished: false,
+        finished: tuning.keep_partial,
     };
-    let copied = copy_cancellable(&mut remote, &mut local, cancel)
-        .await
-        .map_err(|stop| match stop {
-            CopyStop::Io(source) => CoreError::io("write downloaded file", destination, source),
-            stop => stop.into_error("download file"),
-        })?;
-    if copied > maximum_bytes || copied != expected_bytes {
+    let copied = copy_cancellable(
+        &mut remote,
+        &mut local,
+        tuning.rate_limit_bytes_per_second,
+        cancel,
+    )
+    .await
+    .map_err(|stop| match stop {
+        CopyStop::Io(source) => CoreError::io("write downloaded file", destination, source),
+        stop => stop.into_error("download file"),
+    })?;
+    let total = resume_from.saturating_add(copied);
+    if total > maximum_bytes || total != expected_bytes {
         return Err(CoreError::ssh(
             "download file",
             "copied byte count did not match bounded remote metadata",
@@ -5302,7 +5420,7 @@ async fn download_sftp_file(
         .await
         .map_err(|source| CoreError::io("sync downloaded file", destination, source))?;
     partial.finished = true;
-    Ok(copied)
+    Ok(total)
 }
 
 /// A download's own local file, removed unless the download finished —
@@ -5338,10 +5456,14 @@ impl CopyStop {
 }
 
 /// Copies like `tokio::io::copy`, but stops as soon as the transfer is
-/// cancelled, even while a read or write is waiting on the network.
+/// cancelled, even while a read or write is waiting on the network. A
+/// `rate_limit_bytes_per_second` above zero throttles inside the copy loop:
+/// the transfer must not outrun `copied / rate` seconds of wall time, and
+/// the sleep itself still listens for cancel.
 async fn copy_cancellable<R, W>(
     reader: &mut R,
     writer: &mut W,
+    rate_limit_bytes_per_second: u64,
     cancel: &SftpTransferCancel,
 ) -> Result<u64, CopyStop>
 where
@@ -5350,6 +5472,7 @@ where
 {
     let mut buffer = vec![0_u8; TRANSFER_CHUNK_BYTES];
     let mut copied = 0_u64;
+    let started = tokio::time::Instant::now();
     loop {
         if cancel.is_cancelled() {
             return Err(CopyStop::Cancelled);
@@ -5368,6 +5491,19 @@ where
             written = writer.write_all(&buffer[..read]) => written.map_err(CopyStop::Io)?,
         }
         copied = copied.saturating_add(read as u64);
+        if rate_limit_bytes_per_second > 0 {
+            let paced = std::time::Duration::from_secs_f64(
+                copied as f64 / rate_limit_bytes_per_second as f64,
+            );
+            let elapsed = started.elapsed();
+            if paced > elapsed {
+                tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => return Err(CopyStop::Cancelled),
+                    () = tokio::time::sleep(paced - elapsed) => {}
+                }
+            }
+        }
     }
     writer.flush().await.map_err(CopyStop::Io)?;
     Ok(copied)
@@ -6662,6 +6798,7 @@ mod tests {
         let copied = copy_cancellable(
             &mut source.as_slice(),
             &mut written,
+            0,
             &SftpTransferCancel::new(),
         )
         .await
@@ -6681,7 +6818,7 @@ mod tests {
         let mut sink = Vec::new();
         let stopped = tokio::time::timeout(
             RESPONSIVE_BOUND,
-            copy_cancellable(&mut stalled, &mut sink, &cancel),
+            copy_cancellable(&mut stalled, &mut sink, 0, &cancel),
         )
         .await
         .expect("a cancelled copy does not hang");

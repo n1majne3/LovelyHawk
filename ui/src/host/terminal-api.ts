@@ -11,11 +11,15 @@ import {
   isSftpBrowserOpaqueHandle,
   isSftpDirectoryDownloadResult,
   isSftpDirectorySnapshot,
+  isSftpDirectoryUploadPrepare,
+  isSftpDirectoryUploadResult,
   isSftpOperationInput,
   isSftpOperationPlan,
   isSftpOperationReceipt,
   isSftpOperationUndoResult,
+  isSftpQueueEnqueueResult,
   isSftpTransferCancelResult,
+  isSftpTransferQueue,
   isSftpStagedUpload,
   isSftpTextPreview,
 } from "../shared/sftp-browser-contract.js";
@@ -202,6 +206,82 @@ export function createTerminalApi(): TerminalApi {
       return checked("sftp_download_directory",
         { browserHandle, directoryHandle, defaultName, extract }, DIALOG_TIMEOUT_MS,
         isSftpDirectoryDownloadResult, "The SFTP transfer result is invalid.");
+    },
+    prepareSftpDirectoryUpload: async (...values: unknown[]) => {
+      requireArity(values, 1, "Invalid SFTP directory upload request.");
+      const [browserHandle] = values;
+      if (!isSftpBrowserOpaqueHandle(browserHandle)) {
+        refuse("Invalid SFTP directory upload request.");
+      }
+      return checked("sftp_upload_directory_prepare", { browserHandle }, DIALOG_TIMEOUT_MS,
+        isSftpDirectoryUploadPrepare, "The SFTP upload preview is invalid.");
+    },
+    runSftpDirectoryUpload: async (...values: unknown[]) => {
+      requireArity(values, 3, "Invalid SFTP directory upload request.");
+      const [browserHandle, directoryHandle, stagedHandle] = values;
+      if (!isSftpBrowserOpaqueHandle(browserHandle) || !isSftpBrowserOpaqueHandle(directoryHandle) ||
+        !isSftpBrowserOpaqueHandle(stagedHandle)) {
+        refuse("Invalid SFTP directory upload request.");
+      }
+      return checked("sftp_upload_directory_run",
+        { browserHandle, directoryHandle, stagedHandle }, SFTP_BROWSER_TIMEOUT_MS,
+        isSftpDirectoryUploadResult, "The SFTP upload result is invalid.");
+    },
+    discardSftpDirectoryUpload: async (...values: unknown[]) => {
+      requireArity(values, 1, "Invalid SFTP directory upload request.");
+      const [stagedHandle] = values;
+      if (!isSftpBrowserOpaqueHandle(stagedHandle)) {
+        refuse("Invalid SFTP directory upload request.");
+      }
+      return checked("sftp_upload_directory_discard", { stagedHandle }, SFTP_BROWSER_TIMEOUT_MS,
+        (value) => record(value) && Object.keys(value).length === 1 && value.discarded === true,
+        "The SFTP upload discard result is invalid.");
+    },
+    queueSftpDownload: async (...values: unknown[]) => {
+      requireArity(values, 3, "Invalid SFTP queue download request.");
+      const [browserHandle, fileHandles, rateLimitKiB] = values;
+      if (!isSftpBrowserOpaqueHandle(browserHandle) || !Array.isArray(fileHandles) ||
+        fileHandles.length === 0 || fileHandles.length > 64 ||
+        !fileHandles.every(isSftpBrowserOpaqueHandle) ||
+        typeof rateLimitKiB !== "number" || !Number.isInteger(rateLimitKiB) ||
+        rateLimitKiB < 0 || rateLimitKiB > 4 * 1024 * 1024) {
+        refuse("Invalid SFTP queue download request.");
+      }
+      return checked("sftp_queue_download", { browserHandle, fileHandles, rateLimitKiB },
+        DIALOG_TIMEOUT_MS, isSftpQueueEnqueueResult, "The SFTP queue result is invalid.");
+    },
+    queueSftpUpload: async (...values: unknown[]) => {
+      requireArity(values, 2, "Invalid SFTP queue upload request.");
+      const [browserHandle, directoryHandle] = values;
+      if (!isSftpBrowserOpaqueHandle(browserHandle) || !isSftpBrowserOpaqueHandle(directoryHandle)) {
+        refuse("Invalid SFTP queue upload request.");
+      }
+      return checked("sftp_queue_upload", { browserHandle, directoryHandle },
+        DIALOG_TIMEOUT_MS, isSftpQueueEnqueueResult, "The SFTP queue result is invalid.");
+    },
+    pollSftpQueue: async (...values: unknown[]) => {
+      requireArity(values, 1, "Invalid SFTP queue request.");
+      const [browserHandle] = values;
+      if (!isSftpBrowserOpaqueHandle(browserHandle)) refuse("Invalid SFTP queue request.");
+      return checked("sftp_queue_poll", { browserHandle }, SFTP_BROWSER_TIMEOUT_MS,
+        (value) => value === null || isSftpTransferQueue(value), "The SFTP queue state is invalid.");
+    },
+    cancelSftpQueue: async (...values: unknown[]) => {
+      requireArity(values, 1, "Invalid SFTP queue cancellation.");
+      const [browserHandle] = values;
+      if (!isSftpBrowserOpaqueHandle(browserHandle)) refuse("Invalid SFTP queue cancellation.");
+      return checked("sftp_queue_cancel_all", { browserHandle }, SFTP_BROWSER_TIMEOUT_MS,
+        isSftpTransferCancelResult, "The SFTP queue cancellation is invalid.");
+    },
+    retrySftpQueueItem: async (...values: unknown[]) => {
+      requireArity(values, 2, "Invalid SFTP queue retry request.");
+      const [browserHandle, itemId] = values;
+      if (!isSftpBrowserOpaqueHandle(browserHandle) || typeof itemId !== "number" ||
+        !Number.isInteger(itemId) || itemId < 0) {
+        refuse("Invalid SFTP queue retry request.");
+      }
+      return checked("sftp_queue_retry", { browserHandle, itemId }, SFTP_BROWSER_TIMEOUT_MS,
+        isSftpTransferQueue, "The SFTP queue result is invalid.");
     },
     planSftpOperation: async (...values: unknown[]) => {
       requireArity(values, 2, "Invalid SFTP operation request.");

@@ -258,8 +258,8 @@ describe("sftp context menu", () => {
 
     // Right-clicking the empty area offers what needs no entry: a new folder
     // here, or a terminal here.
-    expect(menuItems(null).map((item) => item.action)).toEqual(["create-directory", "terminal"]);
-    expect(menuItems(null).map((item) => item.label)).toEqual(["新建文件夹", "在这里打开终端"]);
+    expect(menuItems(null).map((item) => item.action)).toEqual(["create-directory", "upload-directory", "terminal"]);
+    expect(menuItems(null).map((item) => item.label)).toEqual(["新建文件夹", "上传目录…", "在这里打开终端"]);
   });
 
   it("names the entry it is about and keeps that name inert", () => {

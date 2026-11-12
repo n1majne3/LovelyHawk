@@ -427,3 +427,27 @@
   color: var(--muted);
   font-size: var(--font-caption);
 }
+
+.sftp-browser-rate { display: inline-flex; align-items: center; gap: 4px; font-size: var(--font-caption); color: var(--muted); }
+.sftp-browser-rate input { width: 5.5em; padding: 3px 6px; border: 1px solid var(--border); border-radius: 6px; color: var(--text); background: var(--surface); font-size: var(--font-caption); }
+.sftp-browser-rate input:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+
+.sftp-browser-row-check { flex: none; display: inline-flex; align-items: center; justify-content: center; min-width: 1.1em; margin-right: 2px; color: var(--muted); cursor: pointer; user-select: none; }
+.sftp-browser-row-check[aria-checked="true"] { color: var(--accent-text); }
+.sftp-browser-row-check:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; border-radius: 3px; }
+
+.sftp-queue { margin: 6px 0 0; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-alt); font-size: var(--font-caption); }
+.sftp-queue-head { display: flex; align-items: center; gap: 10px; padding: 6px 10px; border-bottom: 1px solid var(--border); }
+.sftp-queue-head strong { font-weight: 600; }
+.sftp-queue-note { color: var(--warning-text, var(--danger-text)); }
+.sftp-queue-head button { margin-left: auto; padding: 3px 9px; border: 1px solid var(--border); border-radius: 6px; color: var(--text); background: var(--surface); font-size: var(--font-caption); cursor: pointer; }
+.sftp-queue-head button:disabled { cursor: not-allowed; opacity: .55; }
+.sftp-queue-items { list-style: none; margin: 0; padding: 4px 10px 8px; max-height: 180px; overflow-y: auto; }
+.sftp-queue-item { display: flex; align-items: center; gap: 8px; padding: 3px 0; border-bottom: 1px dashed var(--border); }
+.sftp-queue-item:last-child { border-bottom: none; }
+.sftp-queue-item-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sftp-queue-item-state { flex: none; color: var(--muted); }
+.sftp-queue-item.is-failed .sftp-queue-item-state { color: var(--danger-text); }
+.sftp-queue-item.is-done .sftp-queue-item-state { color: var(--success-text); }
+.sftp-queue-item-detail { flex: 2 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
+.sftp-queue-item button { flex: none; padding: 2px 8px; border: 1px solid var(--border); border-radius: 6px; color: var(--text); background: var(--surface); font-size: var(--font-caption); cursor: pointer; }

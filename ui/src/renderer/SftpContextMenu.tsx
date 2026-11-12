@@ -14,6 +14,7 @@ import {
   RenameIcon,
   TerminalHereIcon,
   TrashIcon,
+  UploadIcon,
 } from "./file-icons";
 
 export type SftpMenuAction =
@@ -25,6 +26,7 @@ export type SftpMenuAction =
   | "download"
   | "download-directory"
   | "download-directory-extract"
+  | "upload-directory"
   | "rename"
   | "chmod"
   | "archive"
@@ -133,6 +135,7 @@ export function menuItems(entry: SftpBrowserEntry | null, localScan = false): Me
   if (entry === null) {
     const items: MenuItem[] = [
       { action: "create-directory", label: "新建文件夹", icon: <NewFolderIcon /> },
+      { action: "upload-directory", label: "上传目录…", icon: <UploadIcon /> },
       { action: "terminal", label: "在这里打开终端", icon: <TerminalHereIcon /> },
     ];
     if (localScan) items.push({ action: "local-scan", label: "取回本机扫描", icon: <DownloadIcon /> });
@@ -161,6 +164,11 @@ export function menuItems(entry: SftpBrowserEntry | null, localScan = false): Me
       action: "download-directory-extract",
       label: "下载并解压到本机文件夹…",
       icon: <DownloadIcon />,
+    });
+    items.push({
+      action: "upload-directory",
+      label: "上传目录到此文件夹…",
+      icon: <UploadIcon />,
     });
   }
   // A folder the pane can open or a regular file it can preview: the same two

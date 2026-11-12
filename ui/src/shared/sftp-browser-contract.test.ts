@@ -6,9 +6,14 @@ import {
   isSftpBrowserOpaqueHandle,
   isSftpDirectoryDownloadResult,
   isSftpDirectorySnapshot,
+  isSftpDirectoryUploadPrepare,
+  isSftpDirectoryUploadResult,
   isSftpOperationReceipt,
   isSftpOperationUndoResult,
+  isSftpQueueEnqueueResult,
+  isSftpQueueItem,
   isSftpTransferCancelResult,
+  isSftpTransferQueue,
   isSftpTextPreview,
   type SftpDirectorySnapshot,
   type SftpTextPreview,
@@ -185,6 +190,53 @@ describe("sftp browser standalone contract", () => {
     }
   });
 
+  it("validates the directory-upload preview and result exactly", () => {
+    expect(isSftpDirectoryUploadPrepare({ prepared: false })).toBe(true);
+    const prepared = {
+      prepared: true, stagedHandle: "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      folderName: "site", fileCount: "12", totalBytes: "4096",
+    };
+    expect(isSftpDirectoryUploadPrepare(prepared)).toBe(true);
+    for (const invalid of [
+      { prepared: false, extra: 1 },
+      { ...prepared, stagedHandle: "bad handle!" },
+      { ...prepared, fileCount: 12 },
+      { ...prepared, localPath: "C:\\x" },
+      { ...prepared, folderName: "has\nnewline" },
+      null,
+    ]) {
+      expect(isSftpDirectoryUploadPrepare(invalid)).toBe(false);
+    }
+
+    expect(isSftpDirectoryUploadResult({ saved: false })).toBe(true);
+    const done = {
+      saved: true, state: "done", detail: "目录已上传。",
+      planHandle: "a1b2c3d4-e5f6-7890-abcd-ef1234567890", undoable: true,
+    };
+    expect(isSftpDirectoryUploadResult(done)).toBe(true);
+    expect(isSftpDirectoryUploadResult({
+      ...done, state: "refused-destination", planHandle: null, undoable: false,
+    })).toBe(true);
+    expect(isSftpDirectoryUploadResult({ ...done, state: "cancelled", planHandle: null, undoable: false })).toBe(true);
+    for (const invalid of [
+      { saved: false, extra: 1 },
+      { ...done, state: "running" },
+      { ...done, undoable: true, planHandle: null },
+      { ...done, undoable: false },
+      { ...done, detail: "line\nbreak" },
+      { ...done, localPath: "C:\\x" },
+      null,
+    ]) {
+      expect(isSftpDirectoryUploadResult(invalid)).toBe(false);
+    }
+    // The upload-directory undo kind is accepted on undo receipts only.
+    const undone = {
+      planHandle: "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      kind: "upload-directory", undone: true, detail: "已删除。",
+    };
+    expect(isSftpOperationUndoResult(undone)).toBe(true);
+  });
+
   /**
    * Reading, plus the one transfer that needs no plan. Everything that changes
    * the target has to arrive through the plan/confirm pipeline instead, so
@@ -226,14 +278,19 @@ describe("sftp browser standalone contract", () => {
     expect(isSftpOperationUndoResult({ ...undone, path: "/etc/passwd" })).toBe(false);
   });
 
-  it("keeps the public surface at exactly fourteen finite methods", () => {
+  it("keeps the public surface at exactly twenty-four finite methods", () => {
     const source = readFileSync(new URL("./sftp-browser-contract.ts", import.meta.url), "utf8");
     const api = source.split("export interface SftpBrowserApi")[1]!.split("\n}")[0]!;
     expect([...api.matchAll(/^\s{2}([A-Za-z0-9]+)\(/gmu)].map((match) => match[1])).toEqual([
       "openSftpBrowser", "listSftpDirectory", "readSftpText", "downloadSftpEntry",
       "downloadSftpDirectory",
       "planSftpOperation", "confirmSftpOperation", "executeSftpOperation",
-      "cancelSftpOperation", "undoSftpOperation", "cancelSftpTransfer", "stageSftpUpload", "openFileEditor",
+      "cancelSftpOperation", "undoSftpOperation",
+      "prepareSftpDirectoryUpload", "runSftpDirectoryUpload", "discardSftpDirectoryUpload",
+      "cancelSftpTransfer",
+      "queueSftpDownload", "queueSftpUpload", "pollSftpQueue", "cancelSftpQueue",
+      "retrySftpQueueItem", "setUnsavedChanges", "onBeforeClose",
+      "stageSftpUpload", "openFileEditor",
       "openDirectoryTerminal",
     ]);
     // Transfers and operations name capabilities, never paths: main owns both
@@ -250,5 +307,40 @@ describe("sftp browser standalone contract", () => {
       ["delete", "Sftp"].join(""), ["rename", "Sftp"].join(""), ["chmod", "Sftp"].join(""),
       ["write", "Sftp"].join(""), ["open", "Terminal("].join(""), ["export", "Sftp"].join(""),
     ]) expect(api).not.toContain(forbidden);
+  });
+});
+
+describe("transfer queue contract", () => {
+  const item = {
+    itemId: 3,
+    name: "access.log",
+    state: "running",
+    doneBytes: "1024",
+    totalBytes: "4096",
+    detail: "从 1024 字节处续传。",
+  };
+  const queue = { active: true, degraded: false, items: [item] };
+
+  it("accepts a well-formed queue and item", () => {
+    expect(isSftpQueueItem(item)).toBe(true);
+    expect(isSftpTransferQueue(queue)).toBe(true);
+    expect(isSftpQueueEnqueueResult({ queued: false, queue: null })).toBe(true);
+    expect(isSftpQueueEnqueueResult({ queued: true, queue })).toBe(true);
+    for (const state of ["queued", "running", "done", "failed", "cancelled"]) {
+      expect(isSftpQueueItem({ ...item, state })).toBe(true);
+    }
+  });
+
+  it("rejects unknown fields, bad states, over-cap lists and non-queue values", () => {
+    expect(isSftpQueueItem({ ...item, path: "/etc/passwd" })).toBe(false);
+    expect(isSftpQueueItem({ ...item, state: "resumed" })).toBe(false);
+    expect(isSftpQueueItem({ ...item, doneBytes: -1 })).toBe(false);
+    expect(isSftpQueueItem({ ...item, detail: "x".repeat(2048) })).toBe(false);
+    expect(isSftpTransferQueue({ ...queue, binding: "b" })).toBe(false);
+    expect(isSftpTransferQueue({ ...queue, items: Array.from({ length: 65 }, () => item) })).toBe(false);
+    expect(isSftpTransferQueue({ ...queue, items: [{ ...item, itemId: "3" }] })).toBe(false);
+    expect(isSftpQueueEnqueueResult({ queued: true, queue: null })).toBe(false);
+    expect(isSftpQueueEnqueueResult({ queued: false, queue })).toBe(false);
+    expect(isSftpQueueEnqueueResult({ queued: true, queue, localPath: "/x" })).toBe(false);
   });
 });

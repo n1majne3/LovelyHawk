@@ -46,6 +46,7 @@ pub mod ioc_extract;
 pub mod java;
 pub mod kubernetes;
 pub mod line_config_visual;
+pub mod local_pack;
 pub mod local_scan;
 pub mod log_analysis;
 pub mod mariadb_config;

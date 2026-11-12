@@ -100,6 +100,39 @@ export interface TerminalApi {
   executeSftpOperation(planHandle: string): Promise<unknown>;
   cancelSftpOperation(planHandle: string): Promise<unknown>;
   undoSftpOperation(planHandle: string): Promise<unknown>;
+  /**
+   * Picks a local folder via the host dialog, packs it into a bounded tar and
+   * stages it; the preview comes back before anything remote is touched.
+   */
+  prepareSftpDirectoryUpload(browserHandle: string): Promise<unknown>;
+  /** Runs the confirmed directory upload into `directoryHandle`. */
+  runSftpDirectoryUpload(
+    browserHandle: string,
+    directoryHandle: string,
+    stagedHandle: string,
+  ): Promise<unknown>;
+  /** Drops a staged archive the operator declined at the preview. */
+  discardSftpDirectoryUpload(stagedHandle: string): Promise<unknown>;
+  /**
+   * Queues the checked files for download into one folder the native dialog
+   * picks. `rateLimitKiB` is the read-loop throttle; 0 means unlimited.
+   */
+  queueSftpDownload(
+    browserHandle: string,
+    fileHandles: string[],
+    rateLimitKiB: number,
+  ): Promise<unknown>;
+  /**
+   * Queues host-picked files for upload into the remote directory the pane
+   * is showing; the file choice happens in the native dialog inside main.
+   */
+  queueSftpUpload(browserHandle: string, directoryHandle: string): Promise<unknown>;
+  /** Live queue state for the poll loop; null when this window has none. */
+  pollSftpQueue(browserHandle: string): Promise<unknown>;
+  /** Cancels every queued and running item of this window's queue. */
+  cancelSftpQueue(browserHandle: string): Promise<unknown>;
+  /** Requeues one failed or cancelled queue item. */
+  retrySftpQueueItem(browserHandle: string, itemId: number): Promise<unknown>;
   cancelSftpTransfer(browserHandle: string): Promise<unknown>;
   stageSftpUpload(): Promise<unknown>;
   /** The operator's own machine, addressed by opaque directory handles. */

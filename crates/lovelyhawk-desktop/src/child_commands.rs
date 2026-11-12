@@ -689,6 +689,294 @@ pub async fn sftp_download_directory<R: Runtime>(
     }))
 }
 
+/// Picks a local folder through the native dialog, packs it into a tar inside
+/// the host temp dir — refusing links, junctions and reparse points and the
+/// count/size caps — and hands the archive to the backend's managed staging.
+/// Nothing remote is touched here; the page gets a preview to confirm.
+#[tauri::command]
+pub async fn sftp_upload_directory_prepare<R: Runtime>(
+    window: WebviewWindow<R>,
+    host: State<'_, Host>,
+    browser_handle: String,
+) -> CommandResult<Value> {
+    let scope = scope(&window, &host)?;
+    if !opaque(&browser_handle) {
+        return Err("Invalid SFTP directory upload request.".to_owned());
+    }
+    let Some(folder) =
+        local_files::choose(&window, "选择要上传的文件夹", DialogKind::PickFolder, None).await
+    else {
+        return Ok(json!({ "prepared": false }));
+    };
+    let name = folder
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "所选文件夹名称无法识别。".to_owned())?
+        .to_owned();
+    let archive = std::env::temp_dir().join(format!(
+        "lovelyhawk-upload-{}.tar",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let report = lovelyhawk_backend::local_pack::pack_local_directory(&folder, &archive)
+        .map_err(|error| error.to_string());
+    let report = match report {
+        Ok(report) => report,
+        Err(message) => {
+            let _ = std::fs::remove_file(&archive);
+            return Err(message);
+        }
+    };
+    let staged = host
+        .bridge
+        .call(
+            "sftp-browser.upload-directory.stage",
+            json!({
+                "bindingHandle": scope.binding_handle,
+                "browserHandle": browser_handle,
+                "localPath": archive.to_string_lossy(),
+                "name": name,
+            }),
+        )
+        .await;
+    // The staged copy lives in managed storage; the host temp goes away on
+    // every outcome.
+    let _ = std::fs::remove_file(&archive);
+    let staged = staged?;
+    Ok(json!({
+        "prepared": true,
+        "stagedHandle": staged.get("stagedHandle"),
+        "folderName": report.name,
+        "fileCount": report.files.to_string(),
+        "totalBytes": report.bytes.to_string(),
+    }))
+}
+
+/// Runs a confirmed directory upload: the staged archive goes up, extracts
+/// under `<current dir>/<folder name>` and both temps are removed on every
+/// outcome. The receipt may carry an undoable plan handle.
+#[tauri::command]
+pub async fn sftp_upload_directory_run<R: Runtime>(
+    window: WebviewWindow<R>,
+    host: State<'_, Host>,
+    browser_handle: String,
+    directory_handle: String,
+    staged_handle: String,
+) -> CommandResult<Value> {
+    let scope = scope(&window, &host)?;
+    if !opaque(&browser_handle) || !opaque(&directory_handle) || !opaque(&staged_handle) {
+        return Err("Invalid SFTP directory upload request.".to_owned());
+    }
+    let receipt = host
+        .bridge
+        .call(
+            "sftp-browser.upload-directory",
+            json!({
+                "bindingHandle": scope.binding_handle,
+                "browserHandle": browser_handle,
+                "directoryHandle": directory_handle,
+                "stagedHandle": staged_handle,
+            }),
+        )
+        .await?;
+    Ok(json!({
+        "saved": true,
+        "state": receipt.get("state"),
+        "detail": receipt.get("detail"),
+        "planHandle": receipt.get("planHandle"),
+        "undoable": receipt.get("undoable"),
+    }))
+}
+
+/// Drops a prepared directory upload the operator declined at the preview.
+#[tauri::command]
+pub async fn sftp_upload_directory_discard<R: Runtime>(
+    window: WebviewWindow<R>,
+    host: State<'_, Host>,
+    staged_handle: String,
+) -> CommandResult<Value> {
+    let scope = scope(&window, &host)?;
+    if !opaque(&staged_handle) {
+        return Err("Invalid SFTP directory upload request.".to_owned());
+    }
+    host.bridge
+        .call(
+            "sftp-browser.upload-directory.discard",
+            json!({
+                "bindingHandle": scope.binding_handle,
+                "stagedHandle": staged_handle,
+            }),
+        )
+        .await?;
+    Ok(json!({ "discarded": true }))
+}
+
+/// "下载所选": the operator picks one folder; every selected remote file is
+/// queued as a `<name>.part` download there. The page sends only entry
+/// handles and the optional KiB/s rate limit.
+#[tauri::command]
+pub async fn sftp_queue_download<R: Runtime>(
+    window: WebviewWindow<R>,
+    host: State<'_, Host>,
+    browser_handle: String,
+    file_handles: Vec<String>,
+    rate_limit_kib: u64,
+) -> CommandResult<Value> {
+    const MAX_QUEUE_FILES: usize = 64;
+    let scope = scope(&window, &host)?;
+    if !opaque(&browser_handle)
+        || file_handles.is_empty()
+        || file_handles.len() > MAX_QUEUE_FILES
+        || !file_handles.iter().all(|handle| opaque(handle))
+    {
+        return Err("Invalid SFTP queue download request.".to_owned());
+    }
+    let Some(folder) =
+        local_files::choose(&window, "选择保存文件夹", DialogKind::PickFolder, None).await
+    else {
+        return Ok(json!({ "queued": false, "queue": null }));
+    };
+    let queue = host
+        .bridge
+        .call(
+            "sftp-browser.queue.download",
+            json!({
+                "bindingHandle": scope.binding_handle,
+                "browserHandle": browser_handle,
+                "fileHandles": file_handles,
+                "localPath": folder.to_string_lossy(),
+                "rateLimitKiB": rate_limit_kib,
+            }),
+        )
+        .await?;
+    Ok(json!({ "queued": true, "queue": queue }))
+}
+
+/// "批量上传": the operator picks local files once; each is staged in managed
+/// storage and queued for upload into the current remote directory.
+#[tauri::command]
+pub async fn sftp_queue_upload<R: Runtime>(
+    window: WebviewWindow<R>,
+    host: State<'_, Host>,
+    browser_handle: String,
+    directory_handle: String,
+) -> CommandResult<Value> {
+    const MAX_QUEUE_FILES: usize = 64;
+    let scope = scope(&window, &host)?;
+    if !opaque(&browser_handle) || !opaque(&directory_handle) {
+        return Err("Invalid SFTP queue upload request.".to_owned());
+    }
+    let files = local_files::choose_many(&window, "选择要上传的文件", None).await;
+    if files.is_empty() {
+        return Ok(json!({ "queued": false, "queue": null }));
+    }
+    if files.len() > MAX_QUEUE_FILES {
+        return Err(format!("一次最多上传 {MAX_QUEUE_FILES} 个文件。"));
+    }
+    let mut staged = Vec::with_capacity(files.len());
+    for path in &files {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "所选文件名无法识别。".to_owned())?;
+        let upload = host
+            .bridge
+            .call(
+                "sftp-browser.upload.stage",
+                json!({
+                    "bindingHandle": scope.binding_handle,
+                    "localPath": path.to_string_lossy(),
+                    "name": name,
+                }),
+            )
+            .await?;
+        staged.push(json!({
+            "stagedHandle": upload.get("stagedHandle").cloned().unwrap_or(Value::Null),
+            "name": name,
+        }));
+    }
+    let queue = host
+        .bridge
+        .call(
+            "sftp-browser.queue.upload",
+            json!({
+                "bindingHandle": scope.binding_handle,
+                "browserHandle": browser_handle,
+                "directoryHandle": directory_handle,
+                "staged": staged,
+            }),
+        )
+        .await?;
+    Ok(json!({ "queued": true, "queue": queue }))
+}
+
+/// Queue snapshot for the page's poll loop; null when this window has none.
+#[tauri::command]
+pub async fn sftp_queue_poll<R: Runtime>(
+    window: WebviewWindow<R>,
+    host: State<'_, Host>,
+    browser_handle: String,
+) -> CommandResult<Value> {
+    let scope = scope(&window, &host)?;
+    if !opaque(&browser_handle) {
+        return Err("Invalid SFTP queue request.".to_owned());
+    }
+    host.bridge
+        .call(
+            "sftp-browser.queue.poll",
+            json!({
+                "bindingHandle": scope.binding_handle,
+                "browserHandle": browser_handle,
+            }),
+        )
+        .await
+}
+
+/// Cancels every queued and running item of this window's queue.
+#[tauri::command]
+pub async fn sftp_queue_cancel_all<R: Runtime>(
+    window: WebviewWindow<R>,
+    host: State<'_, Host>,
+    browser_handle: String,
+) -> CommandResult<Value> {
+    let scope = scope(&window, &host)?;
+    if !opaque(&browser_handle) {
+        return Err("Invalid SFTP queue request.".to_owned());
+    }
+    host.bridge
+        .call(
+            "sftp-browser.queue.cancel-all",
+            json!({
+                "bindingHandle": scope.binding_handle,
+                "browserHandle": browser_handle,
+            }),
+        )
+        .await
+}
+
+/// Requeues one failed or cancelled item.
+#[tauri::command]
+pub async fn sftp_queue_retry<R: Runtime>(
+    window: WebviewWindow<R>,
+    host: State<'_, Host>,
+    browser_handle: String,
+    item_id: u64,
+) -> CommandResult<Value> {
+    let scope = scope(&window, &host)?;
+    if !opaque(&browser_handle) {
+        return Err("Invalid SFTP queue request.".to_owned());
+    }
+    host.bridge
+        .call(
+            "sftp-browser.queue.retry",
+            json!({
+                "bindingHandle": scope.binding_handle,
+                "browserHandle": browser_handle,
+                "itemId": item_id,
+            }),
+        )
+        .await
+}
+
 /// One SFTP change as the browser pane describes it. The backend takes the
 /// fields flat beside the handles, with absent options as nulls.
 #[derive(serde::Deserialize)]

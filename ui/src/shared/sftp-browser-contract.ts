@@ -131,10 +131,36 @@ export interface SftpDirectoryDownloadResult {
   fileName?: string;
 }
 
+/**
+ * The staged half of a directory upload: the host packed the picked folder
+ * and the archive waits for confirmation under this handle. Counts come from
+ * the pack, so the preview shows exactly what will land remotely.
+ */
+export interface SftpDirectoryUploadPrepare {
+  prepared: boolean;
+  stagedHandle?: string;
+  folderName?: string;
+  fileCount?: string;
+  totalBytes?: string;
+}
+
+/**
+ * The result of a whole-directory upload: the archive went up, extracted and
+ * verified — or it was refused, failed or cancelled before that. When
+ * `undoable` the plan handle puts the extracted tree away again.
+ */
+export interface SftpDirectoryUploadResult {
+  saved: boolean;
+  state?: "done" | "refused-destination" | "failed" | "cancelled";
+  detail?: string;
+  planHandle?: string | null;
+  undoable?: boolean;
+}
+
 /** What an undo did: put back and read back, or refused with the reason. */
 export interface SftpOperationUndoResult {
   planHandle: string;
-  kind: SftpOperationKind;
+  kind: SftpOperationKind | "upload-directory";
   undone: boolean;
   detail: string;
 }
@@ -182,8 +208,49 @@ export interface SftpBrowserApi {
   cancelSftpOperation(planHandle: string): Promise<unknown>;
   /** Puts a verified operation back, once, while its receipt offers it. */
   undoSftpOperation(planHandle: string): Promise<unknown>;
+  /**
+   * Picks a local folder through the host dialog, packs it into a bounded
+   * tar (no links, junctions or reparse points) and stages it. Nothing remote
+   * changes; the page previews the counts and asks before running.
+   */
+  prepareSftpDirectoryUpload(browserHandle: string): Promise<unknown>;
+  /**
+   * Runs a confirmed directory upload against `directoryHandle`: the staged
+   * tar goes to a remote temp path and extracts under `<dir>/<folder name>`.
+   */
+  runSftpDirectoryUpload(
+    browserHandle: string,
+    directoryHandle: string,
+    stagedHandle: string,
+  ): Promise<unknown>;
+  /** Drops a staged archive the operator declined at the preview. */
+  discardSftpDirectoryUpload(stagedHandle: string): Promise<unknown>;
   /** Stops this browser's running upload or download; it removes what it wrote. */
   cancelSftpTransfer(browserHandle: string): Promise<unknown>;
+  /**
+   * Queues the checked files for download into one host-picked folder;
+   * `rateLimitKiB` throttles the read loop, 0 means unlimited.
+   */
+  queueSftpDownload(
+    browserHandle: string,
+    fileHandles: string[],
+    rateLimitKiB: number,
+  ): Promise<unknown>;
+  /** Queues host-picked files for upload into the shown remote directory. */
+  queueSftpUpload(browserHandle: string, directoryHandle: string): Promise<unknown>;
+  /** Live queue state for the poll loop; null when this window has none. */
+  pollSftpQueue(browserHandle: string): Promise<unknown>;
+  /** Cancels every queued and running item of this window's queue. */
+  cancelSftpQueue(browserHandle: string): Promise<unknown>;
+  /** Requeues one failed or cancelled queue item. */
+  retrySftpQueueItem(browserHandle: string, itemId: number): Promise<unknown>;
+  /**
+   * Reports whether the window holds unfinished work, so closing it from
+   * outside the page waits for `onBeforeClose` to answer first.
+   */
+  setUnsavedChanges(unsaved: boolean): Promise<void>;
+  /** Answers the host's close question; resolves to "may close". */
+  onBeforeClose(handler: () => Promise<boolean>): () => void;
   /**
    * Stages a file where an upload plan can name it. With a handle from the
    * local pane it stages that file; without one main asks the operator to pick
@@ -454,10 +521,42 @@ export function isSftpDirectoryDownloadResult(
     planText(value.detail, 1_024) && safeName(value.fileName, false, 256);
 }
 
+const directoryUploadStates = new Set<string>([
+  "done",
+  "refused-destination",
+  "failed",
+  "cancelled",
+]);
+
+export function isSftpDirectoryUploadPrepare(
+  value: unknown,
+): value is SftpDirectoryUploadPrepare {
+  if (!record(value) || typeof value.prepared !== "boolean") return false;
+  if (!value.prepared) return exact(value, ["prepared"]);
+  return exact(value, ["prepared", "stagedHandle", "folderName", "fileCount", "totalBytes"]) &&
+    isSftpBrowserOpaqueHandle(value.stagedHandle) &&
+    safeName(value.folderName, false, 256) &&
+    u64String(value.fileCount) && u64String(value.totalBytes);
+}
+
+export function isSftpDirectoryUploadResult(
+  value: unknown,
+): value is SftpDirectoryUploadResult {
+  if (!record(value) || typeof value.saved !== "boolean") return false;
+  if (!value.saved) return exact(value, ["saved"]);
+  return exact(value, ["saved", "state", "detail", "planHandle", "undoable"]) &&
+    typeof value.state === "string" && directoryUploadStates.has(value.state) &&
+    planText(value.detail, 1_024) &&
+    (value.planHandle === null || isSftpBrowserOpaqueHandle(value.planHandle)) &&
+    typeof value.undoable === "boolean" &&
+    (value.undoable ? value.planHandle !== null : value.planHandle === null);
+}
+
 export function isSftpOperationUndoResult(value: unknown): value is SftpOperationUndoResult {
   return record(value) && exact(value, ["planHandle", "kind", "undone", "detail"]) &&
     isSftpBrowserOpaqueHandle(value.planHandle) &&
-    typeof value.kind === "string" && operationKindSet.has(value.kind) &&
+    typeof value.kind === "string" &&
+    (operationKindSet.has(value.kind) || value.kind === "upload-directory") &&
     typeof value.undone === "boolean" && planText(value.detail, 1_024);
 }
 
@@ -484,4 +583,55 @@ export function isSftpTextPreview(value: unknown): value is SftpTextPreview {
   const lines = textLines(value.text, value.displayedLineCount);
   return lines !== null && value.displayedLineCount <= value.observedLineCount &&
     lines.every(outputLine) && !(value.observedLineCount > value.displayedLineCount && !value.truncated);
+}
+
+/** One batch-transfer queue item as the page shows it. */
+export interface SftpQueueItem {
+  itemId: number;
+  name: string;
+  /** queued | running | done | failed | cancelled */
+  state: "queued" | "running" | "done" | "failed" | "cancelled";
+  doneBytes: string;
+  totalBytes: string;
+  /** Failure reason, or the integrity/resume note a finished item carries. */
+  detail: string;
+}
+
+/** A browser window's batch transfer queue; absent when it has none. */
+export interface SftpTransferQueue {
+  active: boolean;
+  /** No SFTP on the target: items run one at a time and downloads cannot resume. */
+  degraded: boolean;
+  items: SftpQueueItem[];
+}
+
+/** What a queue download/upload enqueue answers: the picked folder was used (or not). */
+export interface SftpQueueEnqueueResult {
+  queued: boolean;
+  queue: SftpTransferQueue | null;
+}
+
+const queueItemStates = new Set(["queued", "running", "done", "failed", "cancelled"]);
+
+export function isSftpQueueItem(value: unknown): value is SftpQueueItem {
+  return record(value) && exact(value, [
+    "itemId", "name", "state", "doneBytes", "totalBytes", "detail",
+  ]) && unsigned(value.itemId, 64) &&
+    safeName(value.name, false, 512) &&
+    typeof value.state === "string" && queueItemStates.has(value.state) &&
+    u64String(value.doneBytes) && u64String(value.totalBytes) &&
+    planText(value.detail, 1_024);
+}
+
+export function isSftpTransferQueue(value: unknown): value is SftpTransferQueue {
+  return record(value) && exact(value, ["active", "degraded", "items"]) &&
+    typeof value.active === "boolean" && typeof value.degraded === "boolean" &&
+    Array.isArray(value.items) && value.items.length <= 64 &&
+    value.items.every(isSftpQueueItem);
+}
+
+export function isSftpQueueEnqueueResult(value: unknown): value is SftpQueueEnqueueResult {
+  if (!record(value) || typeof value.queued !== "boolean") return false;
+  if (!value.queued) return exact(value, ["queued", "queue"]) && value.queue === null;
+  return exact(value, ["queued", "queue"]) && isSftpTransferQueue(value.queue);
 }

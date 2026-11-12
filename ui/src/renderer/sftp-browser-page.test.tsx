@@ -34,7 +34,17 @@ const api: SftpBrowserApi & LocalBrowserApi = {
   executeSftpOperation: async () => { throw new Error(); },
   cancelSftpOperation: async () => { throw new Error(); },
   undoSftpOperation: async () => { throw new Error(); },
+  prepareSftpDirectoryUpload: async () => { throw new Error(); },
+  runSftpDirectoryUpload: async () => { throw new Error(); },
+  discardSftpDirectoryUpload: async () => { throw new Error(); },
   cancelSftpTransfer: async () => { throw new Error(); },
+  queueSftpDownload: async () => { throw new Error(); },
+  queueSftpUpload: async () => { throw new Error(); },
+  pollSftpQueue: async () => { throw new Error(); },
+  cancelSftpQueue: async () => { throw new Error(); },
+  retrySftpQueueItem: async () => { throw new Error(); },
+  setUnsavedChanges: async () => {},
+  onBeforeClose: () => () => {},
   stageSftpUpload: async () => { throw new Error(); },
   openFileEditor: async () => ({ opened: true, reused: false }),
   openDirectoryTerminal: async () => ({ opened: true, reused: false }),
@@ -254,6 +264,19 @@ describe("下载目录 in the file manager", () => {
       const own = menuItems(entry as SftpBrowserEntry | null).map((item) => item.action);
       expect(own).not.toContain("download-directory");
       expect(own).not.toContain("download-directory-extract");
+    }
+  });
+
+  it("offers 上传目录 on directories and the blank area, never on files or links", () => {
+    const file = entries.find((entry) => entry.action === "preview")!;
+    const directory = entries.find((entry) => entry.action === "browse")!;
+    const link = entries.find((entry) => entry.action === "none")!;
+    expect(menuItems(directory).map((item) => item.action)).toContain("upload-directory");
+    expect(
+      menuItems(null).find((item) => item.action === "upload-directory")?.label,
+    ).toBe("上传目录…");
+    for (const entry of [file, link]) {
+      expect(menuItems(entry).map((item) => item.action)).not.toContain("upload-directory");
     }
   });
 

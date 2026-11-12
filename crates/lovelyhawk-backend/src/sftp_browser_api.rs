@@ -14,12 +14,13 @@ use std::{
 
 use lovelyhawk_core::{
     BackendServices, CoreError,
-    operations::{DangerousConfirmation, OperationState},
+    local_pack::DIRECTORY_UPLOAD_TAR_OVERHEAD_BYTES,
+    operations::{DangerousConfirmation, OperationState, VerificationResult},
     path_guard::PathGuard,
     sftp::{
         ArchiveFormat, BoundSftpSession, MAX_ARCHIVE_DOWNLOAD_BYTES, MAX_ARCHIVE_DOWNLOAD_FILES,
-        MAX_DIRECTORY_ENTRIES, RemotePath, SftpEntry, SftpFileKind, SftpMutation,
-        SftpPlannedOperation, SftpTransferCancel, SftpTransport,
+        MAX_DIRECTORY_ENTRIES, RemotePath, SftpDownloadOptions, SftpEntry, SftpFileKind,
+        SftpMutation, SftpPlannedOperation, SftpTransferCancel, SftpTransport,
     },
     ssh::{BoundSshSession, SFTP_HANDSHAKE_OPERATION},
     target::TargetGuard,
@@ -350,6 +351,301 @@ impl SftpBrowserApi {
             archive_bytes: Some(receipt.bytes.to_string()),
             extracted_entries,
             detail,
+        })
+    }
+
+    /// Copies a packed local directory archive (built by the host from a
+    /// native folder dialog) into core-managed staging. The folder name the
+    /// target will see is bound to the staged handle here, and the file is
+    /// removed on confirmation, discard or expiry.
+    pub(crate) fn stage_directory_upload(
+        &self,
+        binding_handle: &str,
+        browser_handle: &str,
+        local_path: &Path,
+        name: &str,
+    ) -> Result<SftpDirectoryUploadStageDto, SftpBrowserApiError> {
+        validate_handle(browser_handle)?;
+        let (_, scope) = self.capture_binding(binding_handle)?;
+        {
+            let registry = self.lock_registry()?;
+            if !registry.browsers.contains_key(browser_handle) {
+                return Err(SftpBrowserApiError::BrowserStale);
+            }
+        }
+        let display_name = validated_entry_name(name)?;
+        let metadata =
+            std::fs::metadata(local_path).map_err(|_| SftpBrowserApiError::InvalidListing)?;
+        let maximum = MAX_ARCHIVE_DOWNLOAD_BYTES + DIRECTORY_UPLOAD_TAR_OVERHEAD_BYTES;
+        if !metadata.is_file() || metadata.len() > maximum {
+            return Err(SftpBrowserApiError::Capacity);
+        }
+        let staged = self
+            .paths
+            .stage_native_selected_upload(local_path, maximum)
+            .map_err(|_| SftpBrowserApiError::Capacity)?;
+        let staged_handle = Uuid::new_v4().to_string();
+        let now = Instant::now();
+        let mut registry = self.lock_registry()?;
+        registry.prune(now);
+        registry.store_directory_upload(
+            staged_handle.clone(),
+            PendingDirectoryUpload {
+                binding_handle: scope.binding_handle.clone(),
+                path: staged,
+                name: display_name.clone(),
+                expires_at: now + PLAN_TTL,
+            },
+        )?;
+        Ok(SftpDirectoryUploadStageDto {
+            staged_handle,
+            name: display_name,
+            bytes: metadata.len().to_string(),
+        })
+    }
+
+    /// Drops a packed directory archive the operator declined to upload.
+    pub(crate) fn discard_directory_upload(
+        &self,
+        binding_handle: &str,
+        staged_handle: &str,
+    ) -> Result<SftpDirectoryUploadDiscardDto, SftpBrowserApiError> {
+        validate_handle(staged_handle)?;
+        let (_, scope) = self.capture_binding(binding_handle)?;
+        let mut registry = self.lock_registry()?;
+        registry.prune(Instant::now());
+        Ok(SftpDirectoryUploadDiscardDto {
+            discarded: registry.discard_directory_upload(&scope, staged_handle),
+        })
+    }
+
+    /// Uploads a staged directory archive to a remote temp path, extracts it
+    /// under `<current dir>/<folder name>` and removes both temps on every
+    /// outcome. The extraction plan is kept in the done registry so the
+    /// existing undo flow removes the extracted tree again after verifying it
+    /// has not changed.
+    pub(crate) async fn upload_directory(
+        &self,
+        binding_handle: &str,
+        browser_handle: &str,
+        directory_handle: &str,
+        staged_handle: &str,
+    ) -> Result<SftpDirectoryUploadDto, SftpBrowserApiError> {
+        validate_handle(browser_handle)?;
+        validate_handle(directory_handle)?;
+        validate_handle(staged_handle)?;
+        let (_, scope) = self.capture_binding(binding_handle)?;
+        let (access, _permit) = self.begin_operation(
+            &scope,
+            browser_handle,
+            directory_handle,
+            EntryAction::Browse,
+        )?;
+        let session = self.bind_sftp(&scope).await?;
+        self.validate_binding(&scope)?;
+        self.verify_operation(&access)?;
+        if self.sftp_degraded(&session).await? {
+            return Err(SftpBrowserApiError::SubsystemUnavailable);
+        }
+        let staged = {
+            let mut registry = self.lock_registry()?;
+            registry.take_directory_upload(&scope, staged_handle, Instant::now())?
+        };
+        // The local staged archive goes away on every outcome — the upload
+        // operation also removes it when it runs, and this guard covers every
+        // earlier exit.
+        struct StagedFile(Option<PathBuf>);
+        impl Drop for StagedFile {
+            fn drop(&mut self) {
+                if let Some(path) = self.0.take() {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+        let _staged_file = StagedFile(Some(staged.path.clone()));
+        let parent = access.node.path.clone();
+        let destination = parent
+            .child(&staged.name)
+            .map_err(|_| SftpBrowserApiError::InvalidListing)?;
+        let temporary = parent
+            .child(&format!(
+                ".lovelyhawk-upload-{}.tar",
+                Uuid::new_v4().simple()
+            ))
+            .map_err(|_| SftpBrowserApiError::InvalidListing)?;
+
+        // Refuse the destination up front so the message names what happened;
+        // plan_extract re-checks right before writing and closes the race.
+        let taken = self
+            .services
+            .sftp()
+            .metadata(&session, &destination, false)
+            .await
+            .is_ok();
+        if taken {
+            return Ok(SftpDirectoryUploadDto {
+                browser_handle: browser_handle.to_owned(),
+                state: "refused-destination".to_owned(),
+                detail: "目标位置已存在同名文件夹或文件，未写入任何内容。请先改名或移走。"
+                    .to_owned(),
+                plan_handle: None,
+                undoable: false,
+            });
+        }
+
+        let mut upload = self
+            .services
+            .sftp()
+            .plan_upload(&session, &self.paths, &staged.path, temporary.clone())
+            .map_err(|_| SftpBrowserApiError::InvalidListing)?;
+        upload
+            .confirm(DangerousConfirmation::approve(upload.definition()))
+            .map_err(|_| SftpBrowserApiError::Busy)?;
+        let cancel = upload.transfer_cancel();
+        let _transfer = self.register_transfer(&scope, browser_handle, &cancel)?;
+        let outcome = run_transfer(upload.execute_and_verify(), &cancel, TRANSFER_DEADLINE).await;
+        self.validate_binding(&scope)?;
+        match outcome {
+            Err(error) => return Err(error),
+            Ok(Err(error)) => {
+                if lovelyhawk_core::sftp::is_transfer_cancelled(&error) {
+                    return Ok(SftpDirectoryUploadDto {
+                        browser_handle: browser_handle.to_owned(),
+                        state: "cancelled".to_owned(),
+                        detail: "上传已取消，没有内容写到目标机。".to_owned(),
+                        plan_handle: None,
+                        undoable: false,
+                    });
+                }
+                let _ = upload.restore().await;
+                return Ok(SftpDirectoryUploadDto {
+                    browser_handle: browser_handle.to_owned(),
+                    state: "failed".to_owned(),
+                    detail: lovelyhawk_core::sftp::operation_failure_advice(&error)
+                        .unwrap_or("上传没有完成，目标机上未保留临时包。")
+                        .to_owned(),
+                    plan_handle: None,
+                    undoable: false,
+                });
+            }
+            Ok(Ok(verification)) if !verification.passed => {
+                let _ = upload.restore().await;
+                return Ok(SftpDirectoryUploadDto {
+                    browser_handle: browser_handle.to_owned(),
+                    state: "failed".to_owned(),
+                    detail: "上传后核对不一致，临时包已删除，目标机未写入目录。".to_owned(),
+                    plan_handle: None,
+                    undoable: false,
+                });
+            }
+            Ok(Ok(_)) => {}
+        }
+        if cancel.is_cancelled() {
+            let _ = upload.restore().await;
+            return Ok(SftpDirectoryUploadDto {
+                browser_handle: browser_handle.to_owned(),
+                state: "cancelled".to_owned(),
+                detail: "上传已取消，远端临时包已删除。".to_owned(),
+                plan_handle: None,
+                undoable: false,
+            });
+        }
+
+        let mut extract = match self
+            .services
+            .sftp()
+            .plan_extract(&session, temporary.clone(), destination.clone())
+            .await
+        {
+            Ok(plan) => plan,
+            Err(error) => {
+                let _ = upload.restore().await;
+                let taken = error.to_string().contains("already exists")
+                    || error.to_string().contains("存在");
+                return Ok(SftpDirectoryUploadDto {
+                    browser_handle: browser_handle.to_owned(),
+                    state: if taken {
+                        "refused-destination"
+                    } else {
+                        "failed"
+                    }
+                    .to_owned(),
+                    detail: if taken {
+                        "目标位置已存在同名文件夹或文件，未写入任何内容；远端临时包已删除。"
+                            .to_owned()
+                    } else {
+                        format!(
+                            "远端解包计划被拒绝：{}；远端临时包已删除。",
+                            lovelyhawk_core::sftp::operation_failure_advice(&error)
+                                .unwrap_or("请核对目标机状态")
+                        )
+                    },
+                    plan_handle: None,
+                    undoable: false,
+                });
+            }
+        };
+        extract
+            .confirm(DangerousConfirmation::approve(extract.definition()))
+            .map_err(|_| SftpBrowserApiError::Busy)?;
+        let verification = match extract.execute_and_verify().await {
+            Ok(verification) => verification,
+            Err(error) => {
+                let _ = upload.restore().await;
+                return Ok(SftpDirectoryUploadDto {
+                    browser_handle: browser_handle.to_owned(),
+                    state: "failed".to_owned(),
+                    detail: format!(
+                        "远端解包失败：{}；远端临时包已删除。",
+                        lovelyhawk_core::sftp::operation_failure_advice(&error)
+                            .unwrap_or("请核对目标机状态")
+                    ),
+                    plan_handle: None,
+                    undoable: false,
+                });
+            }
+        };
+        self.validate_binding(&scope)?;
+        if !verification.passed {
+            let _ = upload.restore().await;
+            return Ok(SftpDirectoryUploadDto {
+                browser_handle: browser_handle.to_owned(),
+                state: "failed".to_owned(),
+                detail: "远端解包后的核对未通过，已清理；请检查目标机状态。".to_owned(),
+                plan_handle: None,
+                undoable: false,
+            });
+        }
+
+        // Extraction verified: the remote temp archive goes away and the
+        // extraction plan becomes the undoable done entry.
+        let temp_removed = upload.restore().await.is_ok();
+        let plan_handle = Uuid::new_v4().to_string();
+        let entry = PlannedEntry {
+            plan_handle: plan_handle.clone(),
+            browser_handle: browser_handle.to_owned(),
+            browser_token: access.browser_token,
+            scope: scope.clone(),
+            kind: "upload-directory".to_owned(),
+            operation: extract,
+            expires_at: Instant::now() + PLAN_TTL,
+        };
+        let undoable = self.lock_registry()?.store_done(entry);
+        let mut detail = "目录已上传并在目标机解包核对完成。".to_owned();
+        if temp_removed {
+            detail.push_str("远端临时包已删除。");
+        } else {
+            detail.push_str("远端临时包可能未删除，请核对。");
+        }
+        if undoable {
+            detail.push_str("如需回退，可撤销这次上传，解出的文件夹会在核对未变后整个删除。");
+        }
+        Ok(SftpDirectoryUploadDto {
+            browser_handle: browser_handle.to_owned(),
+            state: "done".to_owned(),
+            detail,
+            plan_handle: if undoable { Some(plan_handle) } else { None },
+            undoable,
         })
     }
 
@@ -749,12 +1045,29 @@ impl SftpBrowserApi {
                 let _ = std::fs::remove_file(&staged.path);
                 false
             });
+            // Queues are binding-scoped: a target going away cancels every
+            // item and drops the queue (Drop also frees unconsumed staging).
+            let mut dead_queues = Vec::new();
+            registry.queues.retain(|_, queue| {
+                if queue.scope.binding_handle == binding_handle {
+                    dead_queues.push(Arc::clone(queue));
+                    false
+                } else {
+                    true
+                }
+            });
+            for queue in dead_queues {
+                queue.cancel_all();
+            }
         }
     }
 
     fn invalidate_browser(&self, browser_handle: &str) {
         if let Ok(mut registry) = self.registry.lock() {
             registry.browsers.remove(browser_handle);
+            if let Some(queue) = registry.queues.remove(browser_handle) {
+                queue.cancel_all();
+            }
         }
     }
 
@@ -931,6 +1244,34 @@ pub(crate) struct SftpBrowserEntryDto {
     /// make, so the numbers are reported as they arrive.
     pub(crate) owner_id: Option<u32>,
     pub(crate) group_id: Option<u32>,
+}
+
+/// A packed local folder accepted into managed staging; the preview on the
+/// page shows name/bytes before the operator confirms.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SftpDirectoryUploadStageDto {
+    pub(crate) staged_handle: String,
+    pub(crate) name: String,
+    pub(crate) bytes: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SftpDirectoryUploadDiscardDto {
+    pub(crate) discarded: bool,
+}
+
+/// What a directory upload did: extracted and verified, refused, failed or
+/// cancelled — plus the undo handle when the tree can still be removed.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SftpDirectoryUploadDto {
+    pub(crate) browser_handle: String,
+    pub(crate) state: String,
+    pub(crate) detail: String,
+    pub(crate) plan_handle: Option<String>,
+    pub(crate) undoable: bool,
 }
 
 /// The result of a whole-directory download. `state` is one of
@@ -1337,11 +1678,39 @@ struct SftpBrowserRegistry {
     /// Verified operations that can still be undone, once each.
     done: HashMap<String, PlannedEntry>,
     staged: HashMap<String, StagedUpload>,
+    /// Packed local folders waiting for the operator's upload confirmation.
+    directory_uploads: HashMap<String, PendingDirectoryUpload>,
     /// Uploads and downloads copying right now.
     transfers: HashMap<Uuid, ActiveTransfer>,
+    /// One batch transfer queue per browser window.
+    queues: HashMap<String, Arc<TransferQueue>>,
 }
 
 impl SftpBrowserRegistry {
+    /// Queue items don't take an operation permit — two run at once, which a
+    /// single permit cannot express — so they validate browser, scope and
+    /// node freshness directly here instead.
+    fn queue_entry(
+        &self,
+        scope: &BindingScope,
+        browser_handle: &str,
+        entry_handle: &str,
+        required_action: EntryAction,
+        now: Instant,
+    ) -> Result<StoredNode, SftpBrowserApiError> {
+        let browser = self
+            .browsers
+            .get(browser_handle)
+            .filter(|browser| &browser.scope == scope && browser.expires_at > now)
+            .ok_or(SftpBrowserApiError::BrowserStale)?;
+        browser
+            .nodes
+            .get(entry_handle)
+            .filter(|node| node.action == required_action)
+            .cloned()
+            .ok_or(SftpBrowserApiError::EntryUnavailable)
+    }
+
     /// Throws the switch of every transfer this browser has running, and only
     /// those: another window's browser, or another target's, keeps copying.
     fn cancel_transfers(&self, binding_handle: &str, browser_handle: &str) -> u32 {
@@ -1406,6 +1775,54 @@ impl SftpBrowserRegistry {
         Ok(())
     }
 
+    fn store_directory_upload(
+        &mut self,
+        handle: String,
+        pending: PendingDirectoryUpload,
+    ) -> Result<(), SftpBrowserApiError> {
+        if self.directory_uploads.len() >= MAX_STAGED_UPLOADS {
+            return Err(SftpBrowserApiError::Capacity);
+        }
+        self.directory_uploads.insert(handle, pending);
+        Ok(())
+    }
+
+    /// A prepared directory upload answers only its binding, and only once.
+    fn take_directory_upload(
+        &mut self,
+        scope: &BindingScope,
+        staged_handle: &str,
+        now: Instant,
+    ) -> Result<PendingDirectoryUpload, SftpBrowserApiError> {
+        let valid = self
+            .directory_uploads
+            .get(staged_handle)
+            .is_some_and(|pending| {
+                pending.binding_handle == scope.binding_handle && pending.expires_at > now
+            });
+        if !valid {
+            return Err(SftpBrowserApiError::BrowserStale);
+        }
+        self.directory_uploads
+            .remove(staged_handle)
+            .ok_or(SftpBrowserApiError::BrowserStale)
+    }
+
+    /// Drops a prepared archive the operator declined, removing its file.
+    fn discard_directory_upload(&mut self, scope: &BindingScope, staged_handle: &str) -> bool {
+        let owned = self
+            .directory_uploads
+            .get(staged_handle)
+            .is_some_and(|pending| pending.binding_handle == scope.binding_handle);
+        if !owned {
+            return false;
+        }
+        if let Some(pending) = self.directory_uploads.remove(staged_handle) {
+            let _ = std::fs::remove_file(&pending.path);
+        }
+        true
+    }
+
     /// A plan only answers the target and browser it was built against.
     fn plan_mut(
         &mut self,
@@ -1461,6 +1878,13 @@ impl SftpBrowserRegistry {
                 return true;
             }
             let _ = std::fs::remove_file(&staged.path);
+            false
+        });
+        self.directory_uploads.retain(|_, pending| {
+            if pending.expires_at > now {
+                return true;
+            }
+            let _ = std::fs::remove_file(&pending.path);
             false
         });
     }
@@ -1759,11 +2183,27 @@ impl SftpBrowserRegistry {
     }
 
     fn prune(&mut self, now: Instant) {
-        let active = self
+        let mut active = self
             .active_operations
             .values()
             .map(|operation| operation.browser_handle.as_str())
             .collect::<HashSet<_>>();
+        // A browser whose queue still has pending or running work stays
+        // alive past its TTL; the queue's item validation decides staleness.
+        for (handle, queue) in &self.queues {
+            let pending = queue
+                .items
+                .lock()
+                .map(|items| {
+                    items.iter().any(|item| {
+                        matches!(item.state, QueueItemState::Queued | QueueItemState::Running)
+                    })
+                })
+                .unwrap_or(false);
+            if pending {
+                active.insert(handle.as_str());
+            }
+        }
         self.browsers
             .retain(|handle, browser| browser.expires_at > now || active.contains(handle.as_str()));
         self.prune_operations(now);
@@ -2096,6 +2536,31 @@ pub(crate) struct SftpOperationReceiptDto {
     pub(crate) cancelled: bool,
 }
 
+/// One queue item as the page shows it.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SftpQueueItemDto {
+    pub item_id: u64,
+    pub name: String,
+    /// queued | running | done | failed | cancelled.
+    pub state: String,
+    pub done_bytes: String,
+    pub total_bytes: String,
+    /// Reason for failed items, or the integrity/resume note for done ones.
+    pub detail: String,
+}
+
+/// A browser window's batch transfer queue.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SftpTransferQueueDto {
+    pub active: bool,
+    /// True when the target has no SFTP: items run one at a time through SCP
+    /// and downloads cannot resume.
+    pub degraded: bool,
+    pub items: Vec<SftpQueueItemDto>,
+}
+
 /// How many running transfers a cancel reached; zero when none was running.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -2131,9 +2596,198 @@ struct PlannedEntry {
     expires_at: Instant,
 }
 
+#[derive(Clone)]
 struct StagedUpload {
     binding_handle: String,
     path: PathBuf,
+    expires_at: Instant,
+}
+
+/// The most items one browser's transfer queue may hold.
+const MAX_QUEUE_ITEMS: usize = 64;
+
+/// What the page sends for each host-picked file in a queue upload.
+#[derive(Debug, Clone)]
+pub(crate) struct SftpQueuedUpload {
+    pub staged_handle: String,
+    pub name: String,
+}
+
+#[derive(Clone)]
+enum QueueItemKind {
+    Download {
+        remote_path: RemotePath,
+        local_dir: PathBuf,
+    },
+    Upload {
+        staged_path: PathBuf,
+        dest_dir: RemotePath,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum QueueItemState {
+    Queued,
+    Running,
+    Done,
+    Failed,
+    Cancelled,
+}
+
+struct QueueItem {
+    id: u64,
+    name: String,
+    kind: QueueItemKind,
+    state: QueueItemState,
+    done_bytes: u64,
+    total_bytes: u64,
+    detail: String,
+    cancel: Option<SftpTransferCancel>,
+    /// The `.part` a running download writes; polling its length is the
+    /// progress number the page shows.
+    part_path: Option<PathBuf>,
+    /// The remote file a running upload grows; polling its size is the
+    /// progress number the page shows.
+    remote_dest: Option<RemotePath>,
+}
+
+/// One browser window's batch transfer queue. Bound to the binding it was
+/// created under; a target switch drops it via `close_binding`/`ensure_queue`.
+struct TransferQueue {
+    scope: BindingScope,
+    browser_handle: String,
+    degraded: bool,
+    rate_limit_bytes_per_second: std::sync::atomic::AtomicU64,
+    items: Mutex<Vec<QueueItem>>,
+    runner: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    next_item_id: std::sync::atomic::AtomicU64,
+}
+
+/// Queued items turn cancelled; running ones get their switch thrown.
+fn cancel_queue_items(items: &Mutex<Vec<QueueItem>>) -> u32 {
+    let mut cancelled = 0_u32;
+    if let Ok(mut items) = items.lock() {
+        for item in items.iter_mut() {
+            match item.state {
+                QueueItemState::Queued => {
+                    item.state = QueueItemState::Cancelled;
+                    item.detail = "已取消。".to_owned();
+                    cancelled = cancelled.saturating_add(1);
+                }
+                QueueItemState::Running => {
+                    if let Some(cancel) = &item.cancel {
+                        cancel.cancel();
+                    }
+                    cancelled = cancelled.saturating_add(1);
+                }
+                _ => {}
+            }
+        }
+    }
+    cancelled
+}
+
+impl TransferQueue {
+    fn cancel_all(&self) -> u32 {
+        cancel_queue_items(&self.items)
+    }
+}
+
+impl Drop for TransferQueue {
+    fn drop(&mut self) {
+        self.cancel_all();
+        if let Ok(items) = self.items.lock() {
+            for item in items.iter() {
+                // A staged upload the item never consumed would otherwise
+                // sit in managed staging until its TTL; remove it now.
+                if let QueueItemKind::Upload { staged_path, .. } = &item.kind
+                    && item.state != QueueItemState::Done
+                {
+                    let _ = std::fs::remove_file(staged_path);
+                }
+            }
+        }
+    }
+}
+
+fn queue_item_update(queue: &Arc<TransferQueue>, id: u64, update: impl FnOnce(&mut QueueItem)) {
+    if let Ok(mut items) = queue.items.lock()
+        && let Some(item) = items.iter_mut().find(|item| item.id == id)
+    {
+        update(item);
+    }
+}
+
+/// The `.part` sidecar: the remote size and mtime the partial was taken
+/// under, so a retry can tell "resume" apart from "the file changed".
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PartMeta {
+    size: u64,
+    mtime_epoch: Option<i64>,
+}
+
+fn read_part_meta(path: &Path) -> Option<PartMeta> {
+    let bytes = std::fs::read(path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn write_part_meta(path: &Path, size: u64, mtime_epoch: Option<i64>) {
+    if let Ok(text) = serde_json::to_string(&PartMeta { size, mtime_epoch }) {
+        let _ = std::fs::write(path, text);
+    }
+}
+
+fn local_file_sha256(path: &Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// A remote entry name turned into a safe local file name: separators,
+/// control characters and Windows-reserved forms are replaced, never
+/// followed or interpreted.
+fn sanitize_local_name(name: &str) -> Result<String, SftpBrowserApiError> {
+    let cleaned: String = name
+        .trim()
+        .chars()
+        .map(|character| match character {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+    let cleaned = cleaned.trim_end_matches(['.', ' ']).to_owned();
+    const RESERVED: &[&str] = &[
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    if cleaned.is_empty()
+        || cleaned.len() > MAX_ENTRY_NAME_INPUT
+        || cleaned == "."
+        || cleaned == ".."
+        || RESERVED.contains(&cleaned.to_ascii_uppercase().as_str())
+    {
+        return Err(SftpBrowserApiError::InvalidHandle);
+    }
+    Ok(cleaned)
+}
+
+/// A packed local directory archive held in managed staging while the page
+/// shows its preview; the name is bound here so a later call cannot swap it.
+struct PendingDirectoryUpload {
+    binding_handle: String,
+    path: PathBuf,
+    name: String,
     expires_at: Instant,
 }
 
@@ -2361,6 +3015,815 @@ impl SftpBrowserApi {
         Ok(TransferRegistration {
             registry: Arc::clone(&self.registry),
             token,
+        })
+    }
+
+    /// Enqueues downloads of the selected files into one host-chosen folder.
+    /// The queue lives on the browser; every item writes `<name>.part` and
+    /// only renames to the real name once complete, so a retry can resume.
+    pub(crate) async fn queue_download(
+        &self,
+        binding_handle: &str,
+        browser_handle: &str,
+        file_handles: &[String],
+        local_dir: &Path,
+        rate_limit_kib: u64,
+    ) -> Result<SftpTransferQueueDto, SftpBrowserApiError> {
+        validate_handle(browser_handle)?;
+        if file_handles.is_empty() || file_handles.len() > MAX_QUEUE_ITEMS {
+            return Err(SftpBrowserApiError::InvalidHandle);
+        }
+        if !local_dir.is_dir() {
+            return Err(SftpBrowserApiError::InvalidHandle);
+        }
+        let (_, scope) = self.capture_binding(binding_handle)?;
+        let session = self.bind_sftp(&scope).await?;
+        let degraded = self.sftp_degraded(&session).await?;
+        let nodes = {
+            let mut registry = self.lock_registry()?;
+            registry.prune(Instant::now());
+            let mut nodes = Vec::with_capacity(file_handles.len());
+            for handle in file_handles {
+                validate_handle(handle)?;
+                let node = registry.queue_entry(
+                    &scope,
+                    browser_handle,
+                    handle,
+                    EntryAction::Preview,
+                    Instant::now(),
+                )?;
+                if node.kind != SftpBrowserEntryKind::File {
+                    return Err(SftpBrowserApiError::EntryUnavailable);
+                }
+                let local_name = sanitize_local_name(&node.display_name)?;
+                nodes.push((local_name, node.path.clone()));
+            }
+            nodes
+        };
+        let queue = self.ensure_queue(&scope, browser_handle, degraded, Some(rate_limit_kib))?;
+        {
+            let mut items = queue
+                .items
+                .lock()
+                .map_err(|_| SftpBrowserApiError::RegistryUnavailable)?;
+            if items.len() + nodes.len() > MAX_QUEUE_ITEMS {
+                return Err(SftpBrowserApiError::Capacity);
+            }
+            for (local_name, remote_path) in nodes {
+                let id = queue
+                    .next_item_id
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                items.push(QueueItem {
+                    id,
+                    name: local_name,
+                    kind: QueueItemKind::Download {
+                        remote_path,
+                        local_dir: local_dir.to_path_buf(),
+                    },
+                    state: QueueItemState::Queued,
+                    done_bytes: 0,
+                    total_bytes: 0,
+                    detail: String::new(),
+                    cancel: None,
+                    part_path: None,
+                    remote_dest: None,
+                });
+            }
+        }
+        self.spawn_queue_runner(&queue);
+        self.queue_snapshot(&queue).await
+    }
+
+    /// Enqueues staged host files for upload into the given remote directory.
+    pub(crate) async fn queue_upload(
+        &self,
+        binding_handle: &str,
+        browser_handle: &str,
+        directory_handle: &str,
+        staged: &[SftpQueuedUpload],
+    ) -> Result<SftpTransferQueueDto, SftpBrowserApiError> {
+        validate_handle(browser_handle)?;
+        validate_handle(directory_handle)?;
+        if staged.is_empty() || staged.len() > MAX_QUEUE_ITEMS {
+            return Err(SftpBrowserApiError::InvalidHandle);
+        }
+        let (_, scope) = self.capture_binding(binding_handle)?;
+        let session = self.bind_sftp(&scope).await?;
+        let degraded = self.sftp_degraded(&session).await?;
+        let now = Instant::now();
+        let mut claimed = Vec::with_capacity(staged.len());
+        {
+            let mut registry = self.lock_registry()?;
+            registry.prune(now);
+            let directory = registry
+                .queue_entry(
+                    &scope,
+                    browser_handle,
+                    directory_handle,
+                    EntryAction::Browse,
+                    now,
+                )
+                .and_then(|node| {
+                    (node.kind == SftpBrowserEntryKind::Directory)
+                        .then(|| node.path.clone())
+                        .ok_or(SftpBrowserApiError::EntryUnavailable)
+                })?;
+            for item in staged {
+                validate_handle(&item.staged_handle)?;
+                let name = validated_entry_name(&item.name)?;
+                let staged_upload = registry
+                    .staged
+                    .get(&item.staged_handle)
+                    .filter(|entry| {
+                        entry.binding_handle == scope.binding_handle && entry.expires_at > now
+                    })
+                    .cloned()
+                    .ok_or(SftpBrowserApiError::EntryUnavailable)?;
+                registry.staged.remove(&item.staged_handle);
+                claimed.push((name, staged_upload.path, directory.clone()));
+            }
+        }
+        let queue = self.ensure_queue(&scope, browser_handle, degraded, None)?;
+        {
+            let mut items = queue
+                .items
+                .lock()
+                .map_err(|_| SftpBrowserApiError::RegistryUnavailable)?;
+            if items.len() + claimed.len() > MAX_QUEUE_ITEMS {
+                return Err(SftpBrowserApiError::Capacity);
+            }
+            for (name, staged_path, dest_dir) in claimed {
+                let id = queue
+                    .next_item_id
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                items.push(QueueItem {
+                    id,
+                    name,
+                    kind: QueueItemKind::Upload {
+                        staged_path,
+                        dest_dir,
+                    },
+                    state: QueueItemState::Queued,
+                    done_bytes: 0,
+                    total_bytes: 0,
+                    detail: String::new(),
+                    cancel: None,
+                    part_path: None,
+                    remote_dest: None,
+                });
+            }
+        }
+        self.spawn_queue_runner(&queue);
+        self.queue_snapshot(&queue).await
+    }
+
+    /// Live queue state for the page; `None` when this browser has no queue
+    /// (yet, or after the target changed and it was invalidated).
+    pub(crate) async fn queue_poll(
+        &self,
+        binding_handle: &str,
+        browser_handle: &str,
+    ) -> Result<Option<SftpTransferQueueDto>, SftpBrowserApiError> {
+        validate_handle(browser_handle)?;
+        let (_, scope) = self.capture_binding(binding_handle)?;
+        let queue = self
+            .lock_registry()?
+            .queues
+            .get(browser_handle)
+            .filter(|queue| queue.scope == scope)
+            .cloned();
+        let Some(queue) = queue else {
+            return Ok(None);
+        };
+        self.queue_snapshot(&queue).await.map(Some)
+    }
+
+    /// Cancels every item: queued ones turn cancelled at once, running ones
+    /// get their transfer switch thrown and land cancelled when they answer.
+    pub(crate) fn queue_cancel_all(
+        &self,
+        binding_handle: &str,
+        browser_handle: &str,
+    ) -> Result<SftpTransferCancelDto, SftpBrowserApiError> {
+        validate_handle(browser_handle)?;
+        let (_, scope) = self.capture_binding(binding_handle)?;
+        let queue = self
+            .lock_registry()?
+            .queues
+            .get(browser_handle)
+            .filter(|queue| queue.scope == scope)
+            .cloned()
+            .ok_or(SftpBrowserApiError::BrowserStale)?;
+        Ok(SftpTransferCancelDto {
+            cancelled: queue.cancel_all(),
+        })
+    }
+
+    /// Requeues one failed or cancelled item.
+    pub(crate) async fn queue_retry(
+        &self,
+        binding_handle: &str,
+        browser_handle: &str,
+        item_id: u64,
+    ) -> Result<SftpTransferQueueDto, SftpBrowserApiError> {
+        validate_handle(browser_handle)?;
+        let (_, scope) = self.capture_binding(binding_handle)?;
+        let queue = self
+            .lock_registry()?
+            .queues
+            .get(browser_handle)
+            .filter(|queue| queue.scope == scope)
+            .cloned()
+            .ok_or(SftpBrowserApiError::BrowserStale)?;
+        {
+            let mut items = queue
+                .items
+                .lock()
+                .map_err(|_| SftpBrowserApiError::RegistryUnavailable)?;
+            let item = items
+                .iter_mut()
+                .find(|item| item.id == item_id)
+                .ok_or(SftpBrowserApiError::EntryUnavailable)?;
+            match item.state {
+                QueueItemState::Failed | QueueItemState::Cancelled => {
+                    item.state = QueueItemState::Queued;
+                    item.done_bytes = 0;
+                    item.detail = String::new();
+                    item.cancel = None;
+                }
+                _ => return Err(SftpBrowserApiError::Busy),
+            }
+        }
+        self.spawn_queue_runner(&queue);
+        self.queue_snapshot(&queue).await
+    }
+
+    /// One queue per browser window. A queue created under another binding is
+    /// stale — it is dropped here and a fresh one replaces it.
+    fn ensure_queue(
+        &self,
+        scope: &BindingScope,
+        browser_handle: &str,
+        degraded: bool,
+        rate_limit_kib: Option<u64>,
+    ) -> Result<Arc<TransferQueue>, SftpBrowserApiError> {
+        let mut registry = self.lock_registry()?;
+        if let Some(existing) = registry.queues.get(browser_handle) {
+            if &existing.scope == scope && existing.degraded == degraded {
+                if let Some(kib) = rate_limit_kib {
+                    existing.rate_limit_bytes_per_second.store(
+                        kib.saturating_mul(1024),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
+                return Ok(Arc::clone(existing));
+            }
+            let stale = Arc::clone(existing);
+            registry.queues.remove(browser_handle);
+            stale.cancel_all();
+        }
+        let queue = Arc::new(TransferQueue {
+            scope: scope.clone(),
+            browser_handle: browser_handle.to_owned(),
+            degraded,
+            rate_limit_bytes_per_second: std::sync::atomic::AtomicU64::new(
+                rate_limit_kib.unwrap_or(0).saturating_mul(1024),
+            ),
+            items: Mutex::new(Vec::new()),
+            runner: Mutex::new(None),
+            next_item_id: std::sync::atomic::AtomicU64::new(1),
+        });
+        registry
+            .queues
+            .insert(browser_handle.to_owned(), Arc::clone(&queue));
+        Ok(queue)
+    }
+
+    fn spawn_queue_runner(&self, queue: &Arc<TransferQueue>) {
+        let Ok(mut slot) = queue.runner.lock() else {
+            return;
+        };
+        if slot.is_some() {
+            return;
+        }
+        let api = self.cloned_for_task();
+        let queue = Arc::clone(queue);
+        *slot = Some(tokio::spawn(async move { api.run_queue(queue).await }));
+    }
+
+    fn cloned_for_task(&self) -> Self {
+        Self {
+            services: self.services.clone(),
+            ssh_api: Arc::clone(&self.ssh_api),
+            registry: Arc::clone(&self.registry),
+            paths: Arc::clone(&self.paths),
+        }
+    }
+
+    /// Drains queued items, at most two running at once — one for degraded
+    /// targets, where SCP transfers are serialized.
+    async fn run_queue(&self, queue: Arc<TransferQueue>) {
+        let limit = if queue.degraded { 1 } else { 2 };
+        let mut set = tokio::task::JoinSet::new();
+        loop {
+            while set.len() < limit {
+                let claimed = {
+                    let Ok(mut items) = queue.items.lock() else {
+                        break;
+                    };
+                    items
+                        .iter_mut()
+                        .find(|item| item.state == QueueItemState::Queued)
+                        .map(|item| {
+                            item.state = QueueItemState::Running;
+                            let cancel = SftpTransferCancel::new();
+                            item.cancel = Some(cancel.clone());
+                            (item.id, item.name.clone(), item.kind.clone(), cancel)
+                        })
+                };
+                let Some((id, name, kind, cancel)) = claimed else {
+                    break;
+                };
+                let api = self.cloned_for_task();
+                let queue = Arc::clone(&queue);
+                set.spawn(async move {
+                    match kind {
+                        QueueItemKind::Download {
+                            remote_path,
+                            local_dir,
+                        } => {
+                            api.run_download_item(&queue, id, name, remote_path, local_dir, cancel)
+                                .await;
+                        }
+                        QueueItemKind::Upload {
+                            staged_path,
+                            dest_dir,
+                        } => {
+                            api.run_upload_item(&queue, id, name, staged_path, dest_dir, cancel)
+                                .await;
+                        }
+                    }
+                });
+            }
+            if set.is_empty() {
+                break;
+            }
+            let _ = set.join_next().await;
+        }
+        // Let a retry or a new enqueue start a fresh runner once this one is
+        // fully drained; recheck because a retry may have slipped in while
+        // the last item finished.
+        if let Ok(mut slot) = queue.runner.lock() {
+            *slot = None;
+        }
+        let pending = queue
+            .items
+            .lock()
+            .map(|items| {
+                items
+                    .iter()
+                    .any(|item| item.state == QueueItemState::Queued)
+            })
+            .unwrap_or(false);
+        if pending {
+            self.spawn_queue_runner(&queue);
+        }
+    }
+
+    /// `.part` download item: resumes when the recorded remote size and mtime
+    /// still match, restarts otherwise, verifies the remote SHA-256 when the
+    /// target offers one, and renames to the real name only when whole.
+    async fn run_download_item(
+        &self,
+        queue: &Arc<TransferQueue>,
+        id: u64,
+        name: String,
+        remote_path: RemotePath,
+        local_dir: PathBuf,
+        cancel: SftpTransferCancel,
+    ) {
+        let finish = |state: QueueItemState, detail: String| {
+            queue_item_update(queue, id, |item| {
+                item.state = state;
+                item.detail = detail;
+                item.cancel = None;
+            });
+        };
+        if self.validate_binding(&queue.scope).is_err() {
+            finish(QueueItemState::Failed, "连接已失效，未能下载。".to_owned());
+            return;
+        }
+        let session = match self.bind_sftp(&queue.scope).await {
+            Ok(session) => session,
+            Err(_) => {
+                finish(QueueItemState::Failed, "无法连接目标机。".to_owned());
+                return;
+            }
+        };
+        let metadata = match timeout(
+            READ_DEADLINE,
+            self.services.sftp().metadata(&session, &remote_path, false),
+        )
+        .await
+        {
+            Ok(Ok(metadata)) => metadata,
+            Ok(Err(error)) => {
+                finish(
+                    QueueItemState::Failed,
+                    format!("读取远端文件信息失败：{error}"),
+                );
+                return;
+            }
+            Err(_) => {
+                finish(QueueItemState::Failed, "读取远端文件信息超时。".to_owned());
+                return;
+            }
+        };
+        if metadata.kind != SftpFileKind::File {
+            finish(QueueItemState::Failed, "远端对象不是普通文件。".to_owned());
+            return;
+        }
+        queue_item_update(queue, id, |item| {
+            item.total_bytes = metadata.size;
+        });
+        let part = local_dir.join(format!("{name}.part"));
+        let destination = local_dir.join(&name);
+        let sidecar = local_dir.join(format!("{name}.part.lhmeta"));
+        if destination.exists() {
+            finish(
+                QueueItemState::Failed,
+                "本机已有同名文件，未覆盖。".to_owned(),
+            );
+            return;
+        }
+        let mut detail = String::new();
+        let mut resume_from = 0_u64;
+        if queue.degraded {
+            if part.exists() {
+                let _ = std::fs::remove_file(&part);
+            }
+            detail = "SCP 通道无法续传，将从头重新下载。".to_owned();
+        } else if let Some(recorded) = read_part_meta(&sidecar) {
+            let same_file = recorded.size == metadata.size
+                && recorded.mtime_epoch == metadata.modified_at.map(|mtime| mtime.timestamp());
+            let part_len = std::fs::metadata(&part).ok().map(|meta| meta.len());
+            match (same_file, part_len) {
+                (true, Some(len)) if len <= metadata.size => {
+                    resume_from = len;
+                    if len > 0 {
+                        detail = format!("从 {len} 字节处续传。");
+                    }
+                }
+                (true, _) => {
+                    resume_from = 0;
+                }
+                (false, _) => {
+                    let _ = std::fs::remove_file(&part);
+                    detail = "远端文件已变化，从头重新下载。".to_owned();
+                }
+            }
+        } else if part.exists() {
+            let _ = std::fs::remove_file(&part);
+        }
+        write_part_meta(
+            &sidecar,
+            metadata.size,
+            metadata.modified_at.map(|mtime| mtime.timestamp()),
+        );
+        queue_item_update(queue, id, |item| {
+            item.part_path = Some(part.clone());
+            item.done_bytes = resume_from;
+        });
+        let _registration =
+            match self.register_transfer(&queue.scope, &queue.browser_handle, &cancel) {
+                Ok(registration) => registration,
+                Err(_) => {
+                    finish(QueueItemState::Failed, "无法登记传输任务。".to_owned());
+                    return;
+                }
+            };
+        let rate = queue
+            .rate_limit_bytes_per_second
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let outcome = run_transfer(
+            self.services.sftp().download_with_options(
+                &session,
+                &self.paths,
+                &remote_path,
+                &part,
+                SftpDownloadOptions {
+                    resume_from,
+                    rate_limit_bytes_per_second: rate,
+                    keep_partial: true,
+                },
+                &cancel,
+            ),
+            &cancel,
+            TRANSFER_DEADLINE,
+        )
+        .await;
+        let result = match outcome {
+            Err(error) => {
+                finish(QueueItemState::Failed, format!("下载未完成：{error}"));
+                return;
+            }
+            Ok(Err(error)) => {
+                if lovelyhawk_core::sftp::is_transfer_cancelled(&error) {
+                    finish(QueueItemState::Cancelled, "已取消。".to_owned());
+                } else {
+                    finish(QueueItemState::Failed, format!("下载未完成：{error}"));
+                }
+                return;
+            }
+            Ok(Ok(receipt)) => receipt,
+        };
+        let _ = result;
+        if self.validate_binding(&queue.scope).is_err() {
+            finish(
+                QueueItemState::Failed,
+                "连接已失效，结果未保存。".to_owned(),
+            );
+            return;
+        }
+        match self
+            .services
+            .sftp()
+            .remote_sha256(&session, &remote_path)
+            .await
+        {
+            Ok(Some(expected)) => match local_file_sha256(&part) {
+                Ok(actual) if actual.eq_ignore_ascii_case(&expected) => {
+                    if !detail.is_empty() {
+                        detail.push(' ');
+                    }
+                    detail.push_str("已核对完整性");
+                }
+                Ok(_) => {
+                    finish(
+                        QueueItemState::Failed,
+                        "完整性校验不一致，保留 .part 文件供排查。".to_owned(),
+                    );
+                    return;
+                }
+                Err(_) => {
+                    finish(
+                        QueueItemState::Failed,
+                        "无法读取本机文件核对完整性。".to_owned(),
+                    );
+                    return;
+                }
+            },
+            Ok(None) => {
+                if !detail.is_empty() {
+                    detail.push(' ');
+                }
+                detail.push_str("未核对完整性");
+            }
+            Err(_) => {
+                if !detail.is_empty() {
+                    detail.push(' ');
+                }
+                detail.push_str("未能核对完整性");
+            }
+        }
+        if destination.exists() {
+            finish(
+                QueueItemState::Failed,
+                "本机已有同名文件，未覆盖；内容留在 .part 文件中。".to_owned(),
+            );
+            return;
+        }
+        if std::fs::rename(&part, &destination).is_err() {
+            finish(
+                QueueItemState::Failed,
+                "无法把 .part 改名为最终文件名。".to_owned(),
+            );
+            return;
+        }
+        let _ = std::fs::remove_file(&sidecar);
+        queue_item_update(queue, id, |item| {
+            item.part_path = None;
+            item.done_bytes = item.total_bytes;
+        });
+        finish(QueueItemState::Done, detail);
+    }
+
+    /// Upload item: the staged file goes through the same plan → confirm →
+    /// execute-and-verify path a single upload takes, with the item's own
+    /// cancel switch wired to the operation's transfer switch.
+    async fn run_upload_item(
+        &self,
+        queue: &Arc<TransferQueue>,
+        id: u64,
+        name: String,
+        staged_path: PathBuf,
+        dest_dir: RemotePath,
+        cancel: SftpTransferCancel,
+    ) {
+        let finish = |state: QueueItemState, detail: String| {
+            queue_item_update(queue, id, |item| {
+                item.state = state;
+                item.detail = detail;
+                item.cancel = None;
+            });
+        };
+        if self.validate_binding(&queue.scope).is_err() {
+            finish(QueueItemState::Failed, "连接已失效，未能上传。".to_owned());
+            return;
+        }
+        let session = match self.bind_sftp(&queue.scope).await {
+            Ok(session) => session,
+            Err(_) => {
+                finish(QueueItemState::Failed, "无法连接目标机。".to_owned());
+                return;
+            }
+        };
+        let destination = match dest_dir.child(&name) {
+            Ok(path) => path,
+            Err(_) => {
+                finish(QueueItemState::Failed, "远端目标路径无效。".to_owned());
+                return;
+            }
+        };
+        if let Ok(meta) = std::fs::metadata(&staged_path) {
+            queue_item_update(queue, id, |item| {
+                item.total_bytes = meta.len();
+            });
+        }
+        let mut upload = match self.services.sftp().plan_upload(
+            &session,
+            &self.paths,
+            &staged_path,
+            destination.clone(),
+        ) {
+            Ok(upload) => upload,
+            Err(error) => {
+                finish(QueueItemState::Failed, format!("上传被拒绝：{error}"));
+                return;
+            }
+        };
+        if upload
+            .confirm(DangerousConfirmation::approve(upload.definition()))
+            .is_err()
+        {
+            finish(QueueItemState::Failed, "上传计划未能确认。".to_owned());
+            return;
+        }
+        let op_cancel = upload.transfer_cancel();
+        queue_item_update(queue, id, |item| {
+            item.remote_dest = Some(destination.clone());
+        });
+        let _registration =
+            match self.register_transfer(&queue.scope, &queue.browser_handle, &cancel) {
+                Ok(registration) => registration,
+                Err(_) => {
+                    finish(QueueItemState::Failed, "无法登记传输任务。".to_owned());
+                    return;
+                }
+            };
+        enum UploadOutcome {
+            CancelledByItem,
+            Finished(Result<Result<VerificationResult, CoreError>, SftpBrowserApiError>),
+        }
+        let outcome = tokio::select! {
+            () = cancel.cancelled() => {
+                op_cancel.cancel();
+                UploadOutcome::CancelledByItem
+            }
+            result = run_transfer(upload.execute_and_verify(), &op_cancel, TRANSFER_DEADLINE) => {
+                UploadOutcome::Finished(result)
+            }
+        };
+        match outcome {
+            UploadOutcome::CancelledByItem => {
+                let _ = upload.restore().await;
+                finish(QueueItemState::Cancelled, "已取消。".to_owned());
+            }
+            UploadOutcome::Finished(Err(error)) => {
+                let _ = upload.restore().await;
+                finish(QueueItemState::Failed, format!("上传未完成：{error}"));
+            }
+            UploadOutcome::Finished(Ok(Err(error))) => {
+                let _ = upload.restore().await;
+                if lovelyhawk_core::sftp::is_transfer_cancelled(&error) {
+                    finish(QueueItemState::Cancelled, "已取消。".to_owned());
+                } else {
+                    finish(QueueItemState::Failed, format!("上传未完成：{error}"));
+                }
+            }
+            UploadOutcome::Finished(Ok(Ok(verification))) => {
+                if self.validate_binding(&queue.scope).is_err() {
+                    finish(
+                        QueueItemState::Failed,
+                        "连接已失效，结果未保存。".to_owned(),
+                    );
+                    return;
+                }
+                if verification.passed {
+                    queue_item_update(queue, id, |item| {
+                        item.done_bytes = item.total_bytes;
+                    });
+                    finish(QueueItemState::Done, String::new());
+                } else {
+                    let _ = upload.restore().await;
+                    finish(
+                        QueueItemState::Failed,
+                        format!("上传结果未能核实：{}", verification.detail),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Current queue state; running items report live bytes — downloads from
+    /// the `.part` file length, uploads from the remote file's growth.
+    async fn queue_snapshot(
+        &self,
+        queue: &Arc<TransferQueue>,
+    ) -> Result<SftpTransferQueueDto, SftpBrowserApiError> {
+        let mut upload_stats: Vec<(u64, RemotePath)> = Vec::new();
+        {
+            let mut items = queue
+                .items
+                .lock()
+                .map_err(|_| SftpBrowserApiError::RegistryUnavailable)?;
+            for item in items.iter_mut() {
+                if item.state != QueueItemState::Running {
+                    continue;
+                }
+                match &item.kind {
+                    QueueItemKind::Download { .. } => {
+                        if let Some(part) = &item.part_path
+                            && let Ok(meta) = std::fs::metadata(part)
+                        {
+                            item.done_bytes = if item.total_bytes > 0 {
+                                meta.len().min(item.total_bytes)
+                            } else {
+                                meta.len()
+                            };
+                        }
+                    }
+                    QueueItemKind::Upload { .. } => {
+                        if let Some(dest) = &item.remote_dest {
+                            upload_stats.push((item.id, dest.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        if !upload_stats.is_empty()
+            && let Ok(session) = self.bind_sftp(&queue.scope).await
+        {
+            for (id, path) in upload_stats {
+                if let Ok(Ok(meta)) = timeout(
+                    LIST_DEADLINE,
+                    self.services.sftp().metadata(&session, &path, false),
+                )
+                .await
+                {
+                    queue_item_update(queue, id, |item| {
+                        item.done_bytes = if item.total_bytes > 0 {
+                            meta.size.min(item.total_bytes)
+                        } else {
+                            meta.size
+                        };
+                    });
+                }
+            }
+        }
+        let (active, items) = {
+            let items = queue
+                .items
+                .lock()
+                .map_err(|_| SftpBrowserApiError::RegistryUnavailable)?;
+            (
+                items.iter().any(|item| {
+                    matches!(item.state, QueueItemState::Queued | QueueItemState::Running)
+                }),
+                items
+                    .iter()
+                    .map(|item| SftpQueueItemDto {
+                        item_id: item.id,
+                        name: item.name.clone(),
+                        state: match item.state {
+                            QueueItemState::Queued => "queued",
+                            QueueItemState::Running => "running",
+                            QueueItemState::Done => "done",
+                            QueueItemState::Failed => "failed",
+                            QueueItemState::Cancelled => "cancelled",
+                        }
+                        .to_owned(),
+                        done_bytes: item.done_bytes.to_string(),
+                        total_bytes: item.total_bytes.to_string(),
+                        detail: item.detail.clone(),
+                    })
+                    .collect(),
+            )
+        };
+        Ok(SftpTransferQueueDto {
+            active,
+            degraded: queue.degraded,
+            items,
         })
     }
 
@@ -3343,6 +4806,79 @@ mod tests {
         }
     }
 
+    /// Queue downloads write `<name>.part` on the host; a remote name can be
+    /// anything the server sent, so it is sanitized to a plain local name —
+    /// separators, control characters and Windows-reserved forms never reach
+    /// the filesystem.
+    #[test]
+    fn queue_local_names_are_sanitized() {
+        assert_eq!(sanitize_local_name("report.tar").unwrap(), "report.tar");
+        assert_eq!(sanitize_local_name("a/b\\c:d").unwrap(), "a_b_c_d");
+        assert_eq!(sanitize_local_name("name\tevil").unwrap(), "name_evil");
+        assert_eq!(sanitize_local_name("trail.").unwrap(), "trail");
+        for refused in ["", "   ", ".", "..", "...", "CON", "nul", "LPT3"] {
+            assert!(sanitize_local_name(refused).is_err(), "{refused:?}");
+        }
+    }
+
+    /// The `.part` sidecar is the only thing a retry trusts: it round-trips
+    /// size and mtime and unreadable content counts as "no resume data".
+    #[test]
+    fn part_meta_round_trips_and_rejects_garbage() {
+        let directory =
+            std::env::temp_dir().join(format!("lh-part-meta-{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let sidecar = directory.join("f.part.lhmeta");
+        assert!(read_part_meta(&sidecar).is_none());
+        write_part_meta(&sidecar, 42, Some(1_700_000_000));
+        let meta = read_part_meta(&sidecar).expect("written sidecar parses");
+        assert_eq!(meta.size, 42);
+        assert_eq!(meta.mtime_epoch, Some(1_700_000_000));
+        write_part_meta(&sidecar, 7, None);
+        let meta = read_part_meta(&sidecar).expect("rewritten sidecar parses");
+        assert_eq!(meta.mtime_epoch, None);
+        std::fs::write(&sidecar, b"not json").unwrap();
+        assert!(read_part_meta(&sidecar).is_none());
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// Cancel-all flips queued items to cancelled and throws the switch of
+    /// running ones; finished items are left alone.
+    #[test]
+    fn queue_cancel_all_marks_pending_items() {
+        let make = |id, state| QueueItem {
+            id,
+            name: "n".to_owned(),
+            kind: QueueItemKind::Download {
+                remote_path: RemotePath::new("/f").unwrap(),
+                local_dir: PathBuf::from("/tmp"),
+            },
+            state,
+            done_bytes: 0,
+            total_bytes: 0,
+            detail: String::new(),
+            cancel: None,
+            part_path: None,
+            remote_dest: None,
+        };
+        let running_cancel = SftpTransferCancel::new();
+        let items = Mutex::new(vec![
+            make(1, QueueItemState::Queued),
+            {
+                let mut running = make(2, QueueItemState::Running);
+                running.cancel = Some(running_cancel.clone());
+                running
+            },
+            make(3, QueueItemState::Done),
+        ]);
+        assert_eq!(cancel_queue_items(&items), 2);
+        assert!(running_cancel.is_cancelled());
+        let items = items.lock().unwrap();
+        assert!(matches!(items[0].state, QueueItemState::Cancelled));
+        assert!(matches!(items[1].state, QueueItemState::Running));
+        assert!(matches!(items[2].state, QueueItemState::Done));
+    }
+
     /// The download result crosses as exact camelCase fields with the
     /// preflight counts always present so a refusal can show its numbers.
     #[test]
@@ -3377,6 +4913,101 @@ mod tests {
         for forbidden in ["localPath", "remotePath", "extractTo", "path"] {
             assert!(!encoded.contains(forbidden), "{forbidden}");
         }
+    }
+
+    /// The upload receipt crosses as exact camelCase fields; the undo handle
+    /// only exists while the upload is still undoable, and no local or remote
+    /// path ever crosses on it.
+    #[test]
+    fn directory_upload_dto_serializes_exact_fields() {
+        let dto = SftpDirectoryUploadDto {
+            browser_handle: "opaque-browser".to_owned(),
+            state: "done".to_owned(),
+            detail: "目录已上传并在目标机解包核对完成。".to_owned(),
+            plan_handle: Some(Uuid::new_v4().to_string()),
+            undoable: true,
+        };
+        let value = serde_json::to_value(&dto).unwrap();
+        let object = value.as_object().unwrap();
+        assert_eq!(object.len(), 5);
+        for key in ["browserHandle", "state", "detail", "planHandle", "undoable"] {
+            assert!(object.contains_key(key), "{key}");
+        }
+        let encoded = serde_json::to_string(&dto).unwrap();
+        for forbidden in [
+            "localPath",
+            "remotePath",
+            "stagedPath",
+            "path\":",
+            "fileCount",
+        ] {
+            assert!(!encoded.contains(forbidden), "{forbidden}");
+        }
+        // A refused upload never advertises an undo handle.
+        let refused = SftpDirectoryUploadDto {
+            browser_handle: "opaque-browser".to_owned(),
+            state: "refused-destination".to_owned(),
+            detail: "目标位置已存在同名文件夹。".to_owned(),
+            plan_handle: None,
+            undoable: false,
+        };
+        assert!(serde_json::to_value(&refused).unwrap()["planHandle"].is_null());
+    }
+
+    /// A prepared archive is single use and belongs to its binding only;
+    /// discarding it removes the staged file.
+    #[test]
+    fn directory_upload_staging_is_single_use_and_scoped() {
+        let mut registry = SftpBrowserRegistry::default();
+        let scope_a = scope("binding-a", "a@10.0.0.1", 0);
+        let other = scope("binding-b", "b@10.0.0.2", 0);
+        let staged = std::env::temp_dir().join(format!("lh-staged-{}", Uuid::new_v4()));
+        std::fs::write(&staged, b"tar").unwrap();
+        let now = Instant::now();
+        registry
+            .store_directory_upload(
+                "staged-1".to_owned(),
+                PendingDirectoryUpload {
+                    binding_handle: scope_a.binding_handle.clone(),
+                    path: staged.clone(),
+                    name: "site".to_owned(),
+                    expires_at: now + PLAN_TTL,
+                },
+            )
+            .unwrap();
+        assert!(
+            registry
+                .take_directory_upload(&other, "staged-1", now)
+                .is_err()
+        );
+        let pending = registry
+            .take_directory_upload(&scope_a, "staged-1", now)
+            .unwrap();
+        assert_eq!(pending.name, "site");
+        assert!(
+            registry
+                .take_directory_upload(&scope_a, "staged-1", now)
+                .is_err()
+        );
+        std::fs::remove_file(&staged).unwrap();
+
+        let gone = std::env::temp_dir().join(format!("lh-staged-{}", Uuid::new_v4()));
+        std::fs::write(&gone, b"tar").unwrap();
+        registry
+            .store_directory_upload(
+                "staged-2".to_owned(),
+                PendingDirectoryUpload {
+                    binding_handle: scope_a.binding_handle.clone(),
+                    path: gone.clone(),
+                    name: "site".to_owned(),
+                    expires_at: now + PLAN_TTL,
+                },
+            )
+            .unwrap();
+        assert!(!registry.discard_directory_upload(&other, "staged-2"));
+        assert!(gone.exists());
+        assert!(registry.discard_directory_upload(&scope_a, "staged-2"));
+        assert!(!gone.exists());
     }
 
     /// A plan is single use and belongs to one target and one browser.
@@ -3482,11 +5113,24 @@ mod tests {
         // Local upload sizing and the inventory-authorized, non-following core
         // lstat are the only metadata calls. There is no page-supplied path API.
         let editor_stat = "self.services.sftp().metadata(&session, &path, false)";
+        // The directory-upload destination is statted up front so a refusal
+        // can say the name is taken; plan_extract re-checks before writing.
+        let upload_stat = ".metadata(&session, &destination, false)";
         assert!(whole.contains(editor_stat));
+        assert!(whole.contains(upload_stat));
         assert!(whole.contains("metadata.kind != SftpFileKind::File"));
         let production = whole
             .replace("std::fs::metadata(local_path)", "")
-            .replace(editor_stat, "");
+            .replace(editor_stat, "")
+            .replace(upload_stat, "")
+            // The queue stats each download source once for the resume
+            // decision, and each running upload's remote file for progress.
+            .replace(".metadata(&session, &remote_path, false)", "")
+            .replace(".metadata(&session, &path, false)", "")
+            // Local `.part`/staged sizing for progress and the upload total.
+            .replace("std::fs::metadata(&part)", "")
+            .replace("std::fs::metadata(part)", "")
+            .replace("std::fs::metadata(&staged_path)", "");
         assert!(production.contains(".sftp()\n                .bind_session("));
         assert!(production.contains("self.services.sftp().list("));
         assert!(production.contains("self.services.sftp().read_text("));
@@ -3500,6 +5144,8 @@ mod tests {
         for step in [
             ".plan(&session, mutation)",
             ".plan_upload(&session, &self.paths, &staged_path, destination)",
+            ".plan_upload(&session, &self.paths, &staged.path, temporary.clone())",
+            ".plan_extract(&session, temporary.clone(), destination.clone())",
             "DangerousConfirmation::approve(",
             ".execute_and_verify()",
             ".restore()",
@@ -3509,7 +5155,6 @@ mod tests {
         for forbidden in [
             [".ssh()", ".sftp("].concat(),
             ["open_directory", "_terminal"].concat(),
-            ["plan", "_extract"].concat(),
             ["read", "_file("].concat(),
             ["canonical", "ize"].concat(),
             ["metadata", "("].concat(),

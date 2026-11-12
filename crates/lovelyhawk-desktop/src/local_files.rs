@@ -56,6 +56,33 @@ pub async fn choose<R: Runtime>(
         .filter(|path| path.is_absolute())
 }
 
+/// Picks multiple local files in one system dialog; an empty answer means
+/// the operator cancelled or picked nothing.
+pub async fn choose_many<R: Runtime>(
+    window: &WebviewWindow<R>,
+    title: &str,
+    filter: Option<Filter<'_>>,
+) -> Vec<PathBuf> {
+    if let Some(answer) = crate::test_hooks::scripted_dialog_answer() {
+        return answer.into_iter().collect();
+    }
+    let mut builder = window.dialog().file().set_parent(window).set_title(title);
+    if let Some(filter) = filter {
+        builder = builder.add_filter(filter.name, filter.extensions);
+    }
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    builder.pick_files(move |picked: Option<Vec<tauri_plugin_dialog::FilePath>>| {
+        let _ = sender.send(picked.unwrap_or_default());
+    });
+    receiver
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|path| path.into_path().ok())
+        .filter(|path| path.is_absolute())
+        .collect()
+}
+
 pub const FILE_EXISTS: &str = "所选文件已存在。导出只创建新文件，请换一个文件名。";
 pub const WRITE_FAILED: &str = "无法写入所选文件，请检查目录权限或磁盘空间。";
 

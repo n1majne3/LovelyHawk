@@ -133,6 +133,9 @@ pub const PROTOCOL_VERSION: &str = "lovelyhawk-backend/v1";
 pub use lovelyhawk_core::windows_incident::{
     WINDOWS_EVIDENCE_MAX_BYTES, WINDOWS_EVIDENCE_PART_BYTES, WindowsEvidencePart,
 };
+// The desktop host packs picked folders through the core walker; the rules
+// stay in core, the path stays in the host.
+pub use lovelyhawk_core::local_pack;
 // A maximal typed note can expand when JSON escapes control characters. The
 // process boundary remains hard-bounded while still accepting every value the
 // core notes contract permits.
@@ -2044,6 +2047,47 @@ impl BackendState {
                     Err(failure) => Err(failure),
                 }
             }
+            RpcMethod::SftpBrowserUploadDirectoryStage => {
+                match parse_params::<SftpBrowserUploadDirectoryStageParams>(request.params) {
+                    Ok(params) => self
+                        .sftp_browser
+                        .stage_directory_upload(
+                            &params.binding_handle,
+                            &params.browser_handle,
+                            std::path::Path::new(&params.local_path),
+                            &params.name,
+                        )
+                        .map(to_value)
+                        .map_err(sftp_browser_failure),
+                    Err(failure) => Err(failure),
+                }
+            }
+            RpcMethod::SftpBrowserUploadDirectory => {
+                match parse_params::<SftpBrowserUploadDirectoryParams>(request.params) {
+                    Ok(params) => self
+                        .sftp_browser
+                        .upload_directory(
+                            &params.binding_handle,
+                            &params.browser_handle,
+                            &params.directory_handle,
+                            &params.staged_handle,
+                        )
+                        .await
+                        .map(to_value)
+                        .map_err(sftp_browser_failure),
+                    Err(failure) => Err(failure),
+                }
+            }
+            RpcMethod::SftpBrowserUploadDirectoryDiscard => {
+                match parse_params::<SftpBrowserUploadDirectoryDiscardParams>(request.params) {
+                    Ok(params) => self
+                        .sftp_browser
+                        .discard_directory_upload(&params.binding_handle, &params.staged_handle)
+                        .map(to_value)
+                        .map_err(sftp_browser_failure),
+                    Err(failure) => Err(failure),
+                }
+            }
             RpcMethod::SftpBrowserOperationPlan => {
                 match parse_params::<SftpBrowserOperationParams>(request.params) {
                     Ok(params) => match params.to_request() {
@@ -2119,6 +2163,82 @@ impl BackendState {
                             std::path::Path::new(&params.local_path),
                             &params.name,
                         )
+                        .map(to_value)
+                        .map_err(sftp_browser_failure),
+                    Err(failure) => Err(failure),
+                }
+            }
+            RpcMethod::SftpBrowserQueueDownload => {
+                match parse_params::<SftpBrowserQueueDownloadParams>(request.params) {
+                    Ok(params) => self
+                        .sftp_browser
+                        .queue_download(
+                            &params.binding_handle,
+                            &params.browser_handle,
+                            &params.file_handles,
+                            std::path::Path::new(&params.local_path),
+                            params.rate_limit_kib,
+                        )
+                        .await
+                        .map(to_value)
+                        .map_err(sftp_browser_failure),
+                    Err(failure) => Err(failure),
+                }
+            }
+            RpcMethod::SftpBrowserQueueUpload => {
+                match parse_params::<SftpBrowserQueueUploadParams>(request.params) {
+                    Ok(params) => self
+                        .sftp_browser
+                        .queue_upload(
+                            &params.binding_handle,
+                            &params.browser_handle,
+                            &params.directory_handle,
+                            &params
+                                .staged
+                                .iter()
+                                .map(|item| sftp_browser_api::SftpQueuedUpload {
+                                    staged_handle: item.staged_handle.clone(),
+                                    name: item.name.clone(),
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                        .await
+                        .map(to_value)
+                        .map_err(sftp_browser_failure),
+                    Err(failure) => Err(failure),
+                }
+            }
+            RpcMethod::SftpBrowserQueuePoll => {
+                match parse_params::<SftpBrowserTransferParams>(request.params) {
+                    Ok(params) => self
+                        .sftp_browser
+                        .queue_poll(&params.binding_handle, &params.browser_handle)
+                        .await
+                        .map(to_value)
+                        .map_err(sftp_browser_failure),
+                    Err(failure) => Err(failure),
+                }
+            }
+            RpcMethod::SftpBrowserQueueCancelAll => {
+                match parse_params::<SftpBrowserTransferParams>(request.params) {
+                    Ok(params) => self
+                        .sftp_browser
+                        .queue_cancel_all(&params.binding_handle, &params.browser_handle)
+                        .map(to_value)
+                        .map_err(sftp_browser_failure),
+                    Err(failure) => Err(failure),
+                }
+            }
+            RpcMethod::SftpBrowserQueueRetry => {
+                match parse_params::<SftpBrowserQueueItemParams>(request.params) {
+                    Ok(params) => self
+                        .sftp_browser
+                        .queue_retry(
+                            &params.binding_handle,
+                            &params.browser_handle,
+                            params.item_id,
+                        )
+                        .await
                         .map(to_value)
                         .map_err(sftp_browser_failure),
                     Err(failure) => Err(failure),
@@ -3146,6 +3266,12 @@ enum RpcMethod {
     SftpBrowserDownload,
     #[serde(rename = "sftp-browser.download-directory")]
     SftpBrowserDownloadDirectory,
+    #[serde(rename = "sftp-browser.upload-directory.stage")]
+    SftpBrowserUploadDirectoryStage,
+    #[serde(rename = "sftp-browser.upload-directory")]
+    SftpBrowserUploadDirectory,
+    #[serde(rename = "sftp-browser.upload-directory.discard")]
+    SftpBrowserUploadDirectoryDiscard,
     #[serde(rename = "sftp-browser.operation.plan")]
     SftpBrowserOperationPlan,
     #[serde(rename = "sftp-browser.operation.confirm")]
@@ -3160,6 +3286,16 @@ enum RpcMethod {
     SftpBrowserTransferCancel,
     #[serde(rename = "sftp-browser.upload.stage")]
     SftpBrowserUploadStage,
+    #[serde(rename = "sftp-browser.queue.download")]
+    SftpBrowserQueueDownload,
+    #[serde(rename = "sftp-browser.queue.upload")]
+    SftpBrowserQueueUpload,
+    #[serde(rename = "sftp-browser.queue.poll")]
+    SftpBrowserQueuePoll,
+    #[serde(rename = "sftp-browser.queue.cancel-all")]
+    SftpBrowserQueueCancelAll,
+    #[serde(rename = "sftp-browser.queue.retry")]
+    SftpBrowserQueueRetry,
     #[serde(rename = "packet-capture.interfaces.list")]
     PacketCaptureInterfacesList,
     #[serde(rename = "packet-capture.start")]
@@ -3931,6 +4067,45 @@ struct SftpBrowserStageParams {
     name: String,
 }
 
+/// Batch downloads: the selected remote files into one host-picked folder.
+/// `localPath` only ever arrives from a host command behind a folder dialog.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SftpBrowserQueueDownloadParams {
+    binding_handle: String,
+    browser_handle: String,
+    file_handles: Vec<String>,
+    local_path: String,
+    /// KiB/s for the read loop; 0 means unlimited.
+    #[serde(rename = "rateLimitKiB", default)]
+    rate_limit_kib: u64,
+}
+
+/// Batch uploads: staged host files into the current remote directory.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SftpBrowserQueueUploadParams {
+    binding_handle: String,
+    browser_handle: String,
+    directory_handle: String,
+    staged: Vec<SftpBrowserQueuedUpload>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SftpBrowserQueuedUpload {
+    staged_handle: String,
+    name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SftpBrowserQueueItemParams {
+    binding_handle: String,
+    browser_handle: String,
+    item_id: u64,
+}
+
 /// A replacement class file for Java hot update. Host-only, like the SFTP
 /// upload stage: the path comes from the native open dialog, never a page.
 #[derive(Deserialize)]
@@ -4056,6 +4231,33 @@ struct SftpBrowserDownloadDirectoryParams {
     /// that must be an existing empty directory, forwarded by main.
     #[serde(default)]
     extract_to: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SftpBrowserUploadDirectoryStageParams {
+    binding_handle: String,
+    browser_handle: String,
+    /// Host-built tar archive of the picked folder; forwarded by main, never
+    /// a page-supplied path.
+    local_path: String,
+    name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SftpBrowserUploadDirectoryParams {
+    binding_handle: String,
+    browser_handle: String,
+    directory_handle: String,
+    staged_handle: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SftpBrowserUploadDirectoryDiscardParams {
+    binding_handle: String,
+    staged_handle: String,
 }
 
 #[derive(Deserialize)]
@@ -7235,6 +7437,41 @@ mod tests {
             .expect("the security reference must stay in the page registry");
         assert!(matches!(reference.group, PageGroup::Intelligence));
         assert_eq!(reference.title, "安全速查");
+    }
+
+    /// The queue params are closed shapes: anything extra — a remote path, a
+    /// session, a queue id — is refused at parse, never silently dropped.
+    #[test]
+    fn sftp_queue_params_reject_unknown_fields() {
+        for raw in [
+            r#"{"bindingHandle":"b","browserHandle":"w","fileHandles":["f"],"localPath":"/x","rateLimitKiB":8,"remotePath":"/etc"}"#,
+            r#"{"bindingHandle":"b","browserHandle":"w","fileHandles":["f"],"localPath":"/x","session":"s"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<SftpBrowserQueueDownloadParams>(raw).is_err(),
+                "{raw}"
+            );
+        }
+        for raw in [
+            r#"{"bindingHandle":"b","browserHandle":"w","directoryHandle":"d","staged":[],"localPath":"/x"}"#,
+            r#"{"bindingHandle":"b","browserHandle":"w","directoryHandle":"d","staged":[{"stagedHandle":"s","name":"f","path":"/etc"}]}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<SftpBrowserQueueUploadParams>(raw).is_err(),
+                "{raw}"
+            );
+        }
+        assert!(
+            serde_json::from_str::<SftpBrowserQueueItemParams>(
+                r#"{"bindingHandle":"b","browserHandle":"w","itemId":2,"queueId":"q"}"#
+            )
+            .is_err()
+        );
+        let parsed = serde_json::from_str::<SftpBrowserQueueDownloadParams>(
+            r#"{"bindingHandle":"b","browserHandle":"w","fileHandles":["f"],"localPath":"/x"}"#,
+        )
+        .expect("a well-formed request parses");
+        assert_eq!(parsed.rate_limit_kib, 0);
     }
     use lovelyhawk_core::investigation::AddAiHistory;
     use tracing_subscriber::prelude::*;

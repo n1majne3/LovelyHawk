@@ -213,6 +213,20 @@ pub struct SftpTransferReceipt {
     pub bytes: u64,
 }
 
+/// How a plain (non-evidence) download writes its local file. Evidence
+/// collection keeps its own rules and never takes these options.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SftpDownloadOptions {
+    /// Bytes a kept `.part` file already holds; the transfer continues from
+    /// that offset. `0` starts a fresh file.
+    pub resume_from: u64,
+    /// Bytes per second for the read loop; `0` is unlimited.
+    pub rate_limit_bytes_per_second: u64,
+    /// Keep the partial local file on failure or cancel so a retry can
+    /// resume; without this an unfinished file removes itself.
+    pub keep_partial: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ArchiveFormat {
@@ -699,6 +713,28 @@ impl SftpService {
         selected_target: &Path,
         cancel: &SftpTransferCancel,
     ) -> CoreResult<SftpTransferReceipt> {
+        self.download_with_options(
+            session,
+            paths,
+            remote_path,
+            selected_target,
+            SftpDownloadOptions::default(),
+            cancel,
+        )
+        .await
+    }
+
+    /// A plain download with `.part`/resume/rate-limit options; used by the
+    /// transfer queue. The caller still owns the final rename and cleanup.
+    pub async fn download_with_options(
+        &self,
+        session: &BoundSftpSession,
+        paths: &PathGuard,
+        remote_path: &RemotePath,
+        selected_target: &Path,
+        options: SftpDownloadOptions,
+        cancel: &SftpTransferCancel,
+    ) -> CoreResult<SftpTransferReceipt> {
         let local_path = paths.ensure_safe_download_target(selected_target)?;
         self.target.validate(session.target())?;
         let response = self
@@ -710,12 +746,15 @@ impl SftpService {
                     remote_path: remote_path.as_str().to_owned(),
                     local_path: local_path.clone(),
                     maximum_bytes: MAX_TRANSFER_BYTES,
+                    resume_from: options.resume_from,
+                    rate_limit_bytes_per_second: options.rate_limit_bytes_per_second,
+                    keep_partial: options.keep_partial,
                     cancel: cancel.clone(),
                 },
             )
             .await;
         if let Err(error) = self.target.validate(session.target()) {
-            if matches!(&response, Ok(SftpResponse::Transfer { .. })) {
+            if matches!(&response, Ok(SftpResponse::Transfer { .. })) && !options.keep_partial {
                 let _ = std::fs::remove_file(&local_path);
             }
             return Err(error);
@@ -729,6 +768,52 @@ impl SftpService {
             local_path: Some(local_path),
             bytes,
         })
+    }
+
+    /// The target's own `sha256sum` answer for a remote file, or `None` when
+    /// the tool is not installed — the caller must then report the download
+    /// as 未核对完整性 rather than silently skipping the check.
+    pub async fn remote_sha256(
+        &self,
+        session: &BoundSftpSession,
+        path: &RemotePath,
+    ) -> CoreResult<Option<String>> {
+        self.target.validate(session.target())?;
+        let command = format!(
+            "command -v sha256sum >/dev/null 2>&1 || exit 3; sha256sum -- {}",
+            crate::shell_escape::shq(path.as_str())
+        );
+        let output = self
+            .ssh
+            .execute(
+                session.session_id(),
+                command,
+                std::time::Duration::from_secs(30),
+            )
+            .await?;
+        self.target.validate(session.target())?;
+        if output.exit_code == Some(3) {
+            return Ok(None);
+        }
+        if output.exit_code != Some(0) || output.timed_out {
+            return Err(CoreError::ssh(
+                "verify downloaded file",
+                "remote sha256sum did not complete cleanly",
+            ));
+        }
+        let digest = output
+            .output
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        if digest.len() != 64 || !digest.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(CoreError::ssh(
+                "verify downloaded file",
+                "remote sha256sum produced an unparseable answer",
+            ));
+        }
+        Ok(Some(digest))
     }
 
     /// Collect into an already-created, read/write local file owned by the caller.
@@ -1090,7 +1175,7 @@ impl SftpPlannedOperation {
                         | SftpMutation::Remove { .. }
                         | SftpMutation::RemoveFileIfMatch { .. }
                         | SftpMutation::CreateDirectory { .. }
-                )
+                ) | SftpOperation::ExtractArchive(_)
             )
     }
 
@@ -1273,9 +1358,17 @@ impl SftpMutationExecutor {
                     Err(not_back())
                 }
             }
-            RestoreToken::AtomicWrite { .. } | RestoreToken::ExtractedDirectory { .. } => {
-                Ok("已按操作前留下的备份恢复。".to_owned())
+            RestoreToken::ExtractedDirectory { destination, .. } => {
+                // The restore guard already re-checked the marker and the
+                // whole extracted tree before deleting; here we only confirm
+                // the destination really is gone.
+                if self.service.exists(&self.session, &destination).await? {
+                    Err(not_back())
+                } else {
+                    Ok("解出的文件夹已经整个删除，并在目标机上核对过。".to_owned())
+                }
             }
+            RestoreToken::AtomicWrite { .. } => Ok("已按操作前留下的备份恢复。".to_owned()),
         }
     }
 }

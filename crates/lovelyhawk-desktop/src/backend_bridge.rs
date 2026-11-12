@@ -220,7 +220,12 @@ fn lane_for(method: &str) -> Lane {
         || method == "kubernetes.pod.terminal.open"
     {
         Lane::Terminal
-    } else if method == "sftp-browser.transfer.cancel" {
+    } else if method == "sftp-browser.transfer.cancel"
+        || method == "sftp-browser.queue.poll"
+        || method == "sftp-browser.queue.cancel-all"
+        || method == "sftp-browser.queue.retry"
+    {
+        // Queue control cannot wait behind the transfers it steers.
         Lane::Control
     } else if method.starts_with("sftp-browser.")
         || method.starts_with("emergency-command.path.")
@@ -328,6 +333,14 @@ mod tests {
             "sftp-browser.download",
             "sftp-browser.download-directory",
             "sftp-browser.upload.stage",
+            "sftp-browser.upload-directory.stage",
+            "sftp-browser.upload-directory",
+            "sftp-browser.upload-directory.discard",
+            "sftp-browser.queue.download",
+            "sftp-browser.queue.upload",
+            "sftp-browser.queue.poll",
+            "sftp-browser.queue.cancel-all",
+            "sftp-browser.queue.retry",
             "java.hot-update.class.stage",
             "application-log.export.prepare",
             "ai-history.export",
@@ -471,6 +484,16 @@ mod tests {
         }
         // A cancel cannot queue behind the transfer it is meant to stop.
         assert_eq!(lane_for("sftp-browser.transfer.cancel"), Lane::Control);
+        for method in [
+            "sftp-browser.queue.poll",
+            "sftp-browser.queue.cancel-all",
+            "sftp-browser.queue.retry",
+        ] {
+            assert_eq!(lane_for(method), Lane::Control, "{method}");
+        }
+        for method in ["sftp-browser.queue.download", "sftp-browser.queue.upload"] {
+            assert_eq!(lane_for(method), Lane::Files, "{method}");
+        }
         for action in ["poll", "cancel"] {
             assert_eq!(
                 lane_for_request("emergency.file-evidence", &json!({"action":action})),

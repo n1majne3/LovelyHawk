@@ -1,4 +1,6 @@
 import { TransientNotice } from "./NotificationCenter";
+import { DialogHost } from "./DialogHost";
+import { useConfirmDialog } from "./use-confirm-dialog";
 import { useEffect, useReducer, useRef, useState, type MouseEvent } from "react";
 
 import { errorText } from "./error-text";
@@ -13,8 +15,13 @@ import {
   isSftpStagedUpload,
   isSftpTextPreview,
   isSftpDirectoryDownloadResult,
+  isSftpDirectoryUploadPrepare,
+  isSftpDirectoryUploadResult,
   isSftpTransferResult,
   isSftpTransferCancelResult,
+  isSftpQueueEnqueueResult,
+  isSftpTransferQueue,
+  type SftpTransferQueue,
   type SftpOperationInput,
   type SftpOperationPlan,
   type SftpOperationReceipt,
@@ -111,6 +118,15 @@ export function SftpBrowserPage({
   const [transferNotice, setTransferNotice] = useState<string | null>(null);
   // The download running now, shown with a way to stop it.
   const [downloading, setDownloading] = useState<{ browserHandle: string; name: string; stage: string; cancelling: boolean } | null>(null);
+  // Files checked for the batch transfer queue; cleared on navigation and
+  // whenever the browser (target) changes.
+  const [checkedHandles, setCheckedHandles] = useState<ReadonlySet<string>>(new Set());
+  // The batch queue this window's transfers run in; null before the first
+  // enqueue and after the target changed.
+  const [queue, setQueue] = useState<SftpTransferQueue | null>(null);
+  const [queueCancelling, setQueueCancelling] = useState(false);
+  // Optional download rate limit in KiB/s; blank means unlimited.
+  const [rateLimitInput, setRateLimitInput] = useState("");
   // The open 取回本机扫描 dialog: the browser entry it fetches, never a path this page typed.
   const [localScan, setLocalScan] = useState<{
     browserHandle: string;
@@ -120,6 +136,10 @@ export function SftpBrowserPage({
     returnFocus: HTMLElement | null;
   } | null>(null);
   const [cancellingUpload, setCancellingUpload] = useState(false);
+  // The preview the operator must confirm before a directory upload writes.
+  const directoryUploadConfirm = useConfirmDialog();
+  // The plan handle of a finished directory upload while it is still undoable.
+  const [directoryUndo, setDirectoryUndo] = useState<{ planHandle: string; name: string } | null>(null);
   const transferInFlight = useRef(false);
   // Opening a window is remote work too: a double click would ask twice.
   const fileWindowInFlight = useRef(false);
@@ -163,6 +183,73 @@ export function SftpBrowserPage({
     setPendingPreview(null);
     dispatch({ type: "deactivated", scope });
   }, [enabled, scope]);
+
+  // A new listing means new entry handles: checks from the old listing can
+  // never name the same file again.
+  const currentDirectoryHandle = visibleState.directory?.directoryHandle ?? null;
+  useEffect(() => {
+    setCheckedHandles(new Set());
+  }, [currentDirectoryHandle]);
+
+  // A new browser — target switch or reopen — means the old queue's binding
+  // is gone; the backend already dropped it, drop the local copy too.
+  const currentBrowserHandle = visibleState.directory?.browserHandle ?? null;
+  useEffect(() => {
+    setQueue(null);
+    setCheckedHandles(new Set());
+  }, [currentBrowserHandle]);
+
+  // While the queue has work, poll it; a finished queue keeps its last state
+  // on screen until the operator closes the panel.
+  useEffect(() => {
+    if (queue === null || !queue.active || currentBrowserHandle === null) return;
+    let stopped = false;
+    const poll = async () => {
+      try {
+        const value = await api.pollSftpQueue(currentBrowserHandle);
+        if (stopped) return;
+        if (value === null) {
+          setQueue(null);
+        } else if (isSftpTransferQueue(value)) {
+          setQueue(value);
+        }
+      } catch {
+        // A poll hiccup keeps the last snapshot; the next tick retries.
+      }
+    };
+    let timer = 0;
+    const tick = async () => {
+      await poll();
+      if (!stopped) timer = window.setTimeout(() => void tick(), 800);
+    };
+    timer = window.setTimeout(() => void tick(), 400);
+    return () => {
+      stopped = true;
+      window.clearTimeout(timer);
+    };
+  }, [api, queue?.active, queue === null, currentBrowserHandle]);
+
+  // A running queue holds the window open in the close handshake: closing
+  // cancels every item first, then lets the window go.
+  const queueRef = useRef<{ active: boolean; browserHandle: string | null } | null>(null);
+  queueRef.current = { active: queue?.active === true, browserHandle: currentBrowserHandle };
+  useEffect(() => {
+    void api.setUnsavedChanges(queue?.active === true).catch(() => undefined);
+  }, [api, queue?.active]);
+  useEffect(() => {
+    return api.onBeforeClose(async () => {
+      const current = queueRef.current;
+      if (current !== null && current.active && current.browserHandle !== null) {
+        try {
+          await api.cancelSftpQueue(current.browserHandle);
+        } catch {
+          // The window is going away anyway; the backend drops the queue
+          // with the browser regardless of what the cancel answered.
+        }
+      }
+      return true;
+    });
+  }, [api]);
 
   useEffect(() => {
     if (!enabled || scope === null || state.scope !== scope) return;
@@ -420,6 +507,97 @@ export function SftpBrowserPage({
     dispatch({ type: "entry-selected", entryHandle });
   }
 
+  function toggleChecked(entry: SftpBrowserEntry) {
+    if (entry.kind !== "file") return;
+    setCheckedHandles((previous) => {
+      const next = new Set(previous);
+      if (next.has(entry.entryHandle)) {
+        next.delete(entry.entryHandle);
+      } else {
+        next.add(entry.entryHandle);
+      }
+      return next;
+    });
+  }
+
+  /** Parses the rate-limit field: blank is unlimited, else a KiB/s count. */
+  function parsedRateLimit(): number | null {
+    const text = rateLimitInput.trim();
+    if (text === "") return 0;
+    const value = Number.parseInt(text, 10);
+    if (!Number.isFinite(value) || value < 0) return null;
+    return value;
+  }
+
+  async function enqueueQueueDownload() {
+    if (transferInFlight.current) return;
+    const browserHandle = visibleState.directory?.browserHandle ?? null;
+    if (browserHandle === null || checkedHandles.size === 0) return;
+    const rateLimit = parsedRateLimit();
+    if (rateLimit === null) {
+      setTransferNotice("限速请输入 KiB/s 数字，留空表示不限速。");
+      return;
+    }
+    transferInFlight.current = true;
+    setTransferNotice(null);
+    try {
+      const value = await api.queueSftpDownload(browserHandle, [...checkedHandles], rateLimit);
+      if (!isSftpQueueEnqueueResult(value)) throw new Error();
+      if (value.queued && value.queue !== null) {
+        setQueue(value.queue);
+        setCheckedHandles(new Set());
+      }
+    } catch (reason) {
+      setTransferNotice(errorText(reason, "批量下载没有排上队。"));
+    } finally {
+      transferInFlight.current = false;
+    }
+  }
+
+  async function enqueueQueueUpload() {
+    if (transferInFlight.current || directory === null) return;
+    const browserHandle = directory.browserHandle;
+    transferInFlight.current = true;
+    setTransferNotice(null);
+    try {
+      const value = await api.queueSftpUpload(browserHandle, directory.directoryHandle);
+      if (!isSftpQueueEnqueueResult(value)) throw new Error();
+      if (value.queued && value.queue !== null) {
+        setQueue(value.queue);
+      }
+    } catch (reason) {
+      setTransferNotice(errorText(reason, "批量上传没有排上队。"));
+    } finally {
+      transferInFlight.current = false;
+    }
+  }
+
+  async function cancelQueue() {
+    const browserHandle = visibleState.directory?.browserHandle ?? null;
+    if (browserHandle === null || queueCancelling) return;
+    setQueueCancelling(true);
+    try {
+      await api.cancelSftpQueue(browserHandle);
+      const value = await api.pollSftpQueue(browserHandle);
+      if (value !== null && isSftpTransferQueue(value)) setQueue(value);
+    } catch (reason) {
+      setTransferNotice(errorText(reason, "未能取消队列。"));
+    } finally {
+      setQueueCancelling(false);
+    }
+  }
+
+  async function retryQueueItem(itemId: number) {
+    const browserHandle = visibleState.directory?.browserHandle ?? null;
+    if (browserHandle === null) return;
+    try {
+      const value = await api.retrySftpQueueItem(browserHandle, itemId);
+      if (isSftpTransferQueue(value)) setQueue(value);
+    } catch (reason) {
+      setTransferNotice(errorText(reason, "重试没有排上队。"));
+    }
+  }
+
   /**
    * 取回本机扫描: the row's own entry handle, or the listed directory's handle
    * when the operator asked the folder itself (blank area / toolbar with no
@@ -517,6 +695,82 @@ export function SftpBrowserPage({
   }
 
   /**
+   * "上传目录…": the host folder dialog picks a local folder, the host packs
+   * it into a bounded tar that refuses links and reparse points, and the
+   * preview's numbers come back before anything remote is written. On confirm
+   * the archive uploads to a remote temp path and extracts under
+   * `<dir>/<folder name>`; both temps go away on every outcome, and a
+   * finished upload can be undone while its receipt offers it.
+   */
+  async function uploadDirectory(entry: SftpBrowserEntry | null): Promise<void> {
+    if (transferInFlight.current) return;
+    const browserHandle = visibleState.directory?.browserHandle ?? null;
+    const directoryHandle = entry?.entryHandle ?? visibleState.directory?.directoryHandle ?? null;
+    const directoryLabel = entry?.name ?? visibleState.directory?.directoryLabel ?? "当前目录";
+    if (browserHandle === null || directoryHandle === null) return;
+    if (visibleState.directory?.degradedSftp === true) {
+      setTransferNotice("目标没有 SFTP 子系统：无法改名、调整权限、删除或做递归操作；列目录经命令回退完成，文件下载上传经 SCP 通道完成。");
+      return;
+    }
+    transferInFlight.current = true;
+    setTransferNotice(null);
+    setDirectoryUndo(null);
+    try {
+      const prepared = await api.prepareSftpDirectoryUpload(browserHandle);
+      if (!isSftpDirectoryUploadPrepare(prepared)) throw new Error();
+      if (!prepared.prepared) return;
+      const stagedHandle = prepared.stagedHandle ?? "";
+      const folderName = prepared.folderName ?? "所选文件夹";
+      const confirmed = await directoryUploadConfirm.ask(
+        "上传整个目录",
+        `将把本机文件夹“${folderName}”（${prepared.fileCount ?? "?"} 个文件，共 ` +
+        `${displaySftpBytes(prepared.totalBytes ?? "0")}）上传到 ${directoryLabel}。` +
+        `目标位置若已存在同名内容会被拒绝，不会覆盖。`,
+        "上传",
+      );
+      if (!confirmed) {
+        setTransferNotice("已取消上传。");
+        try { await api.discardSftpDirectoryUpload(stagedHandle); } catch { /* staged copy expires */ }
+        return;
+      }
+      setDownloading({
+        browserHandle,
+        name: folderName,
+        stage: "正在上传并解包",
+        cancelling: false,
+      });
+      const value = await api.runSftpDirectoryUpload(browserHandle, directoryHandle, stagedHandle);
+      if (!isSftpDirectoryUploadResult(value)) throw new Error();
+      setTransferNotice(value.detail ?? "目录上传未完成。");
+      if (value.saved && value.undoable === true && value.planHandle !== null &&
+        value.planHandle !== undefined) {
+        setDirectoryUndo({ planHandle: value.planHandle, name: folderName });
+      }
+    } catch (reason) {
+      setTransferNotice(transferStopped(reason)
+        ? "已取消上传，本机和远端的临时包都已经删除。"
+        : errorText(reason, "目录上传失败；目录可能已变化，或目标位置不可写。"));
+    } finally {
+      transferInFlight.current = false;
+      setDownloading(null);
+    }
+  }
+
+  /** Removes the freshly uploaded tree after the target re-verifies it is unchanged. */
+  async function undoDirectoryUpload(): Promise<void> {
+    const pending = directoryUndo;
+    if (pending === null) return;
+    setDirectoryUndo(null);
+    try {
+      const value = await api.undoSftpOperation(pending.planHandle);
+      if (!isSftpOperationUndoResult(value)) throw new Error();
+      setTransferNotice(value.detail);
+    } catch (reason) {
+      setTransferNotice(sftpUndoFailure(reason));
+    }
+  }
+
+  /**
    * Stops this browser's running upload or download. The transfer removes
    * what it wrote and then answers its own request, which reports the result;
    * when nothing was running yet the button simply comes back.
@@ -556,6 +810,7 @@ export function SftpBrowserPage({
     if (action === "download-directory" || action === "download-directory-extract") {
       return void downloadDirectory(entry, action === "download-directory-extract");
     }
+    if (action === "upload-directory") return void uploadDirectory(entry);
     if (action === "properties") {
       if (entry !== null) setProperties(entry);
       return;
@@ -722,6 +977,25 @@ export function SftpBrowserPage({
           onClick={() => void downloadSelected()}>
           <DownloadIcon />下载
         </button>
+        <button type="button" className="sftp-browser-action is-download" data-testid="sftp-queue-download"
+          disabled={busy || checkedHandles.size === 0 || listStale}
+          title={staleTitle ?? "把勾选的文件逐个下载到所选文件夹；同名本机文件不会被覆盖"}
+          onClick={() => void enqueueQueueDownload()}>
+          <DownloadIcon />下载所选{checkedHandles.size > 0 ? `（${checkedHandles.size}）` : ""}
+        </button>
+        <button type="button" className="sftp-browser-action is-upload" data-testid="sftp-queue-upload"
+          disabled={busy || directory === null || listStale}
+          title={staleTitle ?? "选择多个本机文件，逐个上传到当前目录"}
+          onClick={() => void enqueueQueueUpload()}>
+          <UploadIcon />批量上传
+        </button>
+        <label className="sftp-browser-rate" title="队列下载限速，留空不限速">
+          限速
+          <input type="text" inputMode="numeric" placeholder="不限" value={rateLimitInput}
+            aria-label="下载限速（KiB/s）" data-testid="sftp-rate-limit"
+            onChange={(event) => setRateLimitInput(event.target.value)} />
+          <span>KiB/s</span>
+        </label>
         {api.localScan === undefined ? null : (
           <button type="button" className="sftp-browser-action" data-testid="sftp-local-scan"
             disabled={busy || directory === null || listStale}
@@ -831,6 +1105,7 @@ export function SftpBrowserPage({
               <div className="sftp-browser-pane-body">
                 <SftpBrowserTable entries={entries} selectedHandle={visibleState.selectedEntryHandle}
                   search={visibleState.search} busy={busy} onSelect={selectEntry}
+                  checkedHandles={checkedHandles} onToggleCheck={toggleChecked}
                   onBrowse={(entryHandle) => requestDirectory(entryHandle)}
                   onContextMenu={openMenu} />
               </div>
@@ -864,6 +1139,50 @@ export function SftpBrowserPage({
               of the pane to show a few wrapped lines of a file — the file now
               opens in a window of its own, where it can be read and edited at
               a usable size. */}
+          {queue === null ? null : (
+            <section className="sftp-queue" aria-label="传输队列" data-testid="sftp-transfer-queue">
+              <header className="sftp-queue-head">
+                <strong>传输队列</strong>
+                {queue.degraded ? (
+                  <span className="sftp-queue-note">目标没有 SFTP：逐项经 SCP 传输，下载无法续传。</span>
+                ) : null}
+                {queue.active ? (
+                  <button type="button" disabled={queueCancelling} data-testid="sftp-queue-cancel"
+                    onClick={() => void cancelQueue()}>
+                    {queueCancelling ? "正在取消…" : "全部取消"}
+                  </button>
+                ) : (
+                  <button type="button" data-testid="sftp-queue-dismiss" onClick={() => setQueue(null)}>
+                    关闭
+                  </button>
+                )}
+              </header>
+              <ul className="sftp-queue-items">
+                {queue.items.map((item) => (
+                  <li key={item.itemId} className={`sftp-queue-item is-${item.state}`}
+                    data-testid={`sftp-queue-item-${item.state}`}>
+                    <span className="sftp-queue-item-name" title={item.name}>{item.name}</span>
+                    <span className="sftp-queue-item-state">
+                      {item.state === "queued" ? "排队中"
+                        : item.state === "running"
+                          ? `传输中 ${compactSftpBytes(item.doneBytes)}/${compactSftpBytes(item.totalBytes)}`
+                          : item.state === "done" ? "完成"
+                            : item.state === "failed" ? "失败" : "已取消"}
+                    </span>
+                    {item.detail !== "" ? (
+                      <span className="sftp-queue-item-detail" title={item.detail}>{item.detail}</span>
+                    ) : null}
+                    {item.state === "failed" || item.state === "cancelled" ? (
+                      <button type="button" data-testid={`sftp-queue-retry-${item.itemId}`}
+                        onClick={() => void retryQueueItem(item.itemId)}>
+                        重试
+                      </button>
+                    ) : null}
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
           {downloading === null ? null : (
             <p className="sftp-browser-transfer is-running" role="status">
               <span>{downloading.stage} {downloading.name}…</span>
@@ -875,12 +1194,19 @@ export function SftpBrowserPage({
                     if (!reached) setDownloading((now) => now === null ? null : { ...now, cancelling: false });
                   });
                 }}>
-                {downloading.cancelling ? "正在取消…" : "取消下载"}
+                {downloading.cancelling ? "正在取消…" : downloading.stage.includes("上传") ? "取消上传" : "取消下载"}
               </button>
             </p>
           )}
           {transferNotice === null || downloading !== null ? null : (
             <TransientNotice source="文件传输" message={transferNotice ?? ""} severity="info"><p className="sftp-browser-transfer" role="status">{transferNotice}</p></TransientNotice>
+          )}
+          {directoryUndo === null || downloading !== null ? null : (
+            <button type="button" className="sftp-browser-action" data-testid="sftp-undo-directory-upload"
+              title={`撤销刚才上传的 ${directoryUndo.name}，目标机会先核对内容未变再整个删除`}
+              onClick={() => void undoDirectoryUpload()}>
+              <TrashIcon />撤销这次目录上传
+            </button>
           )}
           {windowError === null ? null : (
             <TransientNotice source="文件传输" message={windowError ?? ""} severity="error"><p className="sftp-browser-transfer is-error" role="alert" data-testid="sftp-window-error">{windowError}</p></TransientNotice>
@@ -911,6 +1237,9 @@ export function SftpBrowserPage({
           onChmod={() => startOperation("chmod", properties)}
           onClose={() => setProperties(null)}
         />
+      )}
+      {directoryUploadConfirm.dialog === null ? null : (
+        <DialogHost dialog={directoryUploadConfirm.dialog} onResolve={directoryUploadConfirm.resolve} />
       )}
       {draft === null ? null : (
             <SftpOperationDialog
@@ -978,6 +1307,8 @@ export function SftpBrowserTable({
   onSelect,
   onBrowse,
   onContextMenu,
+  checkedHandles,
+  onToggleCheck,
 }: {
   entries: SftpBrowserEntry[];
   selectedHandle: string | null;
@@ -986,6 +1317,8 @@ export function SftpBrowserTable({
   onSelect: (entryHandle: string) => void;
   onBrowse: (entryHandle: string) => void;
   onContextMenu?: (event: MouseEvent, entry: SftpBrowserEntry | null) => void;
+  checkedHandles?: ReadonlySet<string>;
+  onToggleCheck?: (entry: SftpBrowserEntry) => void;
 }) {
   return (
     <div className="sftp-browser-rows" role="list"
@@ -1017,6 +1350,29 @@ export function SftpBrowserTable({
           }}
         >
           <span className="sftp-browser-row-name">
+            {entry.kind === "file" && onToggleCheck !== undefined ? (
+              <span
+                role="checkbox"
+                aria-checked={checkedHandles?.has(entry.entryHandle) === true}
+                aria-label={`勾选 ${entry.name} 加入批量传输`}
+                tabIndex={0}
+                className="sftp-browser-row-check"
+                data-testid={`sftp-check-${entry.name}`}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onToggleCheck(entry);
+                }}
+                onKeyDown={(event) => {
+                  if (event.key === " " || event.key === "Enter") {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    onToggleCheck(entry);
+                  }
+                }}
+              >
+                {checkedHandles?.has(entry.entryHandle) === true ? "☑" : "☐"}
+              </span>
+            ) : null}
             <span className={`sftp-browser-row-kind is-${entry.kind}`}>
               <EntryKindIcon kind={entry.kind} />
             </span>
