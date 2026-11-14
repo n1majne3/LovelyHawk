@@ -313,7 +313,9 @@ impl SystemInfoService {
         let new_field = planned_field(&field, &new_hash)?;
         let preserved = field.starts_with('!');
         let session_warning = if snapshot.username == snapshot.session_username {
-            "这是当前 SSH 登录账户：改口令不影响已建立的连接，但下次登录和本机保存的连接口令都要用新口令。"
+            "这是当前 SSH 登录账户：改口令不影响已建立的连接，但下次登录和本机保存的连接口令都要用新口令。可能影响远程接入或对外业务，请确认仍有其他接入方式。"
+        } else if snapshot.username == "root" {
+            "改口令可能使依赖该账户口令登录的服务、计划任务或自动化失效。可能影响远程接入或对外业务，请确认仍有其他接入方式。"
         } else {
             "改口令可能使依赖该账户口令登录的服务、计划任务或自动化失效，执行前请确认影响范围。"
         };

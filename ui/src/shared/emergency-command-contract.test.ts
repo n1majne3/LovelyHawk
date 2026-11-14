@@ -10,6 +10,8 @@ import {
   isEmergencyPathBatchPlan,
   isEmergencyPathBatchStep,
   isEmergencyPathDetail,
+  isEmergencyPathLinesPlan,
+  isEmergencyPathLinesPreview,
   isEmergencyPathPlan,
   isEmergencyPathReceipt,
   isEmergencyPathUndoResult,
@@ -247,15 +249,15 @@ describe("emergency command contract", () => {
     })).toBe(false);
   });
 
-  it("declares exactly fourteen finite methods and no raw execution arguments", () => {
+  it("declares exactly sixteen finite methods and no raw execution arguments", () => {
     const source = readFileSync(new URL("./emergency-command-contract.ts", import.meta.url), "utf8");
     const apiStart = source.indexOf("export interface EmergencyCommandApi");
     const api = source.slice(apiStart, source.indexOf("\n}\n", apiStart));
-    // Fourteen methods: eleven fit on one line; planEmergencyPathAction,
-    // planEmergencyPathBatch and runEmergencyCommand do not — the latter since
-    // it gained the container it may be pointed at.
-    expect(api.match(/^  [a-zA-Z][A-Za-z]*\(/gmu)).toHaveLength(14);
-    expect(api.match(/^\s{2}[a-zA-Z].*Promise<(?:unknown|void)>;/gmu)).toHaveLength(11);
+    // Sixteen methods: twelve fit on one line; planEmergencyPathAction,
+    // planEmergencyPathBatch, planEmergencyPathLines and runEmergencyCommand
+    // do not — the latter since it gained the container it may be pointed at.
+    expect(api.match(/^  [a-zA-Z][A-Za-z]*\(/gmu)).toHaveLength(16);
+    expect(api.match(/^\s{2}[a-zA-Z].*Promise<(?:unknown|void)>;/gmu)).toHaveLength(12);
     expect(api).toContain("loadEmergencyCommandCatalog(bindingHandle: string)");
     // Optional, and the only thing it may be besides absent is a handle: the
     // renderer cannot name a container by id or by name.
@@ -276,8 +278,8 @@ describe("emergency command contract", () => {
     expect(api).toContain("confirmEmergencyPathBatch(bindingHandle: string, batchHandle: string)");
     expect(api).toContain("stepEmergencyPathBatch(bindingHandle: string, batchHandle: string)");
     expect(api).toContain("cancelEmergencyPathBatch(bindingHandle: string, batchHandle: string)");
-    // Every parameter is a handle or the closed action name. A window cannot
-    // put a path of its own into any of these.
+    // Every parameter is a handle, a bounded line number, or the closed
+    // action name. A window cannot put a path of its own into any of these.
     expect(api).not.toMatch(/\b(?:commandId|family|sessionId|generation|guard|host|shell|commandText)\b/u);
     expect(api).not.toMatch(/path: string/u);
   });
@@ -286,7 +288,7 @@ describe("emergency command contract", () => {
     const named = {
       ...result,
       output: "-rwsr-xr-x 1 root root 125688 Jan  1  2024 /usr/local/bin/.sysd\nplain evidence",
-      paths: [{ pathHandle: "path-opaque", line: 0, path: "/usr/local/bin/.sysd" }],
+      paths: [{ pathHandle: "path-opaque", line: 0, path: "/usr/local/bin/.sysd", lineEditable: false, xinetdService: false }],
     };
     expect(isEmergencyCommandResult(named)).toBe(true);
     // A mark past the end of the output, or on a line that does not mention
@@ -296,7 +298,7 @@ describe("emergency command contract", () => {
     // Two offers on one line, or one handle reused, cannot both be acted on.
     expect(isEmergencyCommandResult({
       ...named,
-      paths: [named.paths[0], { pathHandle: "other-opaque", line: 0, path: "/usr/local/bin/.sysd" }],
+      paths: [named.paths[0], { pathHandle: "other-opaque", line: 0, path: "/usr/local/bin/.sysd", lineEditable: false, xinetdService: false }],
     })).toBe(false);
     expect(isEmergencyCommandResult({ ...named, paths: [{ ...named.paths[0], path: "relative" }] })).toBe(false);
     expect(isEmergencyCommandResult({ ...named, paths: [{ ...named.paths[0], path: "" }] })).toBe(false);
@@ -515,5 +517,58 @@ describe("emergency command contract", () => {
     expect(isEmergencyPathBatchStep({
       batchHandle: "batch-1", receipt, remaining: 0, refused: 0, finished: true, extra: 1,
     })).toBe(false);
+  });
+
+  it("accepts a bounded lines preview and a contiguous removal list, and refuses everything else", () => {
+    const preview = {
+      previewHandle: "preview-one", pathHandle: "path-opaque", path: "/etc/crontab",
+      totalLines: 3, truncated: false,
+      lines: [
+        { number: 1, text: "one", clipped: false },
+        { number: 2, text: "", clipped: false },
+        { number: 3, text: "three", clipped: true },
+      ],
+    };
+    expect(isEmergencyPathLinesPreview(preview)).toBe(true);
+    // A truncated preview must name exactly the displayed cap of lines.
+    expect(isEmergencyPathLinesPreview({ ...preview, truncated: true })).toBe(false);
+    // Numbering must be the file's own sequence, controls never display.
+    expect(isEmergencyPathLinesPreview({
+      ...preview, lines: preview.lines.map((line) => ({ ...line, number: line.number + 1 })),
+    })).toBe(false);
+    expect(isEmergencyPathLinesPreview({
+      ...preview, lines: [{ ...preview.lines[0], text: "esc[31m" }],
+    })).toBe(false);
+    expect(isEmergencyPathLinesPreview({ ...preview, extra: 1 })).toBe(false);
+    expect(isEmergencyPathLinesPreview({ ...preview, previewHandle: "preview two" })).toBe(false);
+
+    const plan = {
+      planHandle: "plan-one", pathHandle: "path-opaque", path: "/etc/crontab",
+      action: "delete-lines", summary: "删除 /etc/crontab 第 2 行", dangerous: true,
+      restoreDescription: "放回删除前的完整文件", state: "planned", expiresInSeconds: 300,
+      residue: null,
+      removedLines: [{ number: 2, text: "", clipped: false }],
+    };
+    expect(isEmergencyPathLinesPlan(plan)).toBe(true);
+    // A lines plan only exists for the delete action, never for another label.
+    expect(isEmergencyPathLinesPlan({ ...plan, action: "disarm" })).toBe(false);
+    expect(isEmergencyPathPlan(plan)).toBe(false);
+    // The removal list stays bounded and contiguous: a gap or a forged extra
+    // line is a different delete than the operator approved.
+    expect(isEmergencyPathLinesPlan({
+      ...plan,
+      removedLines: [
+        { number: 2, text: "a", clipped: false },
+        { number: 4, text: "b", clipped: false },
+      ],
+    })).toBe(false);
+    expect(isEmergencyPathLinesPlan({ ...plan, removedLines: [] })).toBe(false);
+    expect(isEmergencyPathLinesPlan({
+      ...plan,
+      removedLines: Array.from({ length: 201 }, (_, index) => ({
+        number: index + 1, text: "x", clipped: false,
+      })),
+    })).toBe(false);
+    expect(isEmergencyPathLinesPlan({ ...plan, removedLines: undefined })).toBe(false);
   });
 });

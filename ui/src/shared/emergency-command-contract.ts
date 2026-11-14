@@ -5,7 +5,10 @@ export const emergencyCommandResultKinds = [
   "success", "empty", "non-zero", "timeout", "missing-command", "permission-denied", "unknown-exit",
 ] as const;
 
-export const emergencyPathActions = ["disarm", "quarantine", "remove-capabilities", "restore-residue"] as const;
+export const emergencyPathActions = [
+  "disarm", "quarantine", "remove-capabilities", "restore-residue", "delete-lines",
+  "disable-xinetd-service",
+] as const;
 
 export type EmergencyCommandCategory = typeof emergencyCommandCategories[number];
 export type EmergencyCommandResultKind = typeof emergencyCommandResultKinds[number];
@@ -77,6 +80,10 @@ export interface EmergencyCommandPathOffer {
   /** Which displayed output line this path was read from. */
   line: number;
   path: string;
+  /** Whether the path sits in the line-delete allow-list, so the menu only offers it where it can apply. */
+  lineEditable: boolean;
+  /** Whether the path is a file xinetd would load, so the menu only offers the service action there. */
+  xinetdService: boolean;
 }
 
 export interface EmergencyCommandResult {
@@ -151,6 +158,36 @@ export interface EmergencyPathPlan {
   residue: EmergencyPathResiduePlan | null;
 }
 
+/** One display-safe line of a file preview or a removal list. */
+export interface EmergencyPathLine {
+  number: number;
+  /** Lossy text with control characters flattened; display only. */
+  text: string;
+  clipped: boolean;
+}
+
+/**
+ * The numbered, sanitized lines of a managed file. The preview handle binds
+ * the digest of exactly these bytes server-side; it never leaves the backend.
+ */
+export interface EmergencyPathLinesPreview {
+  previewHandle: string;
+  pathHandle: string;
+  path: string;
+  totalLines: number;
+  lines: EmergencyPathLine[];
+  /** The file has more lines than `lines` carries. */
+  truncated: boolean;
+}
+
+/**
+ * A line-deletion plan: the same fields a path plan carries, plus the exact
+ * lines the delete would take out so the confirmation lists all of them.
+ */
+export interface EmergencyPathLinesPlan extends EmergencyPathPlan {
+  removedLines: EmergencyPathLine[];
+}
+
 /** What happened, after the target was checked. */
 export interface EmergencyPathReceipt {
   planHandle: string;
@@ -184,6 +221,22 @@ export interface EmergencyCommandApi {
     bindingHandle: string,
     pathHandle: string,
     action: EmergencyPathAction,
+  ): Promise<unknown>;
+  /**
+   * The numbered lines of a managed startup or cron file, for picking the
+   * range to delete. Refused for any other path kind or location.
+   */
+  previewEmergencyPathLines(bindingHandle: string, pathHandle: string): Promise<unknown>;
+  /**
+   * Plans a contiguous-line delete bound to the preview the range was picked
+   * on. The returned plan is confirmed and executed through the same calls
+   * every other path plan uses.
+   */
+  planEmergencyPathLines(
+    bindingHandle: string,
+    previewHandle: string,
+    firstLine: number,
+    lastLine: number,
   ): Promise<unknown>;
   confirmEmergencyPathAction(bindingHandle: string, planHandle: string): Promise<unknown>;
   executeEmergencyPathAction(bindingHandle: string, planHandle: string): Promise<unknown>;
@@ -404,9 +457,10 @@ function offeredPath(value: unknown): value is string {
 }
 
 function pathOffer(value: unknown): value is EmergencyCommandPathOffer {
-  return record(value) && exact(value, ["pathHandle", "line", "path"]) &&
+  return record(value) && exact(value, ["pathHandle", "line", "path", "lineEditable", "xinetdService"]) &&
     isEmergencyCommandOpaqueHandle(value.pathHandle) && unsigned(value.line, 1_999) &&
-    offeredPath(value.path);
+    offeredPath(value.path) && typeof value.lineEditable === "boolean" &&
+    typeof value.xinetdService === "boolean";
 }
 
 export function isEmergencyCommandResult(value: unknown): value is EmergencyCommandResult {
@@ -494,6 +548,48 @@ export function isEmergencyPathPlan(value: unknown): value is EmergencyPathPlan 
     typeof value.state === "string" && planStateSet.has(value.state) &&
     unsigned(value.expiresInSeconds, 300) && value.expiresInSeconds > 0 &&
     (value.residue === null || residuePlan(value.residue));
+}
+
+const MAX_PREVIEW_LINES = 5_000;
+const MAX_LINE_TEXT_BYTES = 512;
+
+function previewLine(value: unknown): value is EmergencyPathLine {
+  return record(value) && exact(value, ["number", "text", "clipped"]) &&
+    unsigned(value.number, 4_294_967_295) && value.number > 0 &&
+    // Empty display lines exist; blank file lines do. Controls still refuse.
+    text(value.text, MAX_LINE_TEXT_BYTES) && !/[ -]/u.test(value.text) &&
+    typeof value.clipped === "boolean";
+}
+
+export function isEmergencyPathLinesPreview(value: unknown): value is EmergencyPathLinesPreview {
+  return record(value) && exact(value, [
+    "previewHandle", "pathHandle", "path", "totalLines", "lines", "truncated",
+  ]) && isEmergencyCommandOpaqueHandle(value.previewHandle) &&
+    isEmergencyCommandOpaqueHandle(value.pathHandle) && offeredPath(value.path) &&
+    unsigned(value.totalLines, 4_294_967_295) &&
+    Array.isArray(value.lines) && value.lines.length <= MAX_PREVIEW_LINES &&
+    (value.lines as unknown[]).every(previewLine) &&
+    (value.lines as EmergencyPathLine[]).every((line, index) => line.number === index + 1) &&
+    value.totalLines >= (value.lines as unknown[]).length &&
+    typeof value.truncated === "boolean" &&
+    // A truncated preview must actually be at the cap; an untruncated one names them all.
+    (value.truncated ? (value.lines as unknown[]).length === MAX_PREVIEW_LINES
+      : value.totalLines === (value.lines as unknown[]).length);
+}
+
+export function isEmergencyPathLinesPlan(value: unknown): value is EmergencyPathLinesPlan {
+  if (!record(value) || !exact(value, [
+    "planHandle", "pathHandle", "path", "action", "summary", "dangerous", "restoreDescription",
+    "state", "expiresInSeconds", "residue", "removedLines",
+  ]) || value.action !== "delete-lines") return false;
+  const { removedLines: lines, ...plan } = value;
+  return isEmergencyPathPlan(plan) && Array.isArray(lines) && lines.length >= 1 &&
+    lines.length <= 200 && lines.every(previewLine) &&
+    // The removal list must stay contiguous, exactly the range it names.
+    ((removed) => {
+      const head = removed[0];
+      return head !== undefined && removed.every((line, index) => line.number === head.number + index);
+    })(lines as EmergencyPathLine[]);
 }
 
 export function isEmergencyPathReceipt(value: unknown): value is EmergencyPathReceipt {

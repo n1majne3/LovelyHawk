@@ -217,7 +217,7 @@ describe("LogAnalysisPage", () => {
       modified: "today",
       pathHandle: "path-a",
     };
-    expect(logEvidenceOffer(listed)).toEqual({ pathHandle: "path-a", line: 0, path: "/var/log/auth.log" });
+    expect(logEvidenceOffer(listed)).toEqual({ pathHandle: "path-a", line: 0, path: "/var/log/auth.log", lineEditable: false, xinetdService: false });
     expect(logEvidenceOffer({ ...listed, pathHandle: null })).toBeNull();
     expect(logEvidenceOffer({
       ...listed, kind: "journal", sizeBytes: null, modified: "", pathHandle: "path-j",

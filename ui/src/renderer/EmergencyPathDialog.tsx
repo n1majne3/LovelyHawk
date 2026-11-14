@@ -34,6 +34,8 @@ const ACTION_LABELS: Record<EmergencyPathAction, string> = {
   quarantine: "隔离",
   "remove-capabilities": "移除文件能力",
   "restore-residue": "用残留恢复",
+  "delete-lines": "删除指定行",
+  "disable-xinetd-service": "停用 xinetd 服务",
 };
 
 const ACTION_INTENT: Record<EmergencyPathAction, string> = {
@@ -43,6 +45,10 @@ const ACTION_INTENT: Record<EmergencyPathAction, string> = {
     "清除这个文件的 Linux 能力集（如 cap_setuid）。文件保留，但依赖这些能力提权的用法不再生效；本来需要它的正常程序可能无法工作。",
   "restore-residue":
     "把同目录下找到的备份残留内容写回这个命令。当前内容先在同目录留底（仅属主可读），写回后逐字节核对，再做软件包校验并试跑一次；包校验和试跑只是参考，能运行不代表可信，残留与软件包有差异也不一定异常。",
+  "delete-lines":
+    "从文件中彻底移除所选行，文件中不再保留该行原文；要留痕迹便于回看请改用注释。写入前会把整份文件备份到同目录的 .lovelyres-backups/。",
+  "disable-xinetd-service":
+    "把这个服务文件移出 xinetd 的加载目录并通知 xinetd 重新加载，服务随之停止。文件在同目录的 .lovelyres-backups/ 留底，xinetd 不会读回它；复核未通过时文件仍保持隔离，可再撤销放回。",
 };
 
 const UNDO_EFFECT: Record<EmergencyPathAction, string> = {
@@ -50,6 +56,8 @@ const UNDO_EFFECT: Record<EmergencyPathAction, string> = {
   quarantine: "撤销会把文件从备份目录移回原路径。原路径会重新出现这个文件，可以再被运行或加载。",
   "remove-capabilities": "撤销会把移除前记录的能力集写回这个文件，依赖它的提权功能重新生效。",
   "restore-residue": "撤销会把留底里保存的原内容写回这个命令，并删除该留底。",
+  "delete-lines": "撤销会在文件仍是删除后内容的前提下，把删除前的完整文件从备份放回原路径，被删的行会重新生效。",
+  "disable-xinetd-service": "撤销会把服务文件放回 /etc/xinetd.d 并重新加载 xinetd，该服务重新启用并重新开始监听。",
 };
 
 /**
@@ -230,7 +238,10 @@ export function EmergencyPathOutcome({
   onUndo: () => void;
   onClose: () => void;
 }) {
-  const offerUndo = receipt.passed && receipt.undoable && !undoSpent;
+  // Undo rides the receipt's own flag rather than success: the xinetd
+  // disable deliberately keeps the file isolated when verification cannot
+  // confirm the port closed, and undo is exactly the way back.
+  const offerUndo = receipt.undoable && !undoSpent;
   const keepRef = useRef<HTMLButtonElement>(null);
   const askRef = useRef<HTMLButtonElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
@@ -259,7 +270,11 @@ export function EmergencyPathOutcome({
           {receipt.passed || receipt.untouched ? null : (
             <div>
               <dt>是否已还原</dt>
-              <dd>{receipt.restored ? "已还原到操作前的状态" : "未能自动还原，请手动检查"}</dd>
+              <dd>{receipt.restored
+                ? "已还原到操作前的状态"
+                : receipt.undoable
+                  ? "文件按应急处置保持隔离未放回，可用下方撤销放回"
+                  : "未能自动还原，请手动检查"}</dd>
             </div>
           )}
         </dl>

@@ -65,7 +65,7 @@ export function groupLogSources(sources: readonly LogSource[]): LogSourceGroup[]
  */
 export function logEvidenceOffer(source: LogSource): EmergencyCommandPathOffer | null {
   if (source.kind !== "file" || source.pathHandle === null) return null;
-  return { pathHandle: source.pathHandle, line: 0, path: source.displayLocation };
+  return { pathHandle: source.pathHandle, line: 0, path: source.displayLocation, lineEditable: false, xinetdService: false };
 }
 
 export function isArchivedLog(source: Pick<LogSource, "displayLocation">): boolean {

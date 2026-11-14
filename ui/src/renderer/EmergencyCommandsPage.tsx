@@ -1,4 +1,4 @@
-import { useEffect, useReducer, useRef, useState } from "react";
+import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 
 import { targetFailureMessage } from "./target-lost";
 
@@ -47,9 +47,12 @@ import {
   type EmergencyCommandLoadStatus,
 } from "./emergency-command-state";
 import { EmergencyPathDialog, EmergencyPathProperties } from "./EmergencyPathDialog";
+import { EmergencyPathLinesDialog } from "./EmergencyPathLinesDialog";
 import { EmergencyPathMenu } from "./EmergencyPathMenu";
 import { useEmergencyPathActions } from "./emergency-path-actions";
 import { EmergencyPathBatchDialog } from "./EmergencyPathBatchDialog";
+import { ProcessWatchPanel } from "./ProcessWatchPanel";
+import type { ProcessWatchApi } from "../shared/process-watch-contract";
 import { FileEvidenceDialog } from "./FileEvidenceDialog";
 import type { FileEvidenceApi } from "../shared/file-evidence-contract";
 import { LocalScanDialog } from "./LocalScanDialog";
@@ -62,7 +65,7 @@ import "./emergency-path.css";
 
 export interface EmergencyCommandsPageProps {
   bindingHandle: string | null;
-  api: EmergencyCommandApi & FileEvidenceApi & LocalScanApi;
+  api: EmergencyCommandApi & FileEvidenceApi & LocalScanApi & ProcessWatchApi;
   /** Clipboard bridge; the result view's 复制 buttons are hidden without it. */
   writeClipboard?: ((text: string) => Promise<void>) | undefined;
   /**
@@ -93,7 +96,14 @@ export function EmergencyCommandsPage({ bindingHandle, api, writeClipboard, reru
   // Handles picked for the batch dialog. A target switch or a new bridge
   // must not carry a selection minted for another target.
   const [batchHandles, setBatchHandles] = useState<readonly string[] | null>(null);
-  useEffect(() => { setEvidence(null); setLocalScan(null); setBatchHandles(null); }, [api, bindingHandle]);
+  const [processWatch, setProcessWatch] = useState<{ binding: string; returnFocus: HTMLElement | null } | null>(null);
+  // The last watch of this connection, so closing the panel to look at a
+  // workbench entry does not lose a result that is still kept.
+  const [lastWatch, setLastWatch] = useState<{ binding: string; handle: string } | null>(null);
+  const rememberWatch = useCallback((handle: string | null) => {
+    setLastWatch(handle !== null && bindingHandle !== null ? { binding: bindingHandle, handle } : null);
+  }, [bindingHandle]);
+  useEffect(() => { setEvidence(null); setLocalScan(null); setBatchHandles(null); setProcessWatch(null); setLastWatch(null); }, [api, bindingHandle]);
   const [state, dispatch] = useReducer(emergencyCommandReducer, undefined, createEmergencyCommandState);
   const [refreshVersion, setRefreshVersion] = useState(0);
   const [runVersion, setRunVersion] = useState(0);
@@ -448,6 +458,19 @@ export function EmergencyCommandsPage({ bindingHandle, api, writeClipboard, reru
               这台机器没能及时报出自己是什么系统，下面给的是通用命令，比按发行版挑的要粗一些。可以重新加载再试。
             </span>
           )}
+          <button type="button" className="emergency-commands-watch"
+            disabled={bindingHandle === null}
+            title="连续监视一段时间里新出现的进程，发现两次检查之间的活动。不向目标写入任何文件。"
+            data-testid="process-watch-open"
+            onClick={() => {
+              if (bindingHandle === null) return;
+              setProcessWatch({
+                binding: bindingHandle,
+                returnFocus: document.activeElement instanceof HTMLElement ? document.activeElement : null,
+              });
+            }}>
+            进程活动监视
+          </button>
           <button type="button" className="emergency-commands-iocs"
             disabled={!current || state.catalog === null || state.iocStatus === "loading"}
             title="汇总这次命令列表下已运行检查输出里的地址线索（IP、域名、URL），供人工核查，不是确认的入侵指标。"
@@ -541,6 +564,18 @@ export function EmergencyCommandsPage({ bindingHandle, api, writeClipboard, reru
           }
         }}
         onDismiss={pathActions.dismissMenu} />}
+      {processWatch !== null && processWatch.binding === bindingHandle ? <ProcessWatchPanel
+        key={processWatch.binding} api={api} bindingHandle={processWatch.binding}
+        writeClipboard={writeClipboard} returnFocus={processWatch.returnFocus}
+        resumeHandle={lastWatch !== null && lastWatch.binding === processWatch.binding ? lastWatch.handle : null}
+        onWatchHandle={rememberWatch}
+        onOpenEntry={(title) => {
+          const entry = state.catalog?.commands.find((command) => command.title === title);
+          if (entry === undefined) return;
+          setProcessWatch(null);
+          dispatch({ type: "command-selected", commandHandle: entry.commandHandle });
+        }}
+        onClose={() => setProcessWatch(null)} /> : null}
       {batchHandles !== null && bindingHandle !== null ? <EmergencyPathBatchDialog
         key={bindingHandle} api={api} bindingHandle={bindingHandle} pathHandles={batchHandles}
         onClose={() => setBatchHandles(null)} /> : null}
@@ -570,6 +605,20 @@ export function EmergencyCommandsPage({ bindingHandle, api, writeClipboard, reru
         onConfirm={() => void pathActions.confirm()}
         onUndo={() => void pathActions.undo()}
         onClose={pathActions.close} />)}
+      {pathActions.lines !== null && <EmergencyPathLinesDialog
+        path={pathActions.lines.offer.path}
+        preview={pathActions.lines.preview}
+        plan={pathActions.lines.plan}
+        receipt={pathActions.lines.receipt}
+        undo={pathActions.lines.undo}
+        undoSpent={pathActions.lines.undoSpent}
+        busy={pathActions.lines.busy}
+        error={pathActions.lines.error}
+        onPlan={(first, last) => void pathActions.planLines(first, last)}
+        onBack={pathActions.backToLines}
+        onConfirm={() => void pathActions.confirm()}
+        onUndo={() => void pathActions.undo()}
+        onClose={pathActions.close} />}
       {(state.iocStatus !== "idle" || state.iocReport !== null) && scope !== null && (
         <EmergencyIocPanel
           status={state.iocStatus}

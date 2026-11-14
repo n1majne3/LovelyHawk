@@ -39,6 +39,7 @@ mod packet_capture_live_api;
 mod pcap_offline_api;
 mod port_forward_api;
 mod postgresql_runtime_api;
+mod process_watch_api;
 mod settings_api;
 mod sftp_browser_api;
 mod ssh_api;
@@ -120,6 +121,9 @@ use crate::{
     pcap_offline_api::{PcapOfflineApi, PcapOfflineError},
     port_forward_api::{PortForwardApi, PortForwardApiError},
     postgresql_runtime_api::{PostgresqlRuntimeApi, PostgresqlRuntimeRequest},
+    process_watch_api::{
+        ProcessWatchApi, ProcessWatchApiError, ProcessWatchStartInput, ProcessWatchUploadInput,
+    },
     settings_api::{
         SettingsAiApiKeyReplacementInput, SettingsApi, SettingsApiError, SettingsSaveInput,
     },
@@ -244,6 +248,7 @@ pub struct BackendState {
     packet_capture_evidence: PacketCaptureEvidenceApi,
     pcap_offline: PcapOfflineApi,
     packet_capture_live: PacketCaptureLiveApi,
+    process_watch: ProcessWatchApi,
     port_forward: PortForwardApi,
     ssh: Arc<SshApi>,
     settings: SettingsApi,
@@ -362,6 +367,7 @@ impl BackendState {
             PacketCaptureEvidenceApi::new(services.clone(), Arc::clone(&ssh));
         let pcap_offline = PcapOfflineApi::new(packet_capture_evidence.clone());
         let packet_capture_live = PacketCaptureLiveApi::new(services.clone(), Arc::clone(&ssh));
+        let process_watch = ProcessWatchApi::new(services.clone(), Arc::clone(&ssh));
         let port_forward = PortForwardApi::new(services.clone(), Arc::clone(&ssh));
         let settings = SettingsApi::new(&services);
         let system_info = SystemInfoApi::new(services.clone(), Arc::clone(&ssh));
@@ -407,6 +413,7 @@ impl BackendState {
             packet_capture_evidence,
             pcap_offline,
             packet_capture_live,
+            process_watch,
             port_forward,
             ssh,
             settings,
@@ -876,6 +883,9 @@ impl BackendState {
                             self.packet_capture_evidence
                                 .close_binding(&params.binding_handle);
                             self.packet_capture_live
+                                .close_binding(&params.binding_handle)
+                                .await;
+                            self.process_watch
                                 .close_binding(&params.binding_handle)
                                 .await;
                             self.ssh
@@ -1892,6 +1902,35 @@ impl BackendState {
                     Err(failure) => Err(failure),
                 }
             }
+            RpcMethod::EmergencyCommandPathLines => {
+                match parse_params::<EmergencyCommandPathParams>(request.params) {
+                    Ok(params) => self
+                        .emergency_command
+                        .paths()
+                        .preview_lines(&params.binding_handle, &params.path_handle)
+                        .await
+                        .map(to_value)
+                        .map_err(emergency_path_failure),
+                    Err(failure) => Err(failure),
+                }
+            }
+            RpcMethod::EmergencyCommandPathPlanLines => {
+                match parse_params::<EmergencyCommandPathPlanLinesParams>(request.params) {
+                    Ok(params) => self
+                        .emergency_command
+                        .paths()
+                        .plan_lines(
+                            &params.binding_handle,
+                            &params.preview_handle,
+                            params.first_line,
+                            params.last_line,
+                        )
+                        .await
+                        .map(to_value)
+                        .map_err(emergency_path_failure),
+                    Err(failure) => Err(failure),
+                }
+            }
             RpcMethod::EmergencyCommandPathConfirm => {
                 match parse_params::<EmergencyCommandPathPlanHandleParams>(request.params) {
                     Ok(params) => self
@@ -2437,6 +2476,142 @@ impl BackendState {
                         .await
                         .map(to_value)
                         .map_err(packet_capture_live_failure),
+                    Err(failure) => Err(failure),
+                }
+            }
+            RpcMethod::ProcessWatchProbe => {
+                match parse_params::<ProcessWatchBindingParams>(request.params) {
+                    Ok(params) => self
+                        .process_watch
+                        .probe(&params.binding_handle)
+                        .await
+                        .map(to_value)
+                        .map_err(process_watch_failure),
+                    Err(failure) => Err(failure),
+                }
+            }
+            RpcMethod::ProcessWatchStart => {
+                match parse_params::<ProcessWatchStartParams>(request.params) {
+                    Ok(params) => self
+                        .process_watch
+                        .start(&params.binding_handle, params.input)
+                        .await
+                        .map(to_value)
+                        .map_err(process_watch_failure),
+                    Err(failure) => Err(failure),
+                }
+            }
+            RpcMethod::ProcessWatchPoll => {
+                match parse_params::<ProcessWatchPollParams>(request.params) {
+                    Ok(params) => self
+                        .process_watch
+                        .poll(
+                            &params.binding_handle,
+                            &params.watch_handle,
+                            params.cursor,
+                            params.limit,
+                        )
+                        .await
+                        .map(to_value)
+                        .map_err(process_watch_failure),
+                    Err(failure) => Err(failure),
+                }
+            }
+            RpcMethod::ProcessWatchStop => {
+                match parse_params::<ProcessWatchHandleParams>(request.params) {
+                    Ok(params) => self
+                        .process_watch
+                        .stop(&params.binding_handle, &params.watch_handle)
+                        .await
+                        .map(to_value)
+                        .map_err(process_watch_failure),
+                    Err(failure) => Err(failure),
+                }
+            }
+            RpcMethod::ProcessWatchSummary => {
+                match parse_params::<ProcessWatchHandleParams>(request.params) {
+                    Ok(params) => self
+                        .process_watch
+                        .summary(&params.binding_handle, &params.watch_handle)
+                        .await
+                        .map(to_value)
+                        .map_err(process_watch_failure),
+                    Err(failure) => Err(failure),
+                }
+            }
+            RpcMethod::ProcessWatchToolLoadPath => {
+                match parse_params::<ProcessWatchToolPathParams>(request.params) {
+                    Ok(params) => self
+                        .process_watch
+                        .load_tool(std::path::Path::new(&params.local_path))
+                        .map(to_value)
+                        .map_err(process_watch_failure),
+                    Err(failure) => Err(failure),
+                }
+            }
+            RpcMethod::ProcessWatchUploadPlan => {
+                match parse_params::<ProcessWatchUploadPlanParams>(request.params) {
+                    Ok(params) => self
+                        .process_watch
+                        .upload_plan(&params.binding_handle, params.input)
+                        .await
+                        .map(to_value)
+                        .map_err(process_watch_failure),
+                    Err(failure) => Err(failure),
+                }
+            }
+            RpcMethod::ProcessWatchUploadStart => {
+                match parse_params::<ProcessWatchUploadStartParams>(request.params) {
+                    Ok(params) => self
+                        .process_watch
+                        .upload_start(&params.binding_handle, &params.plan_handle)
+                        .await
+                        .map(to_value)
+                        .map_err(process_watch_failure),
+                    Err(failure) => Err(failure),
+                }
+            }
+            RpcMethod::ProcessWatchResidueList => {
+                match parse_params::<ProcessWatchBindingParams>(request.params) {
+                    Ok(params) => self
+                        .process_watch
+                        .residues(&params.binding_handle)
+                        .await
+                        .map(to_value)
+                        .map_err(process_watch_failure),
+                    Err(failure) => Err(failure),
+                }
+            }
+            RpcMethod::ProcessWatchSources => {
+                match parse_params::<ProcessWatchBindingParams>(request.params) {
+                    Ok(params) => self
+                        .process_watch
+                        .existing_sources(&params.binding_handle)
+                        .await
+                        .map(to_value)
+                        .map_err(process_watch_failure),
+                    Err(failure) => Err(failure),
+                }
+            }
+            RpcMethod::ProcessWatchAccountingRead => {
+                match parse_params::<ProcessWatchAccountingParams>(request.params) {
+                    Ok(params) => self
+                        .process_watch
+                        .read_accounting(&params.binding_handle, params.minutes)
+                        .await
+                        .map(to_value)
+                        .map_err(process_watch_failure),
+                    Err(failure) => Err(failure),
+                }
+            }
+            RpcMethod::ProcessWatchResidueClean => {
+                match parse_params::<ProcessWatchResidueParams>(request.params) {
+                    Ok(params) => self
+                        .process_watch
+                        .clean_residue(&params.binding_handle, &params.residue_handle)
+                        .await
+                        .map(to_value)
+                        .map_err(process_watch_failure),
                     Err(failure) => Err(failure),
                 }
             }
@@ -3384,6 +3559,10 @@ enum RpcMethod {
     EmergencyCommandPathInspect,
     #[serde(rename = "emergency-command.path.plan")]
     EmergencyCommandPathPlan,
+    #[serde(rename = "emergency-command.path.lines")]
+    EmergencyCommandPathLines,
+    #[serde(rename = "emergency-command.path.plan-lines")]
+    EmergencyCommandPathPlanLines,
     #[serde(rename = "emergency-command.path.confirm")]
     EmergencyCommandPathConfirm,
     #[serde(rename = "emergency-command.path.execute")]
@@ -3472,6 +3651,30 @@ enum RpcMethod {
     PacketCapturePoll,
     #[serde(rename = "packet-capture.stop")]
     PacketCaptureStop,
+    #[serde(rename = "process-watch.probe")]
+    ProcessWatchProbe,
+    #[serde(rename = "process-watch.start")]
+    ProcessWatchStart,
+    #[serde(rename = "process-watch.poll")]
+    ProcessWatchPoll,
+    #[serde(rename = "process-watch.stop")]
+    ProcessWatchStop,
+    #[serde(rename = "process-watch.summary")]
+    ProcessWatchSummary,
+    #[serde(rename = "process-watch.tool.load-path")]
+    ProcessWatchToolLoadPath,
+    #[serde(rename = "process-watch.upload.plan")]
+    ProcessWatchUploadPlan,
+    #[serde(rename = "process-watch.upload.start")]
+    ProcessWatchUploadStart,
+    #[serde(rename = "process-watch.residue.list")]
+    ProcessWatchResidueList,
+    #[serde(rename = "process-watch.residue.clean")]
+    ProcessWatchResidueClean,
+    #[serde(rename = "process-watch.sources")]
+    ProcessWatchSources,
+    #[serde(rename = "process-watch.accounting.read")]
+    ProcessWatchAccountingRead,
     #[serde(rename = "packet-capture.evidence")]
     PacketCaptureEvidence,
     #[serde(rename = "kubernetes.pod.file-evidence")]
@@ -4177,6 +4380,15 @@ struct EmergencyCommandPathPlanParams {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EmergencyCommandPathPlanLinesParams {
+    binding_handle: String,
+    preview_handle: String,
+    first_line: u32,
+    last_line: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct EmergencyCommandPathPlanHandleParams {
     binding_handle: String,
     plan_handle: String,
@@ -4502,6 +4714,70 @@ struct SftpBrowserFileParams {
     binding_handle: String,
     browser_handle: String,
     file_handle: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProcessWatchBindingParams {
+    binding_handle: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProcessWatchStartParams {
+    binding_handle: String,
+    input: ProcessWatchStartInput,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProcessWatchPollParams {
+    binding_handle: String,
+    watch_handle: String,
+    cursor: u64,
+    limit: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProcessWatchHandleParams {
+    binding_handle: String,
+    watch_handle: String,
+}
+
+/// Host-only: the dialog-chosen program file. Never a page parameter.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProcessWatchToolPathParams {
+    local_path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProcessWatchUploadPlanParams {
+    binding_handle: String,
+    input: ProcessWatchUploadInput,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProcessWatchUploadStartParams {
+    binding_handle: String,
+    plan_handle: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProcessWatchAccountingParams {
+    binding_handle: String,
+    minutes: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProcessWatchResidueParams {
+    binding_handle: String,
+    residue_handle: String,
 }
 
 #[derive(Deserialize)]
@@ -6929,6 +7205,66 @@ fn emergency_path_failure(error: EmergencyPathApiError) -> RpcFailure {
                 public_message: "Several backup residues sit beside that command; the source must be chosen by hand.",
                 source: None,
             },
+            PathRefusal::LineLocation => RpcFailure {
+                operation: "plan a line deletion",
+                code: "emergency-path-line-location",
+                public_message: "That file is not one of the startup or cron files line deletion manages.",
+                source: None,
+            },
+            PathRefusal::LineKind => RpcFailure {
+                operation: "plan a line deletion",
+                code: "emergency-path-line-kind",
+                public_message: "Lines can only be deleted from a regular file, not a link or directory.",
+                source: None,
+            },
+            PathRefusal::LineSize => RpcFailure {
+                operation: "plan a line deletion",
+                code: "emergency-path-line-size",
+                public_message: "That file is empty or too large for a managed line deletion.",
+                source: None,
+            },
+            PathRefusal::LineRange => RpcFailure {
+                operation: "plan a line deletion",
+                code: "emergency-path-line-range",
+                public_message: "The selected lines are outside the file or past the per-delete limit.",
+                source: None,
+            },
+            PathRefusal::LineStale => RpcFailure {
+                operation: "plan a line deletion",
+                code: "emergency-path-line-stale",
+                public_message: "The file changed after it was previewed; nothing was planned.",
+                source: None,
+            },
+            PathRefusal::XinetdLocation => RpcFailure {
+                operation: "plan an xinetd service disable",
+                code: "emergency-path-xinetd-location",
+                public_message: "Only service files directly under /etc/xinetd.d can be disabled this way.",
+                source: None,
+            },
+            PathRefusal::XinetdKind => RpcFailure {
+                operation: "plan an xinetd service disable",
+                code: "emergency-path-xinetd-kind",
+                public_message: "Only a regular file can be disabled this way, not a link or directory.",
+                source: None,
+            },
+            PathRefusal::XinetdIgnored => RpcFailure {
+                operation: "plan an xinetd service disable",
+                code: "emergency-path-xinetd-ignored",
+                public_message: "xinetd does not load a file whose name contains a dot or ends with ~; this file is not active.",
+                source: None,
+            },
+            PathRefusal::XinetdPrivilege => RpcFailure {
+                operation: "plan an xinetd service disable",
+                code: "emergency-path-xinetd-privilege",
+                public_message: "Disabling an xinetd service needs root or passwordless sudo on the target.",
+                source: None,
+            },
+            PathRefusal::XinetdTools => RpcFailure {
+                operation: "plan an xinetd service disable",
+                code: "emergency-path-xinetd-tools",
+                public_message: "The target lacks a tool needed to isolate and verify the service file.",
+                source: None,
+            },
         },
     }
 }
@@ -7003,6 +7339,97 @@ fn packet_capture_live_failure(error: PacketCaptureLiveApiError) -> RpcFailure {
             operation: "bound live packet capture deadline",
             code: "packet-capture-timeout",
             public_message: "The live packet capture operation exceeded its deadline.",
+            source: None,
+        },
+    }
+}
+
+fn process_watch_failure(error: ProcessWatchApiError) -> RpcFailure {
+    match error {
+        ProcessWatchApiError::Core | ProcessWatchApiError::RegistryUnavailable => RpcFailure {
+            operation: "run bounded process watch operation",
+            code: "process-watch-operation-failed",
+            public_message: "LovelyHawk could not complete the process watch operation.",
+            source: None,
+        },
+        ProcessWatchApiError::BindingUnavailable => RpcFailure {
+            operation: "validate process watch SSH binding",
+            code: "process-watch-binding-unavailable",
+            public_message: "The process watch target binding is missing or stale.",
+            source: None,
+        },
+        ProcessWatchApiError::InvalidHandle
+        | ProcessWatchApiError::InvalidInput
+        | ProcessWatchApiError::InvalidCursor => RpcFailure {
+            operation: "validate process watch request",
+            code: "invalid-params",
+            public_message: "The process watch request parameters are invalid.",
+            source: None,
+        },
+        ProcessWatchApiError::ProcUnreadable => RpcFailure {
+            operation: "probe process watch capability",
+            code: "process-watch-proc-unreadable",
+            public_message: "The target's process table cannot be read.",
+            source: None,
+        },
+        ProcessWatchApiError::WatchUnavailable => RpcFailure {
+            operation: "validate process watch capability",
+            code: "process-watch-unavailable",
+            public_message: "The process watch is missing, expired, or stale.",
+            source: None,
+        },
+        ProcessWatchApiError::WatchAlreadyActive => RpcFailure {
+            operation: "bound process watch operation",
+            code: "process-watch-already-running",
+            public_message: "This target already has a process watch running.",
+            source: None,
+        },
+        ProcessWatchApiError::RegistryCapacity => RpcFailure {
+            operation: "bound process watch operation",
+            code: "process-watch-too-many",
+            public_message: "Too many process watches are running at once.",
+            source: None,
+        },
+        ProcessWatchApiError::ConcurrencyLimit => RpcFailure {
+            operation: "bound process watch operation",
+            code: "process-watch-busy",
+            public_message: "The previous process watch request is still being handled.",
+            source: None,
+        },
+        ProcessWatchApiError::OutputLimit | ProcessWatchApiError::ProtocolViolation => RpcFailure {
+            operation: "validate process watch output",
+            code: "process-watch-output-invalid",
+            public_message: "The process watch output was rejected.",
+            source: None,
+        },
+        ProcessWatchApiError::TimedOut => RpcFailure {
+            operation: "bound process watch deadline",
+            code: "process-watch-timeout",
+            public_message: "The process watch operation exceeded its deadline.",
+            source: None,
+        },
+        ProcessWatchApiError::ToolRejected => RpcFailure {
+            operation: "inspect process watch program file",
+            code: "process-watch-tool-rejected",
+            public_message: "The chosen file is not a Linux program this can upload.",
+            source: None,
+        },
+        ProcessWatchApiError::PlanUnavailable => RpcFailure {
+            operation: "validate process watch upload plan",
+            code: "process-watch-plan-unavailable",
+            public_message: "The upload plan is missing, expired or already used.",
+            source: None,
+        },
+        ProcessWatchApiError::UploadRefused(code) => RpcFailure {
+            operation: "plan process watch upload",
+            code,
+            public_message: "The upload cannot run on this target.",
+            source: None,
+        },
+        ProcessWatchApiError::UploadMismatch => RpcFailure {
+            operation: "verify process watch upload",
+            code: "process-watch-upload-mismatch",
+            public_message: "The uploaded file did not match the chosen program.",
             source: None,
         },
     }

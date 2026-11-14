@@ -290,3 +290,75 @@
 .emergency-path-batch button.is-link {
   margin-left: 8px;
 }
+
+.emergency-path-lines-dialog {
+  /* The line list needs the width a normal dialog does not. */
+  max-width: min(760px, calc(100vw - 32px));
+}
+
+.emergency-path-lines {
+  flex: none;
+  max-height: 40vh;
+  margin: 8px 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-deep, var(--surface));
+  font-family: var(--font-mono, monospace);
+  font-size: var(--font-caption);
+  line-height: 1.5;
+}
+
+.emergency-path-lines:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: -2px; }
+
+.emergency-path-line {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-height: 22px;
+  padding: 1px 8px;
+  cursor: pointer;
+  white-space: pre;
+}
+
+.emergency-path-line-number {
+  flex: none;
+  min-width: 3.5em;
+  color: var(--muted);
+  text-align: right;
+  user-select: none;
+}
+
+.emergency-path-line-text { min-width: 0; word-break: break-all; white-space: pre-wrap; }
+
+.emergency-path-line-clip { color: var(--muted); font-style: normal; }
+
+.emergency-path-line:is(:hover) { background: var(--surface-hover); }
+.emergency-path-line.is-active { outline: 1px dashed var(--border-strong); outline-offset: -1px; }
+.emergency-path-line.is-selected { color: var(--danger-text); background: var(--danger-soft); }
+.emergency-path-lines.is-removed .emergency-path-line { cursor: default; }
+.emergency-path-lines.is-removed .emergency-path-line:is(:hover) { background: transparent; }
+
+.emergency-path-range {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
+  font-size: var(--font-small);
+}
+
+.emergency-path-range input {
+  width: 5.5em;
+  margin: 0 4px;
+  padding: 3px 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: 5px;
+  color: var(--text);
+  background: var(--surface);
+  font: inherit;
+}
+
+.emergency-path-range input:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: -1px; }
+
+.emergency-path-hint { flex: 1 1 100%; color: var(--muted); font-size: var(--font-caption); }

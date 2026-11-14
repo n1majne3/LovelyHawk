@@ -854,6 +854,40 @@ impl SftpService {
         self.plan_operation(session, SftpOperation::Mutation(mutation))
     }
 
+    /// A mutation plan whose dialog text and journal metadata the caller
+    /// supplies instead of the generic wording. The mutation itself still
+    /// goes through the same validation, guarded write, backup, verification
+    /// and restore machinery; only the description is caller-chosen, so the
+    /// confirmation can say what the write is actually for.
+    pub(crate) fn plan_described(
+        &self,
+        session: &BoundSftpSession,
+        mutation: SftpMutation,
+        summary: String,
+        restore_description: Option<String>,
+        metadata: BTreeMap<String, String>,
+    ) -> CoreResult<SftpPlannedOperation> {
+        self.target.validate(session.target())?;
+        let operation = SftpOperation::Mutation(mutation);
+        validate_operation(&operation)?;
+        let mut plan =
+            OperationPlan::new(session.target().clone(), summary, true, restore_description)?;
+        plan.metadata = operation_metadata(&operation);
+        // Keys the mutation itself reports (path, digest, bytes) stay the
+        // mutation's: a caller key that collides loses rather than relabels
+        // what the plan acts on.
+        for (key, value) in metadata {
+            plan.metadata.entry(key).or_insert(value);
+        }
+        let executor = SftpMutationExecutor::new(self.clone(), session.clone(), operation)?;
+        Ok(SftpPlannedOperation {
+            operation: PlannedOperation::plan(plan),
+            executor,
+            target: self.target.clone(),
+            journal: self.journal.clone(),
+        })
+    }
+
     pub fn suggested_extraction_destination(archive: &RemotePath) -> CoreResult<RemotePath> {
         let (_, stem) = archive_extraction_format(archive)?;
         archive.parent()?.child(stem)
@@ -2360,6 +2394,10 @@ const OPERATION_FAILURE_ADVICE: &[(&[&str], &str)] = &[
         "文件在你看过之后又被改过了，所以没有动它。重新打开看一遍内容再操作。",
     ),
     (
+        &["xinetd process changed after the operation was planned"],
+        "xinetd 进程在你看过之后变了（可能刚重启或退出），所以没有动服务文件。重新确认 xinetd 状态后再规划。",
+    ),
+    (
         &["permission bits changed after planning"],
         "权限位在你看过之后又被改过了，所以没有动它。重新看一眼再操作。",
     ),
@@ -2370,6 +2408,22 @@ const OPERATION_FAILURE_ADVICE: &[(&[&str], &str)] = &[
     (
         &["could not stage the safety copy; nothing was modified"],
         "留底写入未能核实，目标命令未被修改。",
+    ),
+    (
+        &["post-delete `sh -n` check could not run; automatic restore also failed"],
+        "删除后未能执行脚本语法检查，且自动放回原文件未能核实，请人工检查该文件与备份。",
+    ),
+    (
+        &["post-delete `sh -n` check could not run; original bytes were put back"],
+        "删除后未能执行脚本语法检查，已自动把原文件放回。",
+    ),
+    (
+        &["post-delete `sh -n` check failed; automatic restore also failed"],
+        "删除后脚本语法检查未通过，且自动放回原文件未能核实，请人工检查该文件与备份。",
+    ),
+    (
+        &["post-delete `sh -n` check failed; original bytes were put back"],
+        "删除后脚本语法检查未通过，已自动把原文件放回。",
     ),
     (
         &["restore write check failed; original bytes were put back"],
@@ -2421,6 +2475,7 @@ pub fn operation_failure_advice(error: &CoreError) -> Option<&'static str> {
 /// changed, so there is nothing to restore.
 const REFUSED_BEFORE_WRITING: &[&str] = &[
     "file content changed after the operation was planned",
+    "xinetd process changed after the operation was planned",
     "permission bits changed after planning",
     "refuses to overwrite an existing path",
     "could not stage the safety copy; nothing was modified",
@@ -4161,6 +4216,29 @@ mod tests {
             CoreError::ssh("chmod", "Permission denied\n"),
         ] {
             assert!(!operation_left_untouched(&failed), "{failed}");
+        }
+    }
+
+    #[test]
+    fn a_syntax_check_that_never_ran_still_gets_its_own_advice() {
+        for (message, needle) in [
+            (
+                "post-delete `sh -n` check could not run; original bytes were put back",
+                "已自动把原文件放回",
+            ),
+            (
+                "post-delete `sh -n` check could not run; automatic restore also failed: x",
+                "请人工检查该文件与备份",
+            ),
+            (
+                "post-delete `sh -n` check failed; original bytes were put back",
+                "已自动把原文件放回",
+            ),
+        ] {
+            let error = CoreError::validation("line delete syntax", message);
+            let advice =
+                operation_failure_advice(&error).unwrap_or_else(|| panic!("no advice for {error}"));
+            assert!(advice.contains(needle), "{advice}");
         }
     }
 

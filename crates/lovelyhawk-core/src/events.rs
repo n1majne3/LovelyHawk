@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::packet_capture::PacketEntry;
+use crate::process_watch::{ProcessWatchEndState, ProcessWatchEvent};
 use crate::{CoreError, CoreResult};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -181,6 +182,96 @@ impl AiStreamEventReceiver {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProcessWatchStreamEvent {
+    pub watch_id: String,
+    pub sequence: u64,
+    pub kind: ProcessWatchStreamEventKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ProcessWatchStreamEventKind {
+    /// The remote loop printed its header: pid for identity, deadline for
+    /// "it ends by itself at" honesty when the channel is lost.
+    Started {
+        pid: u32,
+        deadline_at_ms: u64,
+    },
+    Process(ProcessWatchEvent),
+    Unparsed {
+        raw: String,
+    },
+    Stopped {
+        reason: ProcessWatchEndState,
+    },
+    Failed {
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct ProcessWatchStreamEventSender(Sender<ProcessWatchStreamEvent>);
+
+#[derive(Debug)]
+pub struct ProcessWatchStreamEventReceiver(Receiver<ProcessWatchStreamEvent>);
+
+pub fn process_watch_event_channel(
+    capacity: usize,
+) -> CoreResult<(
+    ProcessWatchStreamEventSender,
+    ProcessWatchStreamEventReceiver,
+)> {
+    if capacity == 0 {
+        return Err(CoreError::InvalidChannelCapacity);
+    }
+    let (sender, receiver) = async_channel::bounded(capacity);
+    Ok((
+        ProcessWatchStreamEventSender(sender),
+        ProcessWatchStreamEventReceiver(receiver),
+    ))
+}
+
+impl ProcessWatchStreamEventSender {
+    pub async fn send(&self, event: ProcessWatchStreamEvent) -> CoreResult<()> {
+        self.0
+            .send(event)
+            .await
+            .map_err(|_| CoreError::ChannelClosed {
+                channel: "process watch",
+            })
+    }
+
+    pub fn close(&self) {
+        self.0.close();
+    }
+}
+
+impl ProcessWatchStreamEventReceiver {
+    pub async fn recv(&self) -> CoreResult<ProcessWatchStreamEvent> {
+        self.0.recv().await.map_err(|_| CoreError::ChannelClosed {
+            channel: "process watch",
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn try_recv(&self) -> CoreResult<Option<ProcessWatchStreamEvent>> {
+        match self.0.try_recv() {
+            Ok(event) => Ok(Some(event)),
+            Err(async_channel::TryRecvError::Empty) => Ok(None),
+            Err(async_channel::TryRecvError::Closed) => Err(CoreError::ChannelClosed {
+                channel: "process watch",
+            }),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PacketCaptureEventSender(Sender<PacketCaptureEvent>);
 
@@ -247,6 +338,7 @@ pub struct EventChannelDefaults {
     pub terminal: usize,
     pub ai_stream: usize,
     pub packet_capture: usize,
+    pub process_watch: usize,
 }
 
 impl Default for EventChannelDefaults {
@@ -255,6 +347,7 @@ impl Default for EventChannelDefaults {
             terminal: 512,
             ai_stream: 128,
             packet_capture: 64,
+            process_watch: 64,
         }
     }
 }

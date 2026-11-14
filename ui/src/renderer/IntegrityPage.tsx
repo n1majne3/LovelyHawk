@@ -18,6 +18,7 @@ import {
 } from "../shared/integrity-contract";
 import { DialogHost } from "./DialogHost";
 import { EmergencyPathDialog, EmergencyPathProperties } from "./EmergencyPathDialog";
+import { EmergencyPathLinesDialog } from "./EmergencyPathLinesDialog";
 import { EmergencyPathMenu } from "./EmergencyPathMenu";
 import { useEmergencyPathActions } from "./emergency-path-actions";
 import { errorText } from "./error-text";
@@ -618,7 +619,7 @@ export function IntegrityPage({ bindingHandle, api, initialState }: IntegrityPag
                 <div className="integrity-findings">
                   {comparison.entries.map((finding, index) => {
                     const offer = finding.pathHandle === null ? null
-                      : { pathHandle: finding.pathHandle, line: index, path: finding.path };
+                      : { pathHandle: finding.pathHandle, line: index, path: finding.path, lineEditable: false, xinetdService: false };
                     return (
                     <article
                       className={`integrity-finding ${finding.kind}`}
@@ -695,6 +696,20 @@ export function IntegrityPage({ bindingHandle, api, initialState }: IntegrityPag
         onConfirm={() => void pathActions.confirm()}
         onUndo={() => void pathActions.undo()}
         onClose={pathActions.close} />)}
+      {pathActions.lines !== null && <EmergencyPathLinesDialog
+        path={pathActions.lines.offer.path}
+        preview={pathActions.lines.preview}
+        plan={pathActions.lines.plan}
+        receipt={pathActions.lines.receipt}
+        undo={pathActions.lines.undo}
+        undoSpent={pathActions.lines.undoSpent}
+        busy={pathActions.lines.busy}
+        error={pathActions.lines.error}
+        onPlan={(first, last) => void pathActions.planLines(first, last)}
+        onBack={pathActions.backToLines}
+        onConfirm={() => void pathActions.confirm()}
+        onUndo={() => void pathActions.undo()}
+        onClose={pathActions.close} />}
       {confirm.dialog !== null ? <DialogHost dialog={confirm.dialog} onResolve={confirm.resolve} /> : null}
     </main>
   );

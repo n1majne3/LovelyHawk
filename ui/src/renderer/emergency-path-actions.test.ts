@@ -61,9 +61,13 @@ vi.mock("react", async (importOriginal) => {
 });
 
 import { reason, undoFailure, useEmergencyPathActions } from "./emergency-path-actions";
+import type {
+  EmergencyPathLinesPlan,
+  EmergencyPathLinesPreview,
+} from "../shared/emergency-command-contract";
 import { EmergencyCommandsPage } from "./EmergencyCommandsPage";
 
-const offer: EmergencyCommandPathOffer = { pathHandle: "path-one", path: "/tmp/evidence-one", line: 0 };
+const offer: EmergencyCommandPathOffer = { pathHandle: "path-one", path: "/tmp/evidence-one", line: 0, lineEditable: false, xinetdService: false };
 const detail: EmergencyPathDetail = {
   pathHandle: offer.pathHandle, path: offer.path, kind: "file", size: "20", mode: "4700", ownerId: 0, groupId: 0,
   modifiedAt: null, executable: true,
@@ -80,6 +84,37 @@ const receipt: EmergencyPathReceipt = {
 };
 const undone = { planHandle: plan.planHandle, path: plan.path, undone: true, detail: "权限已经恢复为 4755" };
 
+const linesPreview: EmergencyPathLinesPreview = {
+  previewHandle: "preview-one", pathHandle: offer.pathHandle, path: offer.path,
+  totalLines: 4, truncated: false,
+  lines: [
+    { number: 1, text: "one", clipped: false },
+    { number: 2, text: "two", clipped: false },
+    { number: 3, text: "three", clipped: false },
+    { number: 4, text: "four", clipped: false },
+  ],
+};
+const linesPlan: EmergencyPathLinesPlan = {
+  planHandle: "lines-plan", pathHandle: offer.pathHandle, path: offer.path, action: "delete-lines",
+  summary: "删除 /tmp/evidence-one 第 2–3 行", dangerous: true,
+  restoreDescription: "把删除前的完整文件从备份放回",
+  state: "planned", expiresInSeconds: 300, residue: null,
+  removedLines: [
+    { number: 2, text: "two", clipped: false },
+    { number: 3, text: "three", clipped: false },
+  ],
+};
+const linesConfirmed = {
+  planHandle: linesPlan.planHandle, pathHandle: linesPlan.pathHandle, path: linesPlan.path,
+  action: "delete-lines" as const, summary: linesPlan.summary, dangerous: linesPlan.dangerous,
+  restoreDescription: linesPlan.restoreDescription, state: "confirmed" as const,
+  expiresInSeconds: 290, residue: null,
+};
+const linesReceipt = {
+  planHandle: linesPlan.planHandle, path: linesPlan.path, action: "delete-lines" as const,
+  passed: true, detail: "已删除并复核", restored: false, untouched: false, undoable: true,
+};
+
 function deferred<T>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>((done) => { resolve = done; });
@@ -95,6 +130,8 @@ function mockApi() {
     })),
     runEmergencyCommand: vi.fn(async () => null),
     inspectEmergencyPath: vi.fn(async (): Promise<unknown> => detail),
+    previewEmergencyPathLines: vi.fn(async (): Promise<unknown> => linesPreview),
+    planEmergencyPathLines: vi.fn(async (): Promise<unknown> => linesPlan),
     planEmergencyPathAction: vi.fn(async (): Promise<unknown> => plan),
     confirmEmergencyPathAction: vi.fn(async (): Promise<unknown> => confirmed),
     executeEmergencyPathAction: vi.fn(async (): Promise<unknown> => receipt),
@@ -106,7 +143,19 @@ function mockApi() {
     confirmEmergencyPathBatch: vi.fn(async (): Promise<unknown> => { throw new Error(); }),
     stepEmergencyPathBatch: vi.fn(async (): Promise<unknown> => { throw new Error(); }),
     cancelEmergencyPathBatch: vi.fn(async (): Promise<void> => { throw new Error(); }),
-  } satisfies EmergencyCommandApi & import("../shared/file-evidence-contract").FileEvidenceApi & import("../shared/local-scan-contract").LocalScanApi;
+    probeProcessWatch: vi.fn(async () => { throw new Error(); }),
+    startProcessWatch: vi.fn(async () => { throw new Error(); }),
+    pollProcessWatch: vi.fn(async () => { throw new Error(); }),
+    stopProcessWatch: vi.fn(async () => { throw new Error(); }),
+    processWatchSummary: vi.fn(async () => { throw new Error(); }),
+    pickProcessWatchTool: vi.fn(async () => { throw new Error(); }),
+    planProcessWatchUpload: vi.fn(async () => { throw new Error(); }),
+    startProcessWatchUpload: vi.fn(async () => { throw new Error(); }),
+    listProcessWatchResidues: vi.fn(async () => { throw new Error(); }),
+    cleanProcessWatchResidue: vi.fn(async () => { throw new Error(); }),
+    listProcessWatchSources: vi.fn(async () => { throw new Error(); }),
+    readProcessWatchAccounting: vi.fn(async () => { throw new Error(); }),
+  } satisfies EmergencyCommandApi & import("../shared/file-evidence-contract").FileEvidenceApi & import("../shared/local-scan-contract").LocalScanApi & import("../shared/process-watch-contract").ProcessWatchApi;
 }
 
 let api = mockApi();
@@ -363,6 +412,67 @@ describe("emergency file action lifecycle", () => {
     // An unknown code and another action's code both stay untouched.
     expect(reason("x (emergency-path-capability-empty)", "disarm")).toBe("x (emergency-path-capability-empty)");
     expect(reason("x (emergency-path-other)", "remove-capabilities")).toBe("x (emergency-path-other)");
+  });
+
+  it("deletes picked lines through preview, plan, confirm and one undo offer", async () => {
+    await view().start("delete-lines", offer);
+    expect(api.previewEmergencyPathLines)
+      .toHaveBeenCalledExactlyOnceWith("target-one", offer.pathHandle);
+    expect(view().lines?.preview).toEqual(linesPreview);
+    expect(api.inspectEmergencyPath).not.toHaveBeenCalled();
+
+    await view().planLines(2, 3);
+    expect(api.planEmergencyPathLines)
+      .toHaveBeenCalledExactlyOnceWith("target-one", "preview-one", 2, 3);
+    expect(view().lines?.plan).toEqual(linesPlan);
+
+    api.confirmEmergencyPathAction.mockResolvedValueOnce(linesConfirmed);
+    api.executeEmergencyPathAction.mockResolvedValueOnce(linesReceipt);
+    await view().confirm();
+    expect(api.executeEmergencyPathAction)
+      .toHaveBeenCalledExactlyOnceWith("target-one", linesPlan.planHandle);
+    expect(view().lines?.receipt).toEqual(linesReceipt);
+    expect(view().lines?.receipt?.undoable).toBe(true);
+  });
+
+  it("drops a lines plan when the operator goes back to the preview", async () => {
+    await view().start("delete-lines", offer);
+    await view().planLines(2, 2);
+    view().backToLines();
+    expect(view().lines?.plan).toBeNull();
+    expect(api.cancelEmergencyPathAction)
+      .toHaveBeenCalledExactlyOnceWith("target-one", linesPlan.planHandle);
+    // The same preview stays, so re-planning does not re-read the file.
+    await view().planLines(1, 1);
+    expect(api.previewEmergencyPathLines).toHaveBeenCalledOnce();
+    expect(api.planEmergencyPathLines).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps a stale lines plan from filling a closed dialog", async () => {
+    const pending = deferred<unknown>();
+    api.planEmergencyPathLines.mockReturnValueOnce(pending.promise);
+    await view().start("delete-lines", offer);
+    const request = view().planLines(1, 2);
+    await Promise.resolve();
+    expect(api.planEmergencyPathLines).toHaveBeenCalledOnce();
+    view().close();
+    pending.resolve(linesPlan);
+    await request;
+    expect(view().lines).toBeNull();
+    expect(api.cancelEmergencyPathAction)
+      .toHaveBeenCalledExactlyOnceWith("target-one", linesPlan.planHandle);
+  });
+
+  it("translates each line-delete refusal into its own next step", () => {
+    expect(reason("x (emergency-path-line-location)", "delete-lines")).toContain("不在行级删除管理");
+    expect(reason("x (emergency-path-line-kind)", "delete-lines")).toContain("普通文件");
+    expect(reason("x (emergency-path-line-size)", "delete-lines")).toContain("托管编辑大小上限");
+    expect(reason("x (emergency-path-line-range)", "delete-lines")).toContain("重新选择");
+    expect(reason("x (emergency-path-line-stale)", "delete-lines")).toContain("重新查看文件内容");
+    expect(reason("x (emergency-path-plan-unavailable)", "delete-lines")).toContain("过期");
+    // A line code does not bleed into another action, and an unknown code stays untouched.
+    expect(reason("x (emergency-path-line-stale)", "disarm")).toBe("x (emergency-path-line-stale)");
+    expect(reason("x (emergency-path-line-other)", "delete-lines")).toBe("x (emergency-path-line-other)");
   });
 
   it("translates each restore refusal into its own next step", () => {

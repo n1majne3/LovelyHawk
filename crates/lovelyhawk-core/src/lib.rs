@@ -46,6 +46,7 @@ pub mod ioc_extract;
 pub mod java;
 pub mod kubernetes;
 pub mod line_config_visual;
+pub mod line_delete;
 pub mod local_pack;
 pub mod local_scan;
 pub mod log_analysis;
@@ -80,6 +81,10 @@ pub mod postgresql_process;
 pub mod postgresql_role_graph;
 mod postgresql_wire;
 pub mod process_restart;
+pub mod process_watch;
+pub mod process_watch_analysis;
+pub mod process_watch_sources;
+pub mod process_watch_upload;
 pub mod redis_config;
 pub mod report;
 pub(crate) mod scp;
@@ -101,6 +106,7 @@ pub mod tomcat_config;
 pub mod types;
 pub mod visual_document;
 pub mod windows_incident;
+pub mod xinetd_service;
 
 pub use error::{
     CoreError, CoreResult, SshHostRole, SshKeyboardInteractiveChallenge,

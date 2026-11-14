@@ -150,6 +150,8 @@ import type {
   EmergencyCommandResult,
   EmergencyPathAction,
   EmergencyPathDetail,
+  EmergencyPathLinesPlan,
+  EmergencyPathLinesPreview,
   EmergencyPathPlan,
   EmergencyPathReceipt,
   EmergencyPathUndoResult,
@@ -172,6 +174,21 @@ import type {
   PacketCaptureStartInput,
   PacketCaptureStopped,
 } from "./packet-capture-live-contract.js";
+import type {
+  ProcessWatchAccounting,
+  ProcessWatchCleanup,
+  ProcessWatchPoll,
+  ProcessWatchSource,
+  ProcessWatchProbe,
+  ProcessWatchResidue,
+  ProcessWatchStarted,
+  ProcessWatchStartInput,
+  ProcessWatchStopped,
+  ProcessWatchSummary,
+  ProcessWatchTool,
+  ProcessWatchUploadInput,
+  ProcessWatchUploadPlan,
+} from "./process-watch-contract.js";
 import type {
   ApplicationLogClearResult,
   ApplicationLogExportResult,
@@ -214,6 +231,7 @@ export * from "./emergency-command-contract.js";
 export * from "./sftp-browser-contract.js";
 export * from "./local-browser-contract.js";
 export * from "./packet-capture-live-contract.js";
+export * from "./process-watch-contract.js";
 export * from "./pcap-offline-contract.js";
 export * from "./application-log-contract.js";
 export * from "./integrity-contract.js";
@@ -798,6 +816,16 @@ export interface LovelyHawkApi {
     pathHandle: string,
     action: EmergencyPathAction,
   ): Promise<EmergencyPathPlan>;
+  previewEmergencyPathLines(
+    bindingHandle: string,
+    pathHandle: string,
+  ): Promise<EmergencyPathLinesPreview>;
+  planEmergencyPathLines(
+    bindingHandle: string,
+    previewHandle: string,
+    firstLine: number,
+    lastLine: number,
+  ): Promise<EmergencyPathLinesPlan>;
   confirmEmergencyPathAction(bindingHandle: string, planHandle: string): Promise<EmergencyPathPlan>;
   executeEmergencyPathAction(
     bindingHandle: string,
@@ -837,6 +865,41 @@ export interface LovelyHawkApi {
     bindingHandle: string,
     captureHandle: string,
   ): Promise<PacketCaptureStopped>;
+  probeProcessWatch(bindingHandle: string): Promise<ProcessWatchProbe>;
+  startProcessWatch(
+    bindingHandle: string,
+    input: ProcessWatchStartInput,
+  ): Promise<ProcessWatchStarted>;
+  pollProcessWatch(
+    bindingHandle: string,
+    watchHandle: string,
+    cursor: number,
+    limit: number,
+  ): Promise<ProcessWatchPoll>;
+  stopProcessWatch(bindingHandle: string, watchHandle: string): Promise<ProcessWatchStopped>;
+  processWatchSummary(
+    bindingHandle: string,
+    watchHandle: string,
+  ): Promise<ProcessWatchSummary>;
+  pickProcessWatchTool(): Promise<ProcessWatchTool | null>;
+  planProcessWatchUpload(
+    bindingHandle: string,
+    input: ProcessWatchUploadInput,
+  ): Promise<ProcessWatchUploadPlan>;
+  startProcessWatchUpload(
+    bindingHandle: string,
+    planHandle: string,
+  ): Promise<ProcessWatchStarted>;
+  listProcessWatchResidues(bindingHandle: string): Promise<ProcessWatchResidue[]>;
+  cleanProcessWatchResidue(
+    bindingHandle: string,
+    residueHandle: string,
+  ): Promise<ProcessWatchCleanup>;
+  listProcessWatchSources(bindingHandle: string): Promise<ProcessWatchSource[]>;
+  readProcessWatchAccounting(
+    bindingHandle: string,
+    minutes: number,
+  ): Promise<ProcessWatchAccounting>;
   listApplicationLogs(filter: ApplicationLogFilter): Promise<ApplicationLogSnapshot>;
   setApplicationLogLevel(level: ApplicationLogLevel): Promise<ApplicationLogLevelResult>;
   clearApplicationLogBuffer(): Promise<ApplicationLogClearResult>;

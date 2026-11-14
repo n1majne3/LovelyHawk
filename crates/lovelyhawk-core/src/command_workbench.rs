@@ -1047,6 +1047,192 @@ lh_finish
 "#
 ));
 
+const CMD_SYSTEM_MODULE_REVIVAL_POINTS: &str = bounded_observation!(
+    r#"printf '# 范围：会把内核模块重新装回的全部位置——启动脚本、定时任务、xinetd、systemd unit 的执行行、/etc/modules* 与 modprobe.d 的执行性行，以及标准模块目录之外的 .ko 文件。
+'
+printf '# 本项只读；不提供一键 rmmod。重启判断见末尾开机时间。
+'
+command -v grep >/dev/null 2>&1 || { lh_gap 'grep 不可用，本项未执行。'; lh_finish; exit 1; }
+lh_pat='insmod|modprobe|kmod[[:space:]]+load|finit_module|init_module'
+# Files where a line naming a module-load command brings the module back.
+lh_files=$(
+  {
+    for lh_f in /etc/profile /etc/bash.bashrc /etc/bashrc /etc/rc.local /etc/rc.d/rc.local /etc/crontab /etc/inetd.conf; do
+      [ -f "$lh_f" ] && [ ! -L "$lh_f" ] && printf '%s\n' "$lh_f"
+    done
+    for lh_d in /etc/profile.d /etc/cron.d /etc/cron.hourly /etc/cron.daily /etc/cron.weekly /etc/cron.monthly /etc/init.d /etc/rc.d/init.d /etc/xinetd.d /var/spool/cron /var/spool/cron/crontabs /var/spool/cron/tabs; do
+      [ -d "$lh_d" ] || continue
+      lh_n=0
+      for lh_f in "$lh_d"/*; do
+        [ "$lh_n" -ge 100 ] && break
+        [ -f "$lh_f" ] && [ ! -L "$lh_f" ] || continue
+        lh_n=$((lh_n + 1))
+        printf '%s\n' "$lh_f"
+      done
+    done
+    for lh_f in /root/.bashrc /root/.profile /root/.bash_profile /home/*/.bashrc /home/*/.profile /home/*/.bash_profile; do
+      [ -f "$lh_f" ] && [ ! -L "$lh_f" ] && printf '%s\n' "$lh_f"
+    done
+  } | head -n 600
+)
+while IFS= read -r lh_f; do
+  [ -n "$lh_f" ] || continue
+  lh_step
+  [ -r "$lh_f" ] || { lh_gap "$lh_f：权限不足，未读取。"; continue; }
+  # Comments are not revival points; the rule only sees live lines.
+  lh_out=$(grep -nE "$lh_pat" "$lh_f" 2>/dev/null | grep -vE '^[0-9]+:[[:space:]]*#' | head -n 50 | cut -c1-560)
+  while IFS= read -r lh_line; do
+    [ -n "$lh_line" ] || continue
+    lh_ln=${lh_line%%:*}
+    lh_tx=${lh_line#*:}
+    lh_hit "$lh_f | 第 $lh_ln 行：$lh_tx"
+  done <<LH_OUT
+$lh_out
+LH_OUT
+done <<LH_FILES
+$lh_files
+LH_FILES
+# systemd unit ExecStart* lines that load modules.
+for lh_d in /etc/systemd/system /usr/lib/systemd/system /lib/systemd/system; do
+  [ -d "$lh_d" ] || continue
+  if command -v find >/dev/null 2>&1; then
+    lh_units=$(find "$lh_d" -maxdepth 2 -type f 2>/dev/null | head -n 300)
+  else
+    lh_gap 'find 不可用，unit 子目录未列出。'
+    lh_units=$(printf '%s\n' "$lh_d"/* | head -n 300)
+  fi
+  while IFS= read -r lh_f; do
+    [ -f "$lh_f" ] && [ ! -L "$lh_f" ] || continue
+    lh_step
+    [ -r "$lh_f" ] || { lh_gap "$lh_f：权限不足，未读取。"; continue; }
+    lh_out=$(grep -nE '^[[:space:]]*(ExecStart|ExecStartPre|ExecStartPost|ExecReload|ExecStop)[[:space:]]*=.*(insmod|modprobe|kmod[[:space:]]+load|finit_module)' "$lh_f" 2>/dev/null | head -n 20 | cut -c1-560)
+    while IFS= read -r lh_line; do
+      [ -n "$lh_line" ] || continue
+      lh_ln=${lh_line%%:*}
+      lh_tx=${lh_line#*:}
+      lh_hit "$lh_f | 第 $lh_ln 行：$lh_tx"
+    done <<LH_UNIT
+$lh_out
+LH_UNIT
+  done <<LH_UNITS
+$lh_units
+LH_UNITS
+done
+# /etc/modules and modules-load.d: every non-comment line is listed; the name
+# is only marked when the running kernel cannot resolve it.
+lh_krel=$(uname -r 2>/dev/null)
+lh_modinfo=0
+command -v modinfo >/dev/null 2>&1 && lh_modinfo=1
+[ "$lh_modinfo" = 1 ] || lh_gap 'modinfo 不可用，/etc/modules 中模块名无法校验，仅列出未标记。'
+for lh_f in /etc/modules /etc/modules-load.d/*.conf /usr/lib/modules-load.d/*.conf /lib/modules-load.d/*.conf /run/modules-load.d/*.conf; do
+  [ -f "$lh_f" ] && [ ! -L "$lh_f" ] || continue
+  lh_step
+  [ -r "$lh_f" ] || { lh_gap "$lh_f：权限不足，未读取。"; continue; }
+  lh_ln=0
+  while IFS= read -r lh_line || [ -n "$lh_line" ]; do
+    lh_ln=$((lh_ln + 1))
+    [ "$lh_ln" -gt 500 ] && { lh_gap "$lh_f：行数超过 500，剩余未检查。"; break; }
+    case "$lh_line" in ''|'#'*) continue;; esac
+    set -- $lh_line
+    lh_name=$1
+    [ -n "$lh_name" ] || continue
+    lh_ok=0
+    lh_checkable=0
+    if [ "$lh_modinfo" = 1 ]; then
+      lh_checkable=1
+      modinfo -n "$lh_name" >/dev/null 2>&1 && lh_ok=1
+    elif [ -d "/lib/modules/$lh_krel" ]; then
+      lh_checkable=1
+      grep -qw "$lh_name" "/lib/modules/$lh_krel/modules.builtin" "/lib/modules/$lh_krel/modules.dep" 2>/dev/null && lh_ok=1
+    fi
+    [ "$lh_ok" = 0 ] && [ -d "/sys/module/$lh_name" ] && lh_ok=1
+    if [ "$lh_checkable" = 0 ] && [ "$lh_ok" = 0 ]; then
+      printf '文件属性：%s | 第 %s 行：%s（未校验：modinfo 与模块清单均不可用）\n' "$lh_f" "$lh_ln" "$lh_line"
+    elif [ "$lh_ok" = 1 ]; then
+      printf '文件属性：%s | 第 %s 行：%s\n' "$lh_f" "$lh_ln" "$lh_line"
+    else
+      lh_hit "$lh_f | 第 $lh_ln 行：$lh_line（无法解析为已知模块，可能指向已下线的模块文件，也可能是内建模块缺失清单）"
+    fi
+  done < "$lh_f"
+done
+# modprobe.d install/softdep lines that run commands at load time.
+for lh_f in /etc/modprobe.d/*.conf /usr/lib/modprobe.d/*.conf /lib/modprobe.d/*.conf /run/modprobe.d/*.conf; do
+  [ -f "$lh_f" ] && [ ! -L "$lh_f" ] || continue
+  lh_step
+  [ -r "$lh_f" ] || { lh_gap "$lh_f：权限不足，未读取。"; continue; }
+  lh_out=$(grep -nE '^[[:space:]]*(install|softdep)[[:space:]]' "$lh_f" 2>/dev/null | head -n 50 | cut -c1-560)
+  while IFS= read -r lh_line; do
+    [ -n "$lh_line" ] || continue
+    lh_ln=${lh_line%%:*}
+    lh_tx=${lh_line#*:}
+    set -- $lh_tx
+    lh_kind=$1
+    lh_flag=0
+    case "$lh_kind" in
+      install)
+        # `install <name> modprobe …` is the built-in form; other commands or
+        # a chained `;`/`&&`/`||` tail run their own command on load.
+        case "$3" in
+          modprobe|insmod|/sbin/modprobe|/sbin/insmod)
+            case "$lh_tx" in *';'*|*'&&'*|*'||'*) lh_flag=1;; esac;;
+          '') ;;
+          *) lh_flag=1;;
+        esac;;
+      softdep)
+        # pre:/post: name modules; a token starting with / runs a command.
+        shift 2
+        for lh_arg; do
+          case "$lh_arg" in /*) lh_flag=1;; esac
+        done;;
+    esac
+    [ "$lh_flag" = 1 ] && lh_hit "$lh_f | 第 $lh_ln 行：$lh_tx（加载时会执行命令的 modprobe.d 行）"
+  done <<LH_DEP
+$lh_out
+LH_DEP
+done
+# .ko payloads parked outside the standard module trees.
+if command -v find >/dev/null 2>&1; then
+  lh_kos=$(find /root /home /tmp /var/tmp /dev/shm /opt /etc /usr/local -maxdepth 5 -type f \( -name '*.ko' -o -name '*.ko.xz' -o -name '*.ko.zst' -o -name '*.ko.gz' \) 2>/dev/null | head -n 200)
+  while IFS= read -r lh_ko; do
+    [ -n "$lh_ko" ] && { lh_step; lh_hit "$lh_ko | 内核模块文件位于标准模块目录外"; }
+  done <<LH_KO
+$lh_kos
+LH_KO
+else
+  lh_gap 'find 不可用，.ko 扫描未执行。'
+fi
+# Status block: when this boot began, the kernel, and modules hiding from
+# /proc/modules — the same comparison 内核模块 runs.
+printf '# 状态：内核 %s；' "$(uname -r 2>/dev/null)"
+lh_btime=$(awk '/^btime/{print $2; exit}' /proc/stat 2>/dev/null)
+if [ -n "$lh_btime" ]; then
+  lh_when=$(date -d "@$lh_btime" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null)
+  printf '开机时间 %s（epoch %s）。\n' "${lh_when:-未知}" "$lh_btime"
+else
+  printf '无法读取开机时间。\n'
+  lh_gap '/proc/stat 缺少 btime，无法报告本次开机时间。'
+fi
+lh_loaded=$(awk '{print $1}' /proc/modules 2>/dev/null | sort -u)
+lh_hidden=0
+lh_hidden_names=''
+for lh_d in /sys/module/*/initstate; do
+  [ -f "$lh_d" ] || continue
+  lh_m=$(basename "$(dirname "$lh_d")")
+  printf '%s\n' "$lh_loaded" | grep -qx "$lh_m" || { lh_hidden=$((lh_hidden + 1)); lh_hidden_names="$lh_hidden_names $lh_m"; }
+done
+if [ "$lh_hidden" -gt 0 ]; then
+  printf '关注：/sys/module 中存在但模块列表中不可见的已加载模块共 %s 个：%s（疑似自隐藏模块）\n' "$lh_hidden" "$lh_hidden_names"
+fi
+if [ "$lh_hits" -gt 0 ]; then
+  printf '复活点 %s 处：处理完后可在维护窗口重启，重启后重新运行本项与“内核模块”项复核\n' "$lh_hits"
+elif [ "$lh_gaps" -gt 0 ]; then
+  printf '存在 %s 条读取缺口，未能确认没有复活点；补齐权限或工具后重新运行本项（本次开机时间见上）\n' "$lh_gaps"
+else
+  printf '未发现复活点。若仍有无法卸载或自隐藏的模块，可在维护窗口重启，重启后重新运行本项复核（本次开机时间见上）\n'
+fi
+"#
+);
+
 const CMD_PERM_DT_NEEDED: &str = bounded_observation!(
     r#"printf '# 批量核对系统命令的 DT_NEEDED；RPATH/RUNPATH 与 ld.so.conf 非标准目录未完全展开，未解析到属旁证而非结论。
 '
@@ -1186,7 +1372,7 @@ lh_pkgq=''
 if command -v dpkg >/dev/null 2>&1; then lh_pkgq='dpkg -S'
 elif command -v rpm >/dev/null 2>&1; then lh_pkgq='rpm -qf'
 else lh_gap '缺少 dpkg 与 rpm，软件包归属核对未执行。'; fi
-lh_owner() { [ -n "$lh_pkgq" ] && $lh_pkgq "$1" 2>/dev/null | head -n 1; }
+lh_owner() { [ -n "$lh_pkgq" ] && $lh_pkgq "$1" 2>/dev/null | grep -vE 'not owned|不属于' | head -n 1; }
 lh_gtfo_name() {
   case "$1" in
 "#,
@@ -1221,7 +1407,7 @@ lh_pkgq=''
 if command -v dpkg >/dev/null 2>&1; then lh_pkgq='dpkg -S'
 elif command -v rpm >/dev/null 2>&1; then lh_pkgq='rpm -qf'
 else lh_gap '缺少 dpkg 与 rpm，软件包归属核对未执行。'; fi
-lh_owner() { [ -n "$lh_pkgq" ] && $lh_pkgq "$1" 2>/dev/null | head -n 1; }
+lh_owner() { [ -n "$lh_pkgq" ] && $lh_pkgq "$1" 2>/dev/null | grep -vE 'not owned|不属于' | head -n 1; }
 for lh_d in /etc/systemd/system /usr/lib/systemd/system /lib/systemd/system /root/.config/systemd/user /home/*/.config/systemd/user; do
   [ -d "$lh_d" ] || continue
   for lh_f in "$lh_d"/*; do
@@ -1289,6 +1475,252 @@ for lh_root in $lh_roots; do
   done
 done
 [ "$lh_dirs" -gt 0 ] || printf '# 站点目录下未发现 Smarty 编译目录，本项不适用。\n'
+"#
+);
+
+const EDITOR_CONFIG_PERSISTENCE: &str = bounded_observation!(
+    r#"printf '# 范围：/etc/passwd 中各账号主目录（至多 200 个）的编辑器配置、~/.vim 各插件子树（每层至多 200 个文件）与系统级 vim/nano 配置。
+'
+printf '# modeline 本身是合法选项，是否可利用取决于编辑器版本、执行上下文与文件来源；~/.vim/plugin 下的文件在 vim 启动时自动加载。
+'
+command -v grep >/dev/null 2>&1 || { lh_gap 'grep 不可用，内容特征检查未执行。'; lh_finish; exit 1; }
+lh_pattern='modeline|exrc|^[[:space:]]*set[[:space:]]+ex[[:space:]!]|autocmd|^[[:space:]]*au[[:space:]!]|:[[:space:]]*!|system[[:space:]]*\(|systemlist[[:space:]]*\(|writefile[[:space:]]*\(|job_start|term_start|^[[:space:]]*:?[[:space:]]*(py|py3|python|python3|pyfile|py3file|lua|luafile|perl|perlfile|ruby|rubyfile)[[:space:]!<]|^[[:space:]]*(source|runtime)[[:space:]]|shell-command|start-process|call-process|\(load|^[[:space:]]*include[[:space:]]'
+lh_files=0
+lh_scan() {
+  lh_f=$1
+  [ -e "$lh_f" ] || return 0
+  if [ -L "$lh_f" ]; then lh_gap "$lh_f：符号链接，未跟随其目标。"; return 0; fi
+  if [ ! -f "$lh_f" ]; then lh_gap "$lh_f：非常规文件，未检查。"; return 0; fi
+  if [ ! -r "$lh_f" ]; then lh_gap "$lh_f：权限不足，未读取。"; return 0; fi
+  lh_files=$((lh_files + 1))
+  lh_step
+  ls -ld "$lh_f" 2>/dev/null
+  grep -nHE "$lh_pattern" "$lh_f" 2>/dev/null | head -n 50 | cut -c1-560
+}
+lh_homes=0
+while IFS=: read -r lh_u lh_p lh_uid lh_gid lh_gecos lh_home lh_sh; do
+  [ "$lh_homes" -ge 200 ] && break
+  [ -d "$lh_home" ] || continue
+  lh_homes=$((lh_homes + 1))
+  for lh_rel in .vimrc .exrc .nanorc .emacs .emacs.d/init.el .config/nvim/init.vim .config/nvim/init.lua; do
+    lh_scan "$lh_home/$lh_rel"
+  done
+  for lh_sub in plugin autoload after ftplugin; do
+    lh_d="$lh_home/.vim/$lh_sub"
+    [ -d "$lh_d" ] || continue
+    if [ ! -r "$lh_d" ]; then lh_gap "$lh_d：权限不足，未列出。"; continue; fi
+    command -v find >/dev/null 2>&1 || { lh_gap 'find 不可用，插件目录未列出。'; break; }
+    lh_list=$(find "$lh_d" -maxdepth 3 -type f 2>/dev/null | head -n 200)
+    while IFS= read -r lh_f; do
+      [ -n "$lh_f" ] && lh_scan "$lh_f"
+    done <<LH_FILES
+$lh_list
+LH_FILES
+  done
+done < /etc/passwd
+for lh_f in /etc/vim/vimrc /etc/vim/vimrc.local /etc/vimrc /etc/virc /etc/nanorc; do
+  lh_scan "$lh_f"
+done
+[ "$lh_files" -eq 0 ] && printf '未发现编辑器配置文件。\n'
+"#
+);
+
+const INIT_PACKAGE_VERIFY: &str = bounded_observation!(
+    r#"printf '# 范围：/etc/init.d 下的脚本（至多 300 个）。比对的是目标上软件包数据库记录的摘要；数据库本身被改写时本项结果不可信。
+'
+command -v find >/dev/null 2>&1 || { lh_gap 'find 不可用，本项未执行。'; lh_finish; exit 1; }
+if [ ! -d /etc/init.d ]; then printf '# 无 /etc/init.d 目录，本项不适用。\n'; lh_finish; exit 0; fi
+lh_initd=/etc/init.d
+if [ -L /etc/init.d ]; then
+  lh_real=$(readlink -f /etc/init.d 2>/dev/null)
+  if [ -z "$lh_real" ] || [ ! -d "$lh_real" ]; then lh_gap '/etc/init.d 是符号链接且目标不可达，未检查。'; lh_finish; exit 1; fi
+  printf '# /etc/init.d 是符号链接，实际检查 %s。\n' "$lh_real"
+  lh_initd=$lh_real
+fi
+lh_pm=''
+if command -v dpkg-query >/dev/null 2>&1 && command -v dpkg >/dev/null 2>&1; then lh_pm=dpkg
+elif command -v rpm >/dev/null 2>&1; then lh_pm=rpm
+elif command -v apk >/dev/null 2>&1; then lh_pm=apk
+else lh_gap 'dpkg、rpm、apk 均不可用，无法判断软件包归属。'; lh_finish; exit 1; fi
+lh_difffmt=0
+if command -v dpkg-deb >/dev/null 2>&1 && command -v tar >/dev/null 2>&1 && command -v diff >/dev/null 2>&1 \
+  && printf 'x\n' | diff - - --old-line-format='' --unchanged-line-format='' --new-line-format='' >/dev/null 2>&1; then
+  lh_difffmt=1
+fi
+lh_audit_out=''
+lh_audit_ok=0
+if [ "$lh_pm" = apk ]; then
+  lh_audit_out=$(apk audit --full /etc/init.d 2>/dev/null) && lh_audit_ok=1
+fi
+lh_check() {
+  lh_f=$1
+  case "$lh_pm" in
+    dpkg)
+      lh_pkgline=$(dpkg -S "$lh_f" 2>/dev/null | head -n 1)
+      lh_pkg=${lh_pkgline%%:*}
+      lh_pkg=${lh_pkg%%,*}
+      lh_pkg=$(printf '%s' "$lh_pkg" | tr -d ' ')
+      if [ -z "$lh_pkg" ]; then printf '%s | 属包：- | 结论：不属于任何软件包\n' "$lh_f"; return 0; fi
+      lh_ver=$(dpkg-query -W -f='${Version}' "$lh_pkg" 2>/dev/null | head -n 1)
+      lh_ref=$(dpkg-query -W -f='${Conffiles}\n' "$lh_pkg" 2>/dev/null | awk -v p="$lh_f" '$1==p{print $2}' | head -n 1)
+      if [ -z "$lh_ref" ] && [ -f "/var/lib/dpkg/info/$lh_pkg.md5sums" ]; then
+        lh_ref=$(awk -v p="${lh_f#/}" '$2==p{print $1}' "/var/lib/dpkg/info/$lh_pkg.md5sums" 2>/dev/null | head -n 1)
+      fi
+      if [ -z "$lh_ref" ]; then printf '%s | 属包：%s | 结论：无法判断（软件包未记录该文件摘要）\n' "$lh_f" "$lh_pkg"; return 0; fi
+      command -v md5sum >/dev/null 2>&1 || { lh_gap 'md5sum 不可用，无法比对摘要。'; return 0; }
+      lh_now=$(md5sum "$lh_f" 2>/dev/null | awk '{print $1}')
+      if [ -z "$lh_now" ]; then lh_gap "$lh_f：无法计算摘要。"; return 0; fi
+      if [ "$lh_now" = "$lh_ref" ]; then printf '%s | 属包：%s | 结论：一致\n' "$lh_f" "$lh_pkg"; return 0; fi
+      printf '%s | 属包：%s | 结论：与包内记录不一致（配置类文件，可能是管理员合法修改，也可能被植入）\n' "$lh_f" "$lh_pkg"
+      if [ "$lh_difffmt" != 1 ]; then printf '本机没有该软件包的原件，无法显示差异行\n'; return 0; fi
+      lh_deb=$(ls /var/cache/apt/archives/${lh_pkg}_${lh_ver}_*.deb 2>/dev/null | head -n 1)
+      if [ -z "$lh_deb" ]; then
+        if ls /var/cache/apt/archives/${lh_pkg}_*.deb >/dev/null 2>&1; then
+          printf '缓存包版本与已装版本不一致，未显示差异行\n'
+        else
+          printf '本机没有该软件包的原件，无法显示差异行\n'
+        fi
+        return 0
+      fi
+      lh_rel=${lh_f#/}
+      lh_orig=$(dpkg-deb --fsys-tarfile "$lh_deb" 2>/dev/null | tar -xO "./$lh_rel" 2>/dev/null)
+      [ -z "$lh_orig" ] && lh_orig=$(dpkg-deb --fsys-tarfile "$lh_deb" 2>/dev/null | tar -xO "$lh_rel" 2>/dev/null)
+      if [ -z "$lh_orig" ]; then printf '无法从缓存包中取出原件，未显示差异行\n'; return 0; fi
+      printf '%s\n' "$lh_orig" | diff - "$lh_f" --old-line-format='' --unchanged-line-format='' --new-line-format="$lh_f:%dn:+%L" 2>/dev/null | head -n 40
+      ;;
+    rpm)
+      lh_pkg=$(rpm -qf "$lh_f" 2>/dev/null | head -n 1)
+      case "$lh_pkg" in
+        ''|*'not owned'*|*'不属于'*) printf '%s | 属包：- | 结论：不属于任何软件包\n' "$lh_f"; return 0;;
+      esac
+      lh_v=$(rpm -Vf "$lh_f" 2>/dev/null | grep -F "$lh_f" | head -n 1)
+      if [ -z "$lh_v" ]; then printf '%s | 属包：%s | 结论：一致\n' "$lh_f" "$lh_pkg"; return 0; fi
+      lh_flags=$(printf '%s' "$lh_v" | awk '{print $1}')
+      case "$lh_flags" in
+        *5*|*S*|*M*|*T*|*missing*) printf '%s | 属包：%s | 结论：与包内记录不一致（%s）\n' "$lh_f" "$lh_pkg" "$lh_v";;
+        *) printf '%s | 属包：%s | 结论：一致\n' "$lh_f" "$lh_pkg";;
+      esac
+      ;;
+    apk)
+      lh_pkg=$(apk info -W "$lh_f" 2>/dev/null | awk 'NF{print $NF}' | head -n 1)
+      if [ -z "$lh_pkg" ]; then printf '%s | 属包：- | 结论：不属于任何软件包\n' "$lh_f"; return 0; fi
+      if [ "$lh_audit_ok" != 1 ]; then
+        printf '%s | 属包：%s | 结论：无法判断（apk audit 不可用）\n' "$lh_f" "$lh_pkg"
+        return 0
+      fi
+      lh_a=$(printf '%s\n' "$lh_audit_out" | awk -v p="${lh_f#/}" '$2==p{print $1}' | head -n 1)
+      if [ -z "$lh_a" ]; then
+        printf '%s | 属包：%s | 结论：一致\n' "$lh_f" "$lh_pkg"
+        return 0
+      fi
+      printf '%s | 属包：%s | 结论：与包内记录不一致（apk audit 标记 %s）\n' "$lh_f" "$lh_pkg" "$lh_a"
+      ;;
+  esac
+}
+lh_list=$(find "$lh_initd" -maxdepth 1 \( -type f -o -type l \) 2>/dev/null | sort | head -n 300)
+while IFS= read -r lh_f; do
+  [ -n "$lh_f" ] || continue
+  lh_step
+  if [ -L "$lh_f" ]; then
+    printf '%s | 符号链接 -> %s（未跟随）\n' "$lh_f" "$(readlink "$lh_f" 2>/dev/null)"
+    continue
+  fi
+  [ -r "$lh_f" ] || { lh_gap "$lh_f：权限不足，未读取。"; continue; }
+  lh_check "$lh_f"
+done <<LH_INIT
+$lh_list
+LH_INIT
+[ -z "$lh_list" ] && printf '# /etc/init.d 下未发现脚本。\n'
+"#
+);
+
+const LOG_TAMPER_SIGNS: &str = bounded_observation!(
+    r#"printf '# 范围：常见日志文件状态、各账号历史文件、内核环形缓冲区与 journald 启动记录；只读。发行版差异造成的不存在不标记。
+'
+lh_hint='日志可能已被清理，缺失不代表没有发生。'
+lh_boot=''
+if [ -r /proc/uptime ]; then
+  lh_up=$(cut -d. -f1 /proc/uptime 2>/dev/null)
+  lh_now=$(date +%s 2>/dev/null)
+  case "$lh_up$lh_now" in ''|*[!0-9]*) ;; *) lh_boot=$((lh_now - lh_up));; esac
+fi
+for lh_f in /var/log/auth.log /var/log/secure /var/log/syslog /var/log/messages /var/log/kern.log /var/log/cron /var/log/cron.log /var/log/wtmp /var/log/btmp /var/log/lastlog /var/log/audit/audit.log; do
+  lh_step
+  if [ ! -e "$lh_f" ] && [ ! -L "$lh_f" ]; then printf '%s 不存在\n' "$lh_f"; continue; fi
+  if [ -L "$lh_f" ]; then printf '%s | 日志文件是符号链接 -> %s。%s\n' "$lh_f" "$(readlink "$lh_f" 2>/dev/null)" "$lh_hint"; continue; fi
+  if [ ! -f "$lh_f" ]; then printf '%s 非常规文件，未检查\n' "$lh_f"; continue; fi
+  if [ ! -r "$lh_f" ]; then lh_gap "$lh_f：权限不足，未读取。"; continue; fi
+  lh_size=$(wc -c < "$lh_f" 2>/dev/null | tr -d ' ')
+  lh_mtime=$(stat -c %Y "$lh_f" 2>/dev/null || date -r "$lh_f" +%s 2>/dev/null)
+  printf '%s | 大小 %s 字节\n' "$lh_f" "${lh_size:-?}"
+  case "$lh_f" in
+    /var/log/auth.log|/var/log/secure|/var/log/syslog|/var/log/messages|/var/log/kern.log|/var/log/wtmp|/var/log/audit/audit.log)
+      if [ "$lh_size" = 0 ]; then
+        printf '%s 大小为 0，该文件通常不为空。%s\n' "$lh_f" "$lh_hint"
+      fi
+      if [ -n "$lh_boot" ] && [ -n "$lh_mtime" ] && [ "$lh_mtime" -lt "$lh_boot" ] 2>/dev/null; then
+        printf '%s 修改时间早于本次开机，可能被替换或清空后未再写入，也可能只是正常轮替。%s\n' "$lh_f" "$lh_hint"
+      fi
+      ;;
+  esac
+done
+printf '# --- 用户历史文件 ---\n'
+lh_homes=0
+while IFS=: read -r lh_u lh_p lh_uid lh_gid lh_gecos lh_home lh_sh; do
+  [ "$lh_homes" -ge 200 ] && break
+  [ -d "$lh_home" ] || continue
+  lh_homes=$((lh_homes + 1))
+  for lh_hf in .bash_history .zsh_history; do
+    lh_f="$lh_home/$lh_hf"
+    { [ -e "$lh_f" ] || [ -L "$lh_f" ]; } || continue
+    lh_step
+    if [ -L "$lh_f" ]; then
+      printf '%s | 账号 %s | 历史文件是符号链接 -> %s。%s\n' "$lh_f" "$lh_u" "$(readlink "$lh_f" 2>/dev/null)" "$lh_hint"
+      continue
+    fi
+    [ -f "$lh_f" ] || { printf '%s 非常规文件，未检查\n' "$lh_f"; continue; }
+    lh_size=$(wc -c < "$lh_f" 2>/dev/null | tr -d ' ')
+    printf '%s | 账号 %s | 大小 %s 字节\n' "$lh_f" "$lh_u" "${lh_size:-?}"
+    [ "${lh_size:-1}" = 0 ] || continue
+    lh_seen=''
+    if command -v lastlog >/dev/null 2>&1; then
+      lh_ll=$(lastlog -u "$lh_u" 2>/dev/null | tail -n 1)
+      case "$lh_ll" in *'Never logged'*|'') ;; *) lh_seen=yes;; esac
+    elif [ -r /var/log/wtmp ] && command -v last >/dev/null 2>&1; then
+      last -n 3 "$lh_u" 2>/dev/null | grep -q . && lh_seen=yes
+    fi
+    if [ "$lh_seen" = yes ]; then
+      printf '%s | 账号 %s 有登录记录但历史文件为空。%s\n' "$lh_f" "$lh_u" "$lh_hint"
+    else
+      printf '%s | 账号 %s 历史文件为空（未能确认登录记录，未标记）\n' "$lh_f" "$lh_u"
+    fi
+  done
+done < /etc/passwd
+printf '# --- 内核环形缓冲区 ---\n'
+if ! command -v dmesg >/dev/null 2>&1; then
+  lh_gap 'dmesg 不可用，内核环形缓冲区检查未执行。'
+elif ! dmesg >/dev/null 2>&1; then
+  lh_gap 'dmesg 不可读（可能受 dmesg_restrict 限制），内核环形缓冲区检查未执行。'
+else
+  lh_first=$(dmesg 2>/dev/null | grep -m1 '^\[' | sed -n 's/^\[ *\([0-9][0-9.]*\)\].*/\1/p')
+  if [ -n "$lh_first" ]; then
+    lh_fs=${lh_first%%.*}
+    if [ "$lh_fs" -gt 120 ] 2>/dev/null; then
+      printf '内核环形缓冲区最早记录在开机后 %s 秒，可能被清空（dmesg -c），也可能只是缓冲区已滚动。%s\n' "$lh_fs" "$lh_hint"
+    else
+      printf '内核环形缓冲区最早记录在开机后 %s 秒。\n' "$lh_fs"
+    fi
+  else
+    printf '内核环形缓冲区最早记录无法解析时间戳。\n'
+  fi
+fi
+printf '# --- journald ---\n'
+if command -v journalctl >/dev/null 2>&1; then
+  journalctl --list-boots --no-pager 2>/dev/null | head -n 5
+  journalctl --header --no-pager 2>/dev/null | head -n 10
+else
+  printf 'journalctl 不可用（未标记）。\n'
+fi
 "#
 );
 
@@ -1998,7 +2430,17 @@ static CATALOG: &[CommandDefinition] = &[
         "查看 rc.local 与各运行级下的启动脚本。",
         "cat /etc/rc.local 2>/dev/null; echo '--- init 脚本 ---'; ls -l /etc/init.d 2>/dev/null | head -n 100; echo '--- 运行级目录 ---'; ls -l /etc/rc*.d 2>/dev/null | head -n 200; echo '--- init 脚本内容 ---'; grep -nHE '(nohup|insmod|modprobe|/dev/tcp|/dev/udp|curl |wget |base64 -d|bash -i|sh -i|nc -e|socat )' /etc/init.d/* /etc/rc.d/init.d/* 2>/dev/null | head -n 200"
     )
-    .flagging(command_findings::startup_hook),
+    .flagging(command_findings::startup_hook_or_history_evasion),
+    portable!(
+        "startup-init-package-verify",
+        Persistence,
+        "init 脚本包归属比对",
+        "把 /etc/init.d 下的脚本与软件包数据库记录的摘要比对，标出不一致与无归属脚本；数据库本身被改写时结果不可信，配置类文件合法修改也会不一致。",
+        INIT_PACKAGE_VERIFY
+    )
+    .self_checked()
+    .with_timeout(60)
+    .flagging(command_findings::init_script_package_mismatch),
     portable!(
         "persistence-ldso",
         Persistence,
@@ -2014,7 +2456,7 @@ static CATALOG: &[CommandDefinition] = &[
         "读取全局 Shell 启动脚本，定位注入的命令。",
         "for f in /etc/profile /etc/bash.bashrc /etc/bashrc /etc/profile.d/*; do [ -f \"$f\" ] && { echo \"--- $f ---\"; cat \"$f\" 2>/dev/null; }; done 2>/dev/null | head -n 400"
     )
-    .flagging(command_findings::startup_hook),
+    .flagging(command_findings::startup_hook_or_history_evasion),
     portable!(
         "persistence-user-rc",
         Persistence,
@@ -2022,7 +2464,7 @@ static CATALOG: &[CommandDefinition] = &[
         "读取各账号的 Shell 启动脚本。",
         "for f in /root/.bashrc /root/.bash_profile /root/.profile /home/*/.bashrc /home/*/.bash_profile /home/*/.profile; do [ -f \"$f\" ] && { echo \"--- $f ---\"; cat \"$f\" 2>/dev/null; }; done 2>/dev/null | head -n 400"
     )
-    .flagging(command_findings::startup_hook),
+    .flagging(command_findings::startup_hook_or_history_evasion),
     portable!(
         "persistence-motd",
         Persistence,
@@ -2030,7 +2472,7 @@ static CATALOG: &[CommandDefinition] = &[
         "登录时自动执行的横幅脚本也可被用作后门。",
         "ls -l /etc/update-motd.d /etc/motd /etc/issue /etc/issue.net 2>/dev/null; echo '--- 脚本内容 ---'; cat /etc/update-motd.d/* 2>/dev/null | head -n 200"
     )
-    .flagging(command_findings::startup_hook),
+    .flagging(command_findings::startup_hook_or_history_evasion),
     portable!(
         "persistence-udev",
         Persistence,
@@ -2052,7 +2494,7 @@ static CATALOG: &[CommandDefinition] = &[
         Persistence,
         "超级守护进程服务",
         "检查 inetd 与 xinetd 中注册的服务。",
-        "cat /etc/inetd.conf 2>/dev/null; ls -l /etc/xinetd.d 2>/dev/null; cat /etc/xinetd.d/* 2>/dev/null | head -n 200; echo '--- tcpd 包装规则 ---'; grep -vE '^[[:space:]]*(#|$)' /etc/hosts.allow /etc/hosts.deny 2>/dev/null | head -n 200"
+        "cat /etc/inetd.conf 2>/dev/null; ls -l /etc/xinetd.d 2>/dev/null; ls -1d /etc/xinetd.d/* 2>/dev/null | head -n 100; cat /etc/xinetd.d/* 2>/dev/null | head -n 200; echo '--- tcpd 包装规则 ---'; grep -vE '^[[:space:]]*(#|$)' /etc/hosts.allow /etc/hosts.deny 2>/dev/null | head -n 200"
     )
     .flagging(command_findings::startup_hook),
     portable!(
@@ -2090,6 +2532,16 @@ static CATALOG: &[CommandDefinition] = &[
         "grep -rnE '^[[:space:]]*(alias[[:space:]]|function[[:space:]]|trap[[:space:]]|[A-Za-z_][A-Za-z0-9_.-]*[[:space:]]*\\(\\)[[:space:]]*(\\{|$))' /etc/profile /etc/profile.d /etc/bash.bashrc /etc/bashrc /root/.bashrc /root/.bash_aliases /home/*/.bashrc /home/*/.bash_aliases /etc/profile.d/*.sh /root/.profile /home/*/.profile /root/.zshrc /home/*/.zshrc 2>/dev/null | head -n 200"
     )
     .flagging(command_findings::shell_hijack),
+    portable!(
+        "persistence-editor-config",
+        Persistence,
+        "编辑器配置持久化",
+        "检查 vim/ex/nano/emacs 配置中启动或打开文件时自动执行的内容；modeline 本身是合法选项，是否可利用取决于编辑器版本、执行上下文与文件来源；~/.vim/plugin 下的文件在 vim 启动时自动加载。",
+        EDITOR_CONFIG_PERSISTENCE
+    )
+    .self_checked()
+    .with_timeout(60)
+    .flagging(command_findings::editor_config_hook),
     portable!(
         "persistence-python-pth",
         Persistence,
@@ -2138,6 +2590,16 @@ static CATALOG: &[CommandDefinition] = &[
         "ls -l /var/log/wtmp /var/log/btmp /var/log/lastlog /var/run/utmp 2>/dev/null; echo '--- 空日志文件 ---'; find /var/log -type f -size 0 -exec ls -ld -- {} + 2>/dev/null | head -n 200"
     )
     .flagging(command_findings::emptied_log),
+    portable!(
+        "log-tamper-signs",
+        Logs,
+        "日志与历史反取证线索",
+        "检查日志异常截断/清空、登录记录缺口、历史文件符号链接与内核/日志缓冲区起点；均为需关注线索，缺失不代表没有发生。",
+        LOG_TAMPER_SIGNS
+    )
+    .self_checked()
+    .with_timeout(60)
+    .flagging(command_findings::log_tamper_sign),
     portable!(
         "log-journal",
         Logs,
@@ -2630,6 +3092,16 @@ static CATALOG: &[CommandDefinition] = &[
     .self_checked()
     .with_timeout(60)
     .flagging(command_findings::collection_finding),
+    portable!(
+        "system-module-revival-points",
+        System,
+        "模块复活点清单",
+        "列出能把内核模块重新装回的全部位置：启动脚本、定时任务、xinetd、unit 执行行、/etc/modules* 与 modprobe.d 的执行性行、模块目录外的 .ko 文件；末尾给出本次开机时间供重启后复核；不提供一键 rmmod。",
+        CMD_SYSTEM_MODULE_REVIVAL_POINTS
+    )
+    .self_checked()
+    .with_timeout(60)
+    .flagging(command_findings::module_revival_point),
     portable!(
         "perm-dt-needed",
         Permissions,

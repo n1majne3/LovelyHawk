@@ -14,7 +14,7 @@ import {
 } from "./local-scan-controller";
 import { LocalScanBody, LocalScanDialog, type LocalScanSubject } from "./LocalScanDialog";
 
-const offer: EmergencyCommandPathOffer = { pathHandle: "path-one", path: "/tmp/.cache/.helper", line: 0 };
+const offer: EmergencyCommandPathOffer = { pathHandle: "path-one", path: "/tmp/.cache/.helper", line: 0, lineEditable: false, xinetdService: false };
 const engine = { id: "engine-one", name: "D盾网页查杀", kind: "gui" as const, programName: "D_Safe_Manage.exe" };
 const cli = { id: "engine-two", name: "clamscan", kind: "cli" as const, programName: "clamscan.exe" };
 const fetched: LocalScanFetchDto = {

@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { FileEvidenceController } from "./file-evidence-controller";
 import type { FileEvidenceRequest, FileEvidenceResult } from "../shared/file-evidence-contract";
-const offer = { pathHandle: "path-one", path: "/tmp/sample", line: 0 };
+const offer = { pathHandle: "path-one", path: "/tmp/sample", line: 0, lineEditable: false, xinetdService: false };
 const running: FileEvidenceResult = {
   jobHandle: "job-one", pathHandle: offer.pathHandle, path: offer.path, targetLabel: "root@127.0.0.1:22",
   folderName: "LovelyHawk-evidence-12345678-1234-4234-8234-123456789012", caseTitle: "测试案件", state: "collecting",

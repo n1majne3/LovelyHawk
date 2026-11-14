@@ -1,0 +1,140 @@
+.process-watch-dialog {
+  max-width: 64rem;
+  width: 90vw;
+  max-height: 85vh;
+  overflow: auto;
+}
+
+.process-watch-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--space-3, 0.75rem);
+}
+
+.process-watch-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-4, 1rem);
+  align-items: center;
+}
+
+.process-watch-options label {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2, 0.5rem);
+}
+
+.process-watch-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2, 0.5rem);
+  align-items: center;
+  margin-block: var(--space-2, 0.5rem);
+}
+
+.process-watch-tabs {
+  display: flex;
+  gap: var(--space-2, 0.5rem);
+  margin-block: var(--space-2, 0.5rem);
+}
+
+.process-watch-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--font-small);
+}
+
+.process-watch-table th,
+.process-watch-table td {
+  text-align: left;
+  padding: 0.25rem 0.5rem;
+  border-bottom: 1px solid var(--border-strong);
+  vertical-align: top;
+}
+
+.process-watch-command {
+  max-width: 30rem;
+}
+
+/* Collected command lines can be long and hostile: wrap anywhere, render as
+   plain text, never trust markup. */
+.process-watch-command code,
+.process-watch-table code {
+  white-space: pre-wrap;
+  word-break: break-all;
+  overflow-wrap: anywhere;
+}
+
+.process-watch-pager {
+  display: flex;
+  gap: var(--space-2, 0.5rem);
+  align-items: center;
+  margin-block-start: var(--space-2, 0.5rem);
+}
+
+.process-watch-methods {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2, 0.5rem);
+  border: 1px solid var(--border-strong);
+  padding: var(--space-2, 0.5rem) var(--space-3, 0.75rem);
+  margin: 0;
+}
+
+.process-watch-methods label,
+.process-watch-check {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2, 0.5rem);
+}
+
+.process-watch-plan-facts {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: var(--space-2, 0.5rem) var(--space-3, 0.75rem);
+  margin: var(--space-2, 0.5rem) 0;
+}
+
+.process-watch-plan-facts dt {
+  font-weight: 600;
+}
+
+.process-watch-plan-facts dd {
+  margin: 0;
+}
+
+.process-watch-plan-facts code,
+.process-watch-residues code,
+.process-watch-origins code,
+.process-watch-checks code {
+  white-space: pre-wrap;
+  word-break: break-all;
+  overflow-wrap: anywhere;
+}
+
+.process-watch-plan-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2, 0.5rem);
+  margin-block-start: var(--space-3, 0.75rem);
+}
+
+.process-watch-residues ul,
+.process-watch-origins ul,
+.process-watch-checks ul {
+  margin: var(--space-2, 0.5rem) 0;
+  padding-inline-start: var(--space-4, 1rem);
+}
+
+.process-watch-residues li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2, 0.5rem);
+}
+
+.process-watch-sources ul {
+  margin: var(--space-2, 0.5rem) 0;
+  padding-inline-start: var(--space-4, 1rem);
+}

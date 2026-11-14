@@ -1190,6 +1190,34 @@ pub async fn pcap_offline_import<R: Runtime>(
     Ok(json!({ "started": true }))
 }
 
+/// Picking the pspy program for an upload watch in the native dialog. The
+/// path stays on the host; the page learns the file's name, size, digest and
+/// which upstream release it is, and holds a handle to it.
+#[tauri::command]
+pub async fn process_watch_pick_tool<R: Runtime>(
+    window: WebviewWindow<R>,
+    host: State<'_, Host>,
+) -> CommandResult<Value> {
+    require_main(&window)?;
+    let Some(path) =
+        local_files::choose(&window, "选择 pspy 程序文件", DialogKind::OpenFile, None).await
+    else {
+        return Ok(json!({ "picked": false }));
+    };
+    let tool = host
+        .bridge
+        .call(
+            "process-watch.tool.load-path",
+            json!({ "localPath": path.to_string_lossy() }),
+        )
+        .await
+        .map_err(|_| {
+            "所选文件不是可以上传运行的 Linux 程序。请选择从 pspy 发布页下载的 pspy64 或 pspy32。"
+                .to_owned()
+        })?;
+    Ok(json!({ "picked": true, "tool": tool }))
+}
+
 /// Exporting one extracted object to a dialog-chosen file. The content stays
 /// untrusted bytes on the host; the page picks the object by id only.
 #[tauri::command]

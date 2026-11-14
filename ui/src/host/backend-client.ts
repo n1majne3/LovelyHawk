@@ -79,6 +79,8 @@ import {
   type EmergencyCommandResult,
   type EmergencyPathAction,
   type EmergencyPathDetail,
+  type EmergencyPathLinesPlan,
+  type EmergencyPathLinesPreview,
   type EmergencyPathPlan,
   type EmergencyPathBatchPlan,
   type EmergencyPathBatchStep,
@@ -97,6 +99,18 @@ import {
   type PacketCaptureStarted,
   type PacketCaptureStartInput,
   type PacketCaptureStopped,
+  type ProcessWatchAccounting,
+  type ProcessWatchCleanup,
+  type ProcessWatchSource,
+  type ProcessWatchPoll,
+  type ProcessWatchProbe,
+  type ProcessWatchResidue,
+  type ProcessWatchUploadInput,
+  type ProcessWatchUploadPlan,
+  type ProcessWatchStarted,
+  type ProcessWatchStartInput,
+  type ProcessWatchStopped,
+  type ProcessWatchSummary,
   type ApplicationLogClearResult,
   type ApplicationLogFilter,
   type ApplicationLogLevel,
@@ -249,6 +263,8 @@ import {
   isEmergencyPathBatchPlan,
   isEmergencyPathBatchStep,
   isEmergencyPathDetail,
+  isEmergencyPathLinesPlan,
+  isEmergencyPathLinesPreview,
   isEmergencyPathPlan,
   isEmergencyPathReceipt,
   isEmergencyPathUndoResult,
@@ -267,6 +283,19 @@ import {
   isPacketCaptureStarted,
   isPacketCaptureStartInput,
   isPacketCaptureStopped,
+  isProcessWatchHandle,
+  isProcessWatchPoll,
+  isProcessWatchProbe,
+  isProcessWatchAccounting,
+  isProcessWatchSourceList,
+  isProcessWatchResidueCleaned,
+  isProcessWatchResidueList,
+  isProcessWatchUploadInput,
+  isProcessWatchUploadPlan,
+  isProcessWatchStarted,
+  isProcessWatchStartInput,
+  isProcessWatchStopped,
+  isProcessWatchSummary,
   isApplicationLogClearResult,
   isApplicationLogFilter,
   isApplicationLogLevel,
@@ -415,6 +444,13 @@ const PACKET_CAPTURE_LIST_TIMEOUT_MS = 20_000;
 const PACKET_CAPTURE_START_TIMEOUT_MS = 40_000;
 const PACKET_CAPTURE_POLL_TIMEOUT_MS = 20_000;
 const PACKET_CAPTURE_STOP_TIMEOUT_MS = 10_000;
+const PROCESS_WATCH_PROBE_TIMEOUT_MS = 20_000;
+const PROCESS_WATCH_START_TIMEOUT_MS = 40_000;
+const PROCESS_WATCH_POLL_TIMEOUT_MS = 20_000;
+const PROCESS_WATCH_STOP_TIMEOUT_MS = 60_000;
+const PROCESS_WATCH_PLAN_TIMEOUT_MS = 45_000;
+// Uploading a few megabytes in small verified steps, then starting.
+const PROCESS_WATCH_UPLOAD_TIMEOUT_MS = 240_000;
 
 export const SYSTEM_INFO_RPC_METHODS = Object.freeze({
   catalog: "system-info.catalog.get",
@@ -537,6 +573,8 @@ export const EMERGENCY_COMMAND_RPC_METHODS = Object.freeze({
   run: "emergency-command.run",
   inspectPath: "emergency-command.path.inspect",
   planPath: "emergency-command.path.plan",
+  linesPath: "emergency-command.path.lines",
+  planLinesPath: "emergency-command.path.plan-lines",
   confirmPath: "emergency-command.path.confirm",
   executePath: "emergency-command.path.execute",
   cancelPath: "emergency-command.path.cancel",
@@ -566,6 +604,20 @@ export const PACKET_CAPTURE_LIVE_RPC_METHODS = Object.freeze({
   start: "packet-capture.start",
   poll: "packet-capture.poll",
   stop: "packet-capture.stop",
+} as const);
+
+export const PROCESS_WATCH_RPC_METHODS = Object.freeze({
+  probe: "process-watch.probe",
+  start: "process-watch.start",
+  poll: "process-watch.poll",
+  stop: "process-watch.stop",
+  summary: "process-watch.summary",
+  uploadPlan: "process-watch.upload.plan",
+  uploadStart: "process-watch.upload.start",
+  residueList: "process-watch.residue.list",
+  residueClean: "process-watch.residue.clean",
+  sources: "process-watch.sources",
+  accountingRead: "process-watch.accounting.read",
 } as const);
 
 export const APPLICATION_LOG_RPC_METHODS = Object.freeze({
@@ -640,7 +692,7 @@ export const TERMINAL_RPC_METHODS = Object.freeze({
 const REMOTE_NAMESPACES: ReadonlySet<string> = new Set([
   "baseline", "check-audit", "docker", "emergency-command", "firewall",
   "integrity", "kubernetes", "log-analysis", "middleware", "packet-capture",
-  "sftp-browser", "snapshot", "system-info",
+  "process-watch", "sftp-browser", "snapshot", "system-info",
 ]);
 
 /**
@@ -2112,6 +2164,47 @@ export class BackendClient {
     return value;
   }
 
+  async previewEmergencyPathLines(
+    bindingHandle: string,
+    pathHandle: string,
+  ): Promise<EmergencyPathLinesPreview> {
+    if (![bindingHandle, pathHandle].every(isEmergencyCommandOpaqueHandle)) {
+      throw new Error("The emergency path lines request is invalid.");
+    }
+    const value = await this.#request(EMERGENCY_COMMAND_RPC_METHODS.linesPath, {
+      bindingHandle,
+      pathHandle,
+    });
+    if (!isEmergencyPathLinesPreview(value) || value.pathHandle !== pathHandle) {
+      throw new Error("The backend returned an invalid emergency path lines preview.");
+    }
+    return value;
+  }
+
+  async planEmergencyPathLines(
+    bindingHandle: string,
+    previewHandle: string,
+    firstLine: number,
+    lastLine: number,
+  ): Promise<EmergencyPathLinesPlan> {
+    const lineNumber = (value: number): boolean =>
+      Number.isSafeInteger(value) && value >= 1 && value <= 10_000_000;
+    if (![bindingHandle, previewHandle].every(isEmergencyCommandOpaqueHandle) ||
+      !lineNumber(firstLine) || !lineNumber(lastLine) || lastLine < firstLine) {
+      throw new Error("The emergency path line deletion request is invalid.");
+    }
+    const value = await this.#request(EMERGENCY_COMMAND_RPC_METHODS.planLinesPath, {
+      bindingHandle,
+      previewHandle,
+      firstLine,
+      lastLine,
+    });
+    if (!isEmergencyPathLinesPlan(value)) {
+      throw new Error("The backend returned an invalid emergency path line deletion plan.");
+    }
+    return value;
+  }
+
   async confirmEmergencyPathAction(
     bindingHandle: string,
     planHandle: string,
@@ -2360,6 +2453,198 @@ export class BackendClient {
       throw new Error("The backend returned an invalid packet capture stop result.");
     }
     return value;
+  }
+
+  async probeProcessWatch(bindingHandle: string): Promise<ProcessWatchProbe> {
+    if (!isProcessWatchHandle(bindingHandle)) {
+      throw new Error("The process watch probe request is invalid.");
+    }
+    const value = await this.#request(PROCESS_WATCH_RPC_METHODS.probe, {
+      bindingHandle,
+    }, PROCESS_WATCH_PROBE_TIMEOUT_MS);
+    if (!isProcessWatchProbe(value)) {
+      throw new Error("The backend returned an invalid process watch probe result.");
+    }
+    return value;
+  }
+
+  async startProcessWatch(
+    bindingHandle: string,
+    input: ProcessWatchStartInput,
+  ): Promise<ProcessWatchStarted> {
+    if (!isProcessWatchHandle(bindingHandle) || !isProcessWatchStartInput(input)) {
+      throw new Error("The process watch start request is invalid.");
+    }
+    const value = await this.#request(PROCESS_WATCH_RPC_METHODS.start, {
+      bindingHandle,
+      input,
+    }, PROCESS_WATCH_START_TIMEOUT_MS);
+    if (
+      !isProcessWatchStarted(value) || value.watchHandle === bindingHandle
+    ) {
+      throw new Error("The backend returned an invalid process watch start result.");
+    }
+    return value;
+  }
+
+  async pollProcessWatch(
+    bindingHandle: string,
+    watchHandle: string,
+    cursor: number,
+    limit: number,
+  ): Promise<ProcessWatchPoll> {
+    if (
+      !isProcessWatchHandle(bindingHandle) || !isProcessWatchHandle(watchHandle) ||
+      !Number.isSafeInteger(cursor) || cursor < 0 ||
+      !Number.isSafeInteger(limit) || limit < 1 || limit > 500
+    ) {
+      throw new Error("The process watch poll request is invalid.");
+    }
+    const value = await this.#request(PROCESS_WATCH_RPC_METHODS.poll, {
+      bindingHandle,
+      watchHandle,
+      cursor,
+      limit,
+    }, PROCESS_WATCH_POLL_TIMEOUT_MS);
+    if (
+      !isProcessWatchPoll(value) ||
+      value.watchHandle !== watchHandle ||
+      value.events.some((event) => event.seq <= cursor)
+    ) {
+      throw new Error("The backend returned an invalid process watch poll result.");
+    }
+    return value;
+  }
+
+  async stopProcessWatch(
+    bindingHandle: string,
+    watchHandle: string,
+  ): Promise<ProcessWatchStopped> {
+    if (!isProcessWatchHandle(bindingHandle) || !isProcessWatchHandle(watchHandle)) {
+      throw new Error("The process watch stop request is invalid.");
+    }
+    const value = await this.#request(PROCESS_WATCH_RPC_METHODS.stop, {
+      bindingHandle,
+      watchHandle,
+    }, PROCESS_WATCH_STOP_TIMEOUT_MS);
+    if (!isProcessWatchStopped(value)) {
+      throw new Error("The backend returned an invalid process watch stop result.");
+    }
+    return value;
+  }
+
+  async processWatchSummary(
+    bindingHandle: string,
+    watchHandle: string,
+  ): Promise<ProcessWatchSummary> {
+    if (!isProcessWatchHandle(bindingHandle) || !isProcessWatchHandle(watchHandle)) {
+      throw new Error("The process watch summary request is invalid.");
+    }
+    const value = await this.#request(PROCESS_WATCH_RPC_METHODS.summary, {
+      bindingHandle,
+      watchHandle,
+    }, PROCESS_WATCH_POLL_TIMEOUT_MS);
+    if (!isProcessWatchSummary(value)) {
+      throw new Error("The backend returned an invalid process watch summary result.");
+    }
+    return value;
+  }
+
+  async planProcessWatchUpload(
+    bindingHandle: string,
+    input: ProcessWatchUploadInput,
+  ): Promise<ProcessWatchUploadPlan> {
+    if (!isProcessWatchHandle(bindingHandle) || !isProcessWatchUploadInput(input)) {
+      throw new Error("The process watch upload plan request is invalid.");
+    }
+    const value = await this.#request(PROCESS_WATCH_RPC_METHODS.uploadPlan, {
+      bindingHandle,
+      input,
+    }, PROCESS_WATCH_PLAN_TIMEOUT_MS);
+    if (
+      !isProcessWatchUploadPlan(value) || value.durationSeconds !== input.durationSeconds ||
+      value.fileEvents !== input.fileEvents
+    ) {
+      throw new Error("The backend returned an invalid process watch upload plan.");
+    }
+    return value;
+  }
+
+  async startProcessWatchUpload(
+    bindingHandle: string,
+    planHandle: string,
+  ): Promise<ProcessWatchStarted> {
+    if (!isProcessWatchHandle(bindingHandle) || !isProcessWatchHandle(planHandle)) {
+      throw new Error("The process watch upload start request is invalid.");
+    }
+    const value = await this.#request(PROCESS_WATCH_RPC_METHODS.uploadStart, {
+      bindingHandle,
+      planHandle,
+    }, PROCESS_WATCH_UPLOAD_TIMEOUT_MS);
+    if (!isProcessWatchStarted(value) || value.method !== "pspy") {
+      throw new Error("The backend returned an invalid process watch upload start result.");
+    }
+    return value;
+  }
+
+  async listProcessWatchResidues(bindingHandle: string): Promise<ProcessWatchResidue[]> {
+    if (!isProcessWatchHandle(bindingHandle)) {
+      throw new Error("The process watch residue list request is invalid.");
+    }
+    const value = await this.#request(PROCESS_WATCH_RPC_METHODS.residueList, {
+      bindingHandle,
+    }, PROCESS_WATCH_PLAN_TIMEOUT_MS);
+    if (!isProcessWatchResidueList(value)) {
+      throw new Error("The backend returned an invalid process watch residue list.");
+    }
+    return value;
+  }
+
+  async listProcessWatchSources(bindingHandle: string): Promise<ProcessWatchSource[]> {
+    if (!isProcessWatchHandle(bindingHandle)) {
+      throw new Error("The process watch sources request is invalid.");
+    }
+    const value = await this.#request(PROCESS_WATCH_RPC_METHODS.sources, {
+      bindingHandle,
+    }, PROCESS_WATCH_PROBE_TIMEOUT_MS);
+    if (!isProcessWatchSourceList(value)) {
+      throw new Error("The backend returned an invalid process watch sources result.");
+    }
+    return value;
+  }
+
+  async readProcessWatchAccounting(
+    bindingHandle: string,
+    minutes: number,
+  ): Promise<ProcessWatchAccounting> {
+    if (!isProcessWatchHandle(bindingHandle) || !Number.isSafeInteger(minutes) || minutes < 1 || minutes > 120) {
+      throw new Error("The process accounting request is invalid.");
+    }
+    const value = await this.#request(PROCESS_WATCH_RPC_METHODS.accountingRead, {
+      bindingHandle,
+      minutes,
+    }, PROCESS_WATCH_PLAN_TIMEOUT_MS);
+    if (!isProcessWatchAccounting(value) || value.minutes !== minutes) {
+      throw new Error("The backend returned an invalid process accounting result.");
+    }
+    return value;
+  }
+
+  async cleanProcessWatchResidue(
+    bindingHandle: string,
+    residueHandle: string,
+  ): Promise<ProcessWatchCleanup> {
+    if (!isProcessWatchHandle(bindingHandle) || !isProcessWatchHandle(residueHandle)) {
+      throw new Error("The process watch residue clean request is invalid.");
+    }
+    const value = await this.#request(PROCESS_WATCH_RPC_METHODS.residueClean, {
+      bindingHandle,
+      residueHandle,
+    }, PROCESS_WATCH_PLAN_TIMEOUT_MS);
+    if (!isProcessWatchResidueCleaned(value)) {
+      throw new Error("The backend returned an invalid process watch residue result.");
+    }
+    return value.cleanup;
   }
 
   async listApplicationLogs(filter: ApplicationLogFilter): Promise<ApplicationLogSnapshot> {

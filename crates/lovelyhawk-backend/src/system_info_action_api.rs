@@ -121,6 +121,7 @@ impl RowAction {
             Self::ArtifactMutation(action) => match action {
                 ArtifactMutationAction::DeleteCronFile => "cron.delete-file",
                 ArtifactMutationAction::CommentShellLine => "shell.comment-line",
+                ArtifactMutationAction::DeleteShellLine => "shell.delete-line",
                 ArtifactMutationAction::RemoveSuidBits => "suid.remove-bits",
                 ArtifactMutationAction::QuarantineSuidFile => "suid.quarantine",
                 ArtifactMutationAction::AddManagedModuleBlacklist => "module.blacklist.add",
@@ -191,6 +192,9 @@ impl RowAction {
             "shell" => match rest {
                 "comment-line" => Some(Self::ArtifactMutation(
                     ArtifactMutationAction::CommentShellLine,
+                )),
+                "delete-line" => Some(Self::ArtifactMutation(
+                    ArtifactMutationAction::DeleteShellLine,
                 )),
                 _ => from_kebab(rest)
                     .map(ArtifactInvestigationAction::ShellConfig)
@@ -389,6 +393,9 @@ impl RowAction {
                 );
                 actions.push(Self::ArtifactMutation(
                     ArtifactMutationAction::CommentShellLine,
+                ));
+                actions.push(Self::ArtifactMutation(
+                    ArtifactMutationAction::DeleteShellLine,
                 ));
             }
             SystemInfoTab::Sudoers => actions.extend(

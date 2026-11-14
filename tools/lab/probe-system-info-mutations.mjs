@@ -2,7 +2,8 @@
 // machine what actually happened.
 //
 // Four of the twenty-five tabs offer an action that writes to the target:
-// delete a standalone cron file, comment out a line in a shell startup file,
+// delete a standalone cron file, comment out or delete a line in a shell
+// startup file,
 // strip the SUID/SGID bits off a file, or take its permissions to zero. They
 // are the fastest way to cut persistence — the operator is already looking at
 // the row that proves it — and until now every one of them had only ever been
@@ -18,7 +19,7 @@
 //   LAB=alpine node tools/lab/probe-system-info-mutations.mjs
 import { execFileSync } from "node:child_process";
 
-import { Sidecar, newDataRoot, connect } from "./rpc-harness.mjs";
+import { Sidecar, newDataRoot, connect, backendBinary } from "./rpc-harness.mjs";
 import { labTarget } from "./lab-target.mjs";
 
 const which = process.env.LAB ?? "ubuntu";
@@ -52,7 +53,7 @@ function onHost(command) {
 }
 
 const trimmed = (command) => onHost(command).split("\0").join("").trim();
-const sidecar = new Sidecar("D:/LovelyRes/target/debug/lovelyhawk-backend.exe", newDataRoot());
+const sidecar = new Sidecar(backendBinary(), newDataRoot());
 
 /// Collects a tab and finds the row whose text names `needle`.
 async function rowNaming(binding, tab, needle) {
@@ -136,6 +137,29 @@ try {
     check("行数一行没多也没少", afterLines.length, beforeLines.length);
     check("旁边的行一个字都没动", afterLines.filter((line) => !line.includes("203.0.113.7")),
       (value) => value.join("\n") === beforeLines.filter((line) => !line.includes("203.0.113.7")).join("\n"));
+    check("文件结尾的换行还在", after, (value) => String(value).endsWith("\n"));
+    check("文件权限没被顺手改掉", trimmed(`stat -c %a ${SHELL_FILE}`), beforeMode);
+  }
+
+  // ---- 删掉启动文件里的一行（留证后删除，不是注释） ------------------------
+  console.log("\n  删掉启动文件里的那一行");
+  // The planted `export LOVELYHAWK_PROBE=1` is still there whether or not the
+  // comment run above found its own line, and deleting it is exactly what the
+  // action is for: the line leaves the file, every other byte stays.
+  const del = await rowNaming(binding, "shell-configs", "LOVELYHAWK_PROBE");
+  check("总览里看得到要删的那一行", del.row?.id, (value) => String(value ?? "").length > 0);
+  if (del.row !== undefined) {
+    const commentAfter = onHost(`cat ${SHELL_FILE}`);
+    const receipt = await runAction(binding, del.table, del.row, "shell.delete-line");
+    check("执行后复核通过", receipt.passed, true);
+    const after = onHost(`cat ${SHELL_FILE}`);
+    const afterLines = after.split("\n");
+    check("那一行被删掉了，不是被注释", after,
+      (value) => !String(value).includes("LOVELYHAWK_PROBE=1"));
+    check("行数少了一行", afterLines.length, commentAfter.split("\n").length - 1);
+    check("旁边的行一个字都没动", afterLines,
+      (value) => value.join("\n") === commentAfter.split("\n")
+        .filter((line) => !line.includes("LOVELYHAWK_PROBE")).join("\n"));
     check("文件结尾的换行还在", after, (value) => String(value).endsWith("\n"));
     check("文件权限没被顺手改掉", trimmed(`stat -c %a ${SHELL_FILE}`), beforeMode);
   }

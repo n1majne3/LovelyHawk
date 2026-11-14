@@ -41,6 +41,7 @@
     "allow-config-visual-save",
     "allow-windows-file-save",
     "allow-pcap-offline-import",
+    "allow-process-watch-pick-tool",
     "allow-pcap-offline-export",
     "allow-windows-rdp",
     "allow-windows-channel-owner",

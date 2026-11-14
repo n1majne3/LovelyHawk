@@ -333,7 +333,7 @@ function LocalScanHits({ hits, onLocate }: {
             <div className="local-scan-hit-line">{hit.line}</div>
             {hit.pathHandle !== null && onLocate !== undefined ? (
               <button type="button" data-testid="local-scan-hit-locate"
-                onClick={(event) => onLocate(event, { path: hit.remotePath, pathHandle: hit.pathHandle!, line: index + 1 })}>
+                onClick={(event) => onLocate(event, { path: hit.remotePath, pathHandle: hit.pathHandle!, line: index + 1, lineEditable: false, xinetdService: false })}>
                 在远端定位
               </button>
             ) : null}

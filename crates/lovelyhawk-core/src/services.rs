@@ -25,6 +25,7 @@ use crate::middleware::MiddlewareService;
 use crate::operations::PortableOperationJournal;
 use crate::packet_capture::PacketCaptureService;
 use crate::path_guard::PathGuard;
+use crate::process_watch::ProcessWatchService;
 use crate::report::ReportService;
 use crate::settings::SettingsRepository;
 use crate::sftp::SftpService;
@@ -56,6 +57,7 @@ struct BackendServicesInner {
     database: DatabaseService,
     log_analysis: LogAnalysisService,
     packet_capture: PacketCaptureService,
+    process_watch: ProcessWatchService,
     file_analysis: FileAnalysisService,
     investigation: InvestigationRepositories,
     report: ReportService,
@@ -106,6 +108,7 @@ impl BackendServices {
         let log_analysis = LogAnalysisService::new(ssh.clone(), target.clone(), store.clone());
         let file_analysis = FileAnalysisService::new(ssh.clone(), target.clone());
         let packet_capture = PacketCaptureService::new(ssh.clone(), target.clone());
+        let process_watch = ProcessWatchService::new(ssh.clone(), target.clone());
         let audit = AuditService::new(ssh.clone(), target.clone(), store.clone());
         let integrity = IntegrityService::new(ssh.clone(), target.clone(), store.clone());
         let investigation = InvestigationRepositories::new(store.clone());
@@ -144,6 +147,7 @@ impl BackendServices {
                 database,
                 log_analysis,
                 packet_capture,
+                process_watch,
                 file_analysis,
                 investigation,
                 report,
@@ -228,6 +232,10 @@ impl BackendServices {
 
     pub fn packet_capture(&self) -> &PacketCaptureService {
         &self.inner.packet_capture
+    }
+
+    pub fn process_watch(&self) -> &ProcessWatchService {
+        &self.inner.process_watch
     }
 
     pub fn file_analysis(&self) -> &FileAnalysisService {

@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
   isEmergencyPathDetail,
+  isEmergencyPathLinesPlan,
+  isEmergencyPathLinesPreview,
   isEmergencyPathPlan,
   isEmergencyPathReceipt,
   isEmergencyPathUndoResult,
@@ -9,6 +11,8 @@ import {
   type EmergencyCommandPathOffer,
   type EmergencyPathAction,
   type EmergencyPathDetail,
+  type EmergencyPathLinesPlan,
+  type EmergencyPathLinesPreview,
   type EmergencyPathPlan,
   type EmergencyPathReceipt,
   type EmergencyPathUndoResult,
@@ -19,6 +23,19 @@ import type { EmergencyPathMenuAction } from "./EmergencyPathMenu";
 export interface EmergencyPathMenuState {
   position: { x: number; y: number };
   offer: EmergencyCommandPathOffer;
+}
+
+/** The delete-lines flow: preview, range plan, receipt, one undo offer. */
+export interface EmergencyPathLinesState {
+  offer: EmergencyCommandPathOffer;
+  preview: EmergencyPathLinesPreview | null;
+  plan: EmergencyPathLinesPlan | null;
+  receipt: EmergencyPathReceipt | null;
+  /** What the one undo attempt reported, once it has been made. */
+  undo: EmergencyPathUndoResult | null;
+  undoSpent: boolean;
+  busy: boolean;
+  error: string | null;
 }
 
 export interface EmergencyPathActionState {
@@ -43,6 +60,8 @@ interface PathContext {
 
 interface PathOperation extends PathContext {
   bindingHandle: string;
+  /** The preview the line range was picked on; needed until plan-lines answers. */
+  previewHandle: string | null;
   plan: EmergencyPathPlan | null;
   /** A verified, reversible receipt; cleared as soon as an undo is attempted. */
   done: EmergencyPathReceipt | null;
@@ -73,6 +92,7 @@ function message(error: unknown): string {
 export function useEmergencyPathActions(api: EmergencyCommandApi, bindingHandle: string | null) {
   const [menu, setMenu] = useState<(EmergencyPathMenuState & PathContext) | null>(null);
   const [state, setState] = useState<EmergencyPathActionState | null>(null);
+  const [lines, setLines] = useState<EmergencyPathLinesState | null>(null);
   // Each dialog owns its request and plan. A closed dialog's finally block
   // must never unlock, fill, or execute the dialog that replaced it.
   const operationRef = useRef<PathOperation | null>(null);
@@ -113,6 +133,7 @@ export function useEmergencyPathActions(api: EmergencyCommandApi, bindingHandle:
     operationRef.current = null;
     setMenu(null);
     setState(null);
+    setLines(null);
     if (abandoned !== null) cancelPlan(abandoned);
   }, []);
 
@@ -121,9 +142,30 @@ export function useEmergencyPathActions(api: EmergencyCommandApi, bindingHandle:
     setMenu(null);
     if (bindingHandle === null || operationRef.current !== null ||
       contextRef.current?.api !== api || contextRef.current.bindingHandle !== bindingHandle) return;
-    const action = menuAction === "properties" ? null : menuAction;
-    const operation: PathOperation = { api, bindingHandle, plan: null, done: null, busy: true };
+    const operation: PathOperation = { api, bindingHandle, previewHandle: null, plan: null, done: null, busy: true };
     operationRef.current = operation;
+    if (menuAction === "delete-lines") {
+      setLines({ offer, preview: null, plan: null, receipt: null, undo: null, undoSpent: false, busy: true, error: null });
+      try {
+        const preview = await api.previewEmergencyPathLines(bindingHandle, offer.pathHandle);
+        if (!isCurrent(operation)) return;
+        if (!isEmergencyPathLinesPreview(preview) || preview.pathHandle !== offer.pathHandle ||
+          preview.path !== offer.path) {
+          throw new Error("文件行内容与本次选择不一致，请关闭后重新检查。");
+        }
+        operation.previewHandle = preview.previewHandle;
+        setLines({ offer, preview, plan: null, receipt: null, undo: null, undoSpent: false, busy: false, error: null });
+      } catch (error) {
+        if (!isCurrent(operation)) return;
+        operationRef.current = null;
+        setLines((current) => current === null ? null
+          : { ...current, busy: false, error: reason(message(error), "delete-lines") });
+      } finally {
+        operation.busy = false;
+      }
+      return;
+    }
+    const action = menuAction === "properties" ? null : menuAction;
     setState({ offer, action, detail: null, plan: null, receipt: null, undo: null, undoSpent: false, busy: true, error: null });
     try {
       // The property read rides SFTP; a restore plan reads everything over
@@ -172,6 +214,54 @@ export function useEmergencyPathActions(api: EmergencyCommandApi, bindingHandle:
     }
   }, [api, bindingHandle]);
 
+  /** Plans the delete for the range the operator picked in the preview. */
+  const planLines = useCallback(async (firstLine: number, lastLine: number) => {
+    const operation = operationRef.current;
+    const previewHandle = operation?.previewHandle;
+    if (operation === null || previewHandle === null || previewHandle === undefined ||
+      operation.busy || !isCurrent(operation)) return;
+    operation.busy = true;
+    setLines((current) => current === null ? null : { ...current, busy: true, error: null });
+    try {
+      const plan = await operation.api.planEmergencyPathLines(
+        operation.bindingHandle, previewHandle, firstLine, lastLine);
+      if (!isEmergencyPathLinesPlan(plan)) throw new Error("目标机返回的行删除计划无法识别。");
+      operation.plan = plan;
+      // The preview handle stays: stepping back re-plans from the same read.
+      if (!isCurrent(operation)) {
+        cancelPlan(operation);
+        return;
+      }
+      setLines((current) => {
+        const offer = current?.offer;
+        if (current === null || offer === null || offer === undefined ||
+          plan.pathHandle !== offer.pathHandle || plan.path !== offer.path ||
+          plan.action !== "delete-lines" || plan.state !== "planned") {
+          cancelPlan(operation);
+          return current === null ? null
+            : { ...current, busy: false, error: "操作计划与本次选择不一致，请关闭后重新检查。" };
+        }
+        return { ...current, plan, busy: false, error: null };
+      });
+    } catch (error) {
+      cancelPlan(operation);
+      if (!isCurrent(operation)) return;
+      setLines((current) => current === null ? null
+        : { ...current, busy: false, error: reason(message(error), "delete-lines") });
+    } finally {
+      operation.busy = false;
+    }
+  }, []);
+
+  /** Drops a made plan and goes back to picking lines from the same preview. */
+  const backToLines = useCallback(() => {
+    const operation = operationRef.current;
+    if (operation === null || !isCurrent(operation)) return;
+    cancelPlan(operation);
+    setLines((current) => current === null ? null
+      : { ...current, plan: null, receipt: null, error: null });
+  }, []);
+
   const renderedOperation = operationRef.current;
   const confirm = useCallback(async () => {
     const operation = renderedOperation;
@@ -199,13 +289,20 @@ export function useEmergencyPathActions(api: EmergencyCommandApi, bindingHandle:
         receipt.path !== plan.path || receipt.action !== plan.action) {
         throw new Error("无法核对本次操作的结果，请重新检查目标文件，勿重复执行。");
       }
-      operation.done = receipt.passed && receipt.undoable ? receipt : null;
+      // A receipt that stays undoable keeps its one undo even when the
+      // post-check failed: the xinetd isolate deliberately reports a failed
+      // verify while still offering the way back.
+      operation.done = receipt.undoable ? receipt : null;
       setState((current) => current === null ? null
         : { ...current, plan: confirmed, receipt, busy: false, error: null });
+      setLines((current) => current === null ? null
+        : { ...current, plan: null, receipt, busy: false, error: null });
     } catch (error) {
       cancelPlan(operation);
       if (!isCurrent(operation)) return;
       setState((current) => current === null ? null
+        : { ...current, plan: null, busy: false, error: message(error) });
+      setLines((current) => current === null ? null
         : { ...current, plan: null, busy: false, error: message(error) });
     } finally {
       operation.busy = false;
@@ -224,6 +321,7 @@ export function useEmergencyPathActions(api: EmergencyCommandApi, bindingHandle:
     operation.done = null;
     operation.busy = true;
     setState((current) => current === null ? null : { ...current, undoSpent: true, busy: true, error: null });
+      setLines((current) => current === null ? null : { ...current, undoSpent: true, busy: true, error: null });
     try {
       const result = await operation.api.undoEmergencyPathAction(operation.bindingHandle, done.planHandle);
       if (!isCurrent(operation)) return;
@@ -231,9 +329,11 @@ export function useEmergencyPathActions(api: EmergencyCommandApi, bindingHandle:
         throw new Error("无法核对撤销的结果，请重新检查目标文件，勿重复操作。");
       }
       setState((current) => current === null ? null : { ...current, undo: result, busy: false, error: null });
+      setLines((current) => current === null ? null : { ...current, undo: result, busy: false, error: null });
     } catch (error) {
       if (!isCurrent(operation)) return;
       setState((current) => current === null ? null : { ...current, busy: false, error: undoFailure(message(error)) });
+      setLines((current) => current === null ? null : { ...current, busy: false, error: undoFailure(message(error)) });
     } finally {
       operation.busy = false;
     }
@@ -242,7 +342,8 @@ export function useEmergencyPathActions(api: EmergencyCommandApi, bindingHandle:
   return {
     menu: menu?.api === api && menu.bindingHandle === bindingHandle ? menu : null,
     state: operationRef.current !== null && isCurrent(operationRef.current) ? state : null,
-    openMenu, dismissMenu, start, confirm, undo, close,
+    lines: operationRef.current !== null && isCurrent(operationRef.current) ? lines : null,
+    openMenu, dismissMenu, start, planLines, backToLines, confirm, undo, close,
   };
 }
 
@@ -281,6 +382,52 @@ export function reason(text: string, action: EmergencyPathAction | null): string
     }
     if (/\(emergency-path-capability-empty\)$/u.test(text)) {
       return "这个文件当前没有文件能力，无需移除。";
+    }
+  }
+  if (action === "delete-lines") {
+    if (/\(emergency-path-line-location\)$/u.test(text)) {
+      return "该文件不在行级删除管理的启动与计划任务文件范围内，不能从这里删除行。";
+    }
+    if (/\(emergency-path-line-kind\)$/u.test(text)) {
+      return "只能删除普通文件中的行；符号链接、目录与其他类型不支持。";
+    }
+    if (/\(emergency-path-line-size\)$/u.test(text)) {
+      return "文件为空或超过托管编辑大小上限，不能做行级删除。";
+    }
+    if (/\(emergency-path-line-range\)$/u.test(text)) {
+      return "所选行号超出文件行数或超过单次删除上限，请重新选择。";
+    }
+    if (/\(emergency-path-line-stale\)$/u.test(text)) {
+      return "文件在查看后发生了变化，没有生成计划。请重新查看文件内容再选择行。";
+    }
+    if (/\(emergency-path(?:-plan)?-unavailable\)$/u.test(text)) {
+      return "预览或计划已过期，请重新查看文件内容再选择行。";
+    }
+    if (/\(emergency-command-timeout\)$/u.test(text)) {
+      return "读取或计划在时限内没有完成，请稍后重试；若反复超时，请在目标机上检查该文件状态。";
+    }
+  }
+  if (action === "disable-xinetd-service") {
+    if (/\(emergency-path-xinetd-location\)$/u.test(text)) {
+      return "只能停用 /etc/xinetd.d 下的服务文件，这个位置不在范围内。";
+    }
+    if (/\(emergency-path-xinetd-kind\)$/u.test(text)) {
+      return "只能停用普通文件形式的服务定义；符号链接、目录与其他类型不支持。";
+    }
+    if (/\(emergency-path-xinetd-ignored\)$/u.test(text)) {
+      return "文件名含点号或以 ~ 结尾，xinetd 本就不加载它，无需停用。";
+    }
+    if (/\(emergency-path-xinetd-privilege\)$/u.test(text)) {
+      return "需要 root 或免密码 sudo 才能隔离服务文件并重载 xinetd，当前账号权限不足。";
+    }
+    if (/\(emergency-path-xinetd-tools\)$/u.test(text)) {
+      return "目标机缺少 sha256sum 等校验工具，无法安全隔离并复核服务文件。";
+    }
+    if (/\(emergency-path(?:-plan)?-unavailable\)$/u.test(text)) {
+      return "计划已过期，请重新生成停用计划。";
+    }
+    if (/\(emergency-command-timeout\)$/u.test(text)) {
+      return "读取或计划在时限内没有完成，请稍后重试；若反复超时，请在目标机上检查该文件状态。";
     }
   }
   if (action === "restore-residue") {

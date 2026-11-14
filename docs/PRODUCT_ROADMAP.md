@@ -1,5 +1,132 @@
 # LovelyHawk 长期产品与验证进度
 
+## 2026-11-13 day5 运维 writeup 对照与进程活动监视规划
+
+材料：`day5运维wp.pdf`（公网 Linux 主机被入侵后的加固与后门清理，8 个检查点；题目约束：不改 root 口令与公钥、不改 SSH/Web 端口、不用防火墙拦 SSH/Web、部分 Web 在 Docker 中、**配置文件里的持久化命令必须删除而不是注释**）。材料不入库。以下状态均为对照现有代码的结论，未在该题环境实测（NOT_RUN）。
+
+### 逐项对照
+
+| 检查点 | 检测 | 处置 | 缺口 |
+| --- | --- | --- | --- |
+| 1 `/etc/crontab` 后门行与 `/root/.cr` | 已有（Cron 页、`persistence-chain`） | 已有（行级删除） | `/etc/crontab` 与 spool 单行已可行级删除（一次性容器实验核对）；`/root/.cr` 不在放行清单内，仍无处置入口 |
+| 2 `lsmod` 可见的恶意模块 | 已有（内核模块页、`system-lkm`） | 部分（复活点行级删除：profile/init.d/cron.d/systemd Exec/modprobe.d/`/etc/modules*`；`rmmod` 待决策） | `system-module-revival-points` 已汇总全部复活位置并给出重启复核提示；已加载模块仍无卸载动作（待决策） |
+| 3 自隐藏模块 | 已有（`/sys/module` 与 `/proc/modules` 差集、kallsyms 标签） | 部分（删复活点后重启，条目汇总与开机时间复核） | 隐藏模块仍无法按名卸载；重启后需人工重跑条目复核（条目含本次开机时间），不做自动复核 |
+| 4 `/etc/profile`、`/etc/init.d/cron` 中的 `insmod` | 已有（启动钩子判定） | 已有（行级删除，init.d 写后 `sh -n`） | `/etc/profile` 与 `/etc/init.d/*` 的单行/范围已可删除（容器实验核对）；整脚本移出启动序列的连带问题仍在 |
+| 5 `/etc/init.d/ssh` 中的恶意代码段 | 已有（特征词扫描 + 软件包摘要比对） | 已有（连续行范围删除） | `startup-init-package-verify` 对 dpkg（conffiles 优先、md5sums 兜底）、apk（`apk audit --full`）与 rpm（`rpm -qf`/`rpm -Vf`）均已核对（Debian/Alpine/Rocky 一次性容器）；比对依赖目标上包数据库，数据库被改写时结果不可信，未记录摘要的脚本只能“无法判断” |
+| 6 `/root/.vimrc` 的 `set modeline` | 已有（`persistence-editor-config`，需关注级） | 已有（行级删除放行 `.vimrc`/`.exrc`/`.nanorc`/`.emacs` 与 `/etc/vim*`） | `~/.vim/plugin` 等子树文件不在行级删除放行内（走权限隔离）；modeline 判定为需关注而非已入侵 |
+| 7 xinetd `server = /bin/bash`（10005 端口） | 已有（inetd/xinetd 采集与 shell 服务判定） | 已有（隔离 `/etc/xinetd.d/<服务>` + 重载 + 端口复核 + 撤销，容器端到端 33/33 与桌面 13/13） | systemd reload 分支容器内不可达未实测；`/etc/inetd.conf` 行可删但 inetd 重载未实现，需人工重载 |
+| 8 SUID 后门文件 | 已有（包归属、GTFOBins） | 已有 | 无（移除 SUID 位、权限隔离） |
+
+### 待补能力（按优先级）
+
+1. **行级删除（留证后删除，不是注释）**。现有唯一的行级动作是“注释此行”，题目与真实清理都可能要求彻底移除。
+   - 范围：`/etc/crontab`、`/etc/cron.d/*`、cron spool、`/etc/profile`、`/etc/profile.d/*.sh`、`/etc/bash.bashrc`、`/etc/bashrc`、各用户 `.bashrc`/`.profile`/`.bash_profile`、`/etc/rc.local`、`/etc/init.d/*`。
+   - 做法：计划绑定文件摘要、行号与该行原文；执行前重读一致才写；整文件先备份；写后独立回读确认该行不存在且其余内容逐字节不变；可撤销（放回备份前核对文件未再变化）。init.d 与 rc.local 写后做 `sh -n` 语法检查，失败自动放回。
+   - 多行代码段（检查点 5）：允许选择连续行范围，预览显示将删除的全部内容；不做自动识别“恶意函数边界”。
+   - 界面同时保留“注释此行”，并说明两者区别（注释保留痕迹便于回看，删除才满足“彻底清除”）。
+2. **编辑器配置持久化检测**（唯一的检测盲区）。新增工作台条目：`/root` 与各用户主目录下 `.vimrc`、`.vim/`（`plugin/`、`autoload/`、`after/`）、`.exrc`、`.config/nvim/`、`/etc/vim/vimrc*`、`.emacs`、`.emacs.d/init.el`、`.nanorc`；标注 `set modeline`/`modelines=`、`autocmd`、`:!`/`system(`/`:py`、`exrc` 开启，以及指向可写目录的 `source`。说明：`modeline` 本身是合法选项，是否可利用取决于 vim 版本，判定为“需关注”而不是“已被入侵”。处置走上面的行级删除。
+3. **xinetd/inetd 服务处置**。移除（实为隔离到备份位置）`/etc/xinetd.d/<服务>` 或把 `disable = no` 改为 `yes`；随后重新加载 xinetd，并以监听表回读确认端口不再监听；撤销放回原文件并再次加载。xinetd 未运行时只改文件并明确说明“未加载，无需重载”。
+4. **init 脚本与软件包原件比对**。对 `/etc/init.d/*` 逐个取包归属与包内摘要（`dpkg --verify`/`rpm -V`，conffile 单独说明可能被管理员合法修改）；不归属任何包、或与包内不一致的脚本标出，并在可取得原件时显示差异行。用于补特征词扫描覆盖不到的任意代码段。
+5. **已加载内核模块的卸载**（待决策）。`rmmod` 对正常可见的模块可行，但卸载正在挂钩内核的模块可能直接导致崩溃，自隐藏模块则根本无法按名卸载。默认决策：先不提供一键卸载；改为提供“模块清理清单”——列出所有复活点（启动文件、init 脚本、`modules-load.d`、`/etc/modules`、cron、systemd unit）及其处置状态，全部清完后提示可以重启，重启后自动复核 `/sys/module` 差集与 kallsyms。若后续决定做卸载，必须单独确认、说明崩溃风险、卸载后复核，不进批量操作。
+6. **反取证提示**。`dmesg -c` 清空内核环形缓冲区、日志文件被截断为 0 字节、`history -c` 与 `HISTFILE=/dev/null` 等，在日志类条目中给出“日志可能已被清理，缺失不代表没有发生”的提示。
+7. **题目类约束的提醒**（小项）。处置对话框在涉及 SSH/Web 端口、防火墙拦截 SSH/Web、root 口令与 `authorized_keys` 时，已有的影响说明里补一句“可能影响远程接入或对外业务”；不做针对比赛的专用模式。
+
+### 实施进度（2026-11-13 起）
+
+- 行级删除（留证后删除，不是注释）：core `line_delete.rs` 放行清单限 `/etc/crontab`、`/etc/cron.d/*`、cron spool、`/etc/profile`、`/etc/profile.d/*.sh`、`/etc/bash.bashrc`、`/etc/bashrc`、`/root` 与各用户主目录 `.bashrc`/`.profile`/`.bash_profile`、`/etc/rc.local`、`/etc/init.d/*`；逐字节范围删除支持 CRLF、无尾换行、非 UTF-8 与首尾行，单次至多 200 行，预览净化控制字符并按行截断。计划绑定路径、原文件 SHA-256、行号范围与原文，预览后文件变化按 `line-stale` 拒绝；整份文件先备份到同目录 `.lovelyres-backups/`，`AtomicWriteIfMatch` 原子写入保留权限与属主，写后独立回读文件摘要验证（既证明该行不存在、也证明其余字节不变）；撤销仅在文件仍为删除后内容时放回备份，放回后再回读比对原摘要。init.d 与 rc.local 写后 `sh -n`：原文件通过而写后不通过则自动放回，原文件本就不通过或目标无 sh 时在计划与回执中注明“未做语法检查”。backend 新增 `emergency-command.path.lines`（有界预览，摘要留在后端不发给页面）与 `emergency-command.path.plan-lines`（计划列出将被删除的全部行），复用既有确认/执行/取消/撤销链路；`path.plan` 与 `path.batch.plan` 对该动作明确拒绝；path DTO 增加 `lineEditable`，位置/类型/大小/范围/过期分别按 `emergency-path-line-*` 码拒绝。主机全景 shell 配置行新增“删除此行”（`shell.delete-line`），与“注释此行”并存，计划文案区分两者。
+- 界面：应急命令路径菜单在放行路径上显示“删除指定行…”，`EmergencyPathLinesDialog` 提供行列表（单击单行、Shift 选连续范围、行号直输、截断提示、纯键盘可达），计划页列出将被删除的全部行且默认焦点不在危险按钮，回执带 10 分钟内一次撤销。
+- 验证：core `line_delete` 12 项、`shell_line` 2 项；backend `emergency_` 43 项（含拒绝映射、delete-lines 往返、绑定/窗口隔离）与 `system_info` 15 项；desktop 桥白名单 5 项；backend/desktop `clippy -D warnings` 干净；`pnpm ui:check` 151 个测试文件 1301 项全过，UI 构建通过（过程中修正：预览句柄在返回选行时被清导致无法重新生成计划、六处契约/夹具未跟上新字段）。Debian 一次性容器端到端 66/66（`tools/lab/probe-emergency-path-lines.mjs`，输出 `tmp/lab_day5_line_delete.txt`，证据 `target/desktop-debug/line-delete-*/report.json`）：单行与 6 行块删除后独立回读逐字节一致；预览后、计划后被改分别按码拒绝且文件不动；已用计划不可再执行；撤销恢复原始 SHA-256、文件再被改时撤销被拒且不覆盖；删 `fi` 触发 `sh -n` 失败并自动逐字节放回；原文件本就不通过时按计划与回执“未做语法检查”放行；放行外路径、`cron.d` 点文件、软链接、越界范围分别按 `line-location`/`line-kind`/`line-range` 拒绝；非 root 属主 0640 文件删除后权限与属主不变；`path.plan`/`path.batch.plan` 对 delete-lines 按 `emergency-path-batch-action` 拒绝。调试构建桌面端到端 13/13（`tools/lab/probe-ui-path-lines.mjs`，输出 `tmp/lab_day5_line_delete_ui.txt`，证据 `target/desktop-debug/ui-line-delete-*/report.json` 与 5 张截图）：命令工作台 → 关键文件权限 → `/etc/crontab` 右键菜单“删除指定行…” → 纯键盘选中末行 → 生成计划 → 确认删除 → 容器内独立 sha256 核对行已删 → 撤销后逐字节还原，无渲染异常与控制台错误。
+- NOT_RUN：`probe-system-info-mutations.mjs` 已补 `shell.delete-line` 用例（删除而非注释、行数少一、其余字节不动、权限不变），但该探针需 WSL `lab-*` 靶机，本机无 Ubuntu 发行版，未能运行；目录拒绝与软链接同走“非普通文件”检查（`line-kind`），工作台输出不提供目录路径句柄，仅单测覆盖；`/etc/rc.local` 与 `/etc/rc.d/rc.local` 未在实验中驱动（语法门与 init.d 同一分支）；`sudo -n` 路径、VM/实机验证待补。
+- 只读检测缺口（待补能力 2、4、6、7）与一处修正：新增目录条目 `persistence-editor-config`（/etc/passwd 各主目录 ≤200 个的 `.vimrc`/`.exrc`/`.nanorc`/`.emacs`/`.emacs.d/init.el`/`.config/nvim/init.*` 与 `.vim/{plugin,autoload,after,ftplugin}` 子树 ≤200 文件/层深 3，加 `/etc/vim*`、`/etc/virc`、`/etc/nanorc`；头部打印属主/权限/时间，匹配行 `路径:行号` ≤50 行/文件；全部缺失时明示“未发现编辑器配置文件”）配 `editor_config_hook` 行规则（注释与引号内文本不标记；`modeline`/`exrc`/`autocmd`/`:!`/解释器调用/指向可写目录的 source-include 标“需关注”，文案注明 modeline 是合法选项）；`startup-init-package-verify`（dpkg：conffiles 摘要优先、md5sums 兜底，不一致且缓存有同版本 `.deb` 时流式 `dpkg-deb|tar|diff` 输出 `路径:当前行号:+内容` ≤40 行；apk：`apk info -W` 归属 + `apk audit --full`；rpm：`rpm -qf` + `rpm -Vf` 标记位；区分“一致/不一致/不属于任何软件包/无法判断”，文案注明数据库被改写则不可信）配 `init_script_package_mismatch` 行规则；`history_evasion` 行规则并入启动文件条目（`startup_hook_or_history_evasion`，覆盖 profile/rc/motd/user-rc 四个条目，`HISTCONTROL=ignorespace` 不标记）；`log-tamper-signs`（常见日志大小与 mtime-早于开机启发式、历史文件符号链接与“登录过却为空”、dmesg 最早记录 vs 开机 120 秒、journald 首条；凡标记行均以“日志可能已被清理，缺失不代表没有发生”结尾，发行版差异的不存在不标记）配 `log_tamper_sign` 行规则。处置侧：行级删除放行清单扩至 `/root` 与 `/home/<用户>` 的 `.vimrc`/`.exrc`/`.nanorc`/`.emacs` 及 `/etc/vim*`。影响说明（待补能力 7）：按类型化事实补固定句——出方向封禁 SSH 会话对端、断开本地 22 端口或 sshd 进程的 TCP 连接、停止/重启/禁用 `sshd`/`ssh` 单元补“可能影响远程接入或对外业务，请确认仍有其他接入方式。”；断开 80/443 端口或 Web 进程连接、停止/重启/禁用 `nginx`/`apache2`/`httpd`/`caddy`/`tomcat*` 单元补“可能影响对外业务。”；root 或当前 SSH 登录账户改口令补远程接入句。修正：行级删除写后 `sh -n` 因通道/执行错误（非退出码失败）无法运行时，同样先尽力放回原文件，再分别报“已放回/未能核实放回”的语法类拒绝，不再让已删文件留在原地。
+- 验证：core `command_` 123 项、 `line_delete` 12 项、`system_info` 71 项、`account_password` 4 项、`firewall` 8 项；backend `emergency_` 41+25+25 项、`system_info` 15 项；目录条目经 `command_workbench::lab` 在 debian:12-slim、alpine:3.20 与 rockylinux:9-minimal 一次性容器各 24 例全过（`tmp/lab_day5_wave2.txt`）：`.vimrc` 的 `set modeline`/`autocmd`/`.vim/plugin` 命中，`nomodeline`/注释不标记；cron conffile 改行后报“不一致”且缓存 `.deb` 下按当前文件行号输出 `+` 差异行（独立 `grep -n` 复核 93/94 行一致），无归属脚本与未改脚本分别正确判定，alpine `apk audit --full` 报 `U` 不一致，Rocky 上 `/etc/init.d` 为指向 `rc.d/init.d` 的符号链接时解析实目录后比对，改动的包内脚本报“不一致”（`S.5....T.` 标记位）、植入脚本报“不属于任何软件包”；`/etc/profile` 的 `HISTFILE=/dev/null`/`unset HISTFILE` 标记、`ignorespace` 不标记；截断的 auth.log、wtmp 与符号链接 `.bash_history` 命中，`/var/log/secure` 不存在不标记。实验过程中修正：rockylinux:9-minimal 无 findutils/initscripts（lab 在每族容器先装 find、fixture 自装 initscripts）；`rpm -qf` 的“not owned”打到 stdout 导致 `perm-suid-ownership` 与 `persistence-unit-owner` 把无归属文件当已归属，已修正；`process-exe-path` 夹具改用 `sh` 副本以兼容 busybox applet 名与 Rocky coreutils 转接；podman 虚拟机辅助进程在容器内被 `process-hidden` 如实命中，该例在 redhat 族豁免“无线索”断言。端到端：`probe-emergency-path-lines.mjs` 扩出 `/root/.vimrc` 段落后 72/72（`tmp/lab_day5_wave2_probe.txt`，证据 `target/desktop-debug/line-delete-e3835796-*/report.json`）——编辑器条目给出 `lineEditable` 句柄，删 `set modeline` 独立回读逐字节核对。
+- NOT_RUN：rpm 分支仅在 rockylinux:9-minimal 一次性容器核对（补齐 find/initscripts 后），Alma/openEuler 等其他 RPM 发行版与完整 RHEL 系 VM 未覆盖；`sh -n` 因通道/执行错误放回原文件的分支无法在无 SSH/SFTP 会话的单测中模拟，覆盖方式为代码走查 + `OPERATION_FAILURE_ADVICE` 文案断言，未做端到端注入；dmesg_restrict 与 journald 首条分支在 slim 容器内不可得（容器共享宿主内核、无 systemd 日志）；目录拒绝仍无工作台句柄可达；VM/实机与 `sudo -n` 路径未测。
+- xinetd 服务处置与模块复活点清单（待补能力 3、5）与三处修正：core 新增 `xinetd_service.rs`——`/etc/xinetd.d/<安全名>`（名字含点号或以 `~` 结尾的按 xinetd 自身规则拒绝为“本就不加载”，符号链接按类型拒绝）、仅普通文件且 ≤ 托管上限；计划一次性探测文件摘要与属主、服务块（多 service 块、`disable`/`port`/`socket_type`/`protocol`/`server`/`server_args`/`type`/`user`）、端口缺失时 `getent services` 回退、xinetd 进程身份（comm+exe+启动时间）、冻结重载方式（systemd 管理→`systemctl reload`；否则向已核对身份的 PID 发 SIGHUP；未运行→“无需重载”）与监听表（`ss`→`netstat`→`/proc/net` 三级，均不可用记缺口）；执行复核文件摘要与守护进程身份（任一变化即拒绝且文件不动）、移入 `/etc/xinetd.d/.lovelyres-backups/`（目录名含点号，xinetd 自身跳过，备份不会被读回，计划与回执都写明）、重载后按端口轮询至多 5 秒；复核只认“端口不再被监听”，监听表不可读或端口仍被占用时 `passed=false`、文件保持隔离不自动放回、回执点名占用者（comm+pid）且仍可撤销——`PathOperation::restores_on_failed_verification()` 默认 true、本动作为 false，这是“验证失败不回放”语义的实现点；撤销仅在原路径仍空且备份摘要一致时放回并重载（守护进程换实例时按当前实例发 SIGHUP 并明说）。backend：`EmergencyPathAction::DisableXinetdService`（`disable-xinetd-service`）走 SSH 臂，不进批量与通用 SFTP 路径；位置/类型/忽略/权限/工具分别映射 `emergency-path-xinetd-*` 公开码；path DTO 增 `xinetdService`。界面：菜单“停用此 xinetd 服务…”只对 xinetd 实际加载的名字出现；计划写服务名、端口、重载方式、备份位置与“已建立的连接可能保留到其自行退出”；意图说明“复核未通过时文件仍保持隔离，可再撤销放回”；失败但已隔离的回执照常提供撤销；新增错误码均有中文翻译。配套：`/etc/inetd.conf` 入行级删除放行（inetd 重载未实现，计划与回执注明“inetd 需重新加载后才生效，本工具尚不执行重载”）；新目录条目 `system-module-revival-points`（启动文件/cron/init.d/systemd Exec 行/xinetd.d 中含 insmod·modprobe·kmod load·finit_module 的行；`/etc/modules` 与 `modules-load.d` 全部非注释行——可解析名只列不标、modinfo 与 `/lib/modules` 清单都不可用时列“未校验”不标、解析不出才标；modprobe.d 中执行命令的 install/softdep 行；标准模块目录外 `.ko` 限深 5 上限 200；末尾给出内核版本、隐藏模块计数（复用 `system-modules` 的差集逻辑）与本次开机时间；汇总“复活点 N 处”或“未发现”，凡有读取缺口不打印“未发现”）配 `module_revival_point` 行规则；行级删除放行 `/etc/modules` 与 `/etc/modules-load.d/<安全名>.conf`。修正：采集器不再把注释行当复活点命中；`xinetd process changed` 纳入“写入前拒绝”集合并有中文提示（此前只落到泛化的“操作未能完成”）；重载后守护进程已退出或被替换时回执追加说明（容器实测 xinetd 2.3.15.4 的 SIGHUP 重配置有概率令守护进程退出，撤销如实报“配置已放回但未被加载”）。
+- 验证：core `xinetd` 8 项、`line_delete` 12 项、`command_` 全过（含 `module_revival_point` 规则与放行表）；backend `emergency_` 全过；core/backend `clippy -D warnings` 干净；`pnpm ui:check` 全过（含新错误码翻译断言）。目录条目经 `command_workbench::lab` 在 debian:12-slim、alpine:3.20、rockylinux:9-minimal 各 27 例全过（`tmp/lab_day5_wave3.txt`）：`/etc/profile`、init.d、cron.d 中的加载模块行与 modprobe.d 执行行、标准目录外 `.ko` 全部命中；`# insmod` 注释与 `options` 行不标记；无 modinfo 的 Debian/Rocky 如实列“未校验”不标记并记缺口，有 modinfo 的 Alpine 标“无法解析”；汇总按缺口如实给出。Debian 一次性容器端到端 33/33（`tools/lab/probe-emergency-path-xinetd.mjs`，输出 `tmp/lab_day5_xinetd.txt`，证据 `target/desktop-debug/xinetd-*/report.json`）：停用后独立连接被拒、备份落在 `.lovelyres-backups` 且摘要一致、撤销后端口恢复连接；计划后改文件、计划后重启 xinetd 分别按“未动”拒绝；`nc` 预先占用同一端口时回执点名 `nc(pid)`、文件保持隔离、撤销可用；xinetd 未运行时文件隔离且计划/回执注明无需重载；`svc.bak` 按 ignored、软链接按 kind、批量入口按 batch-action 拒绝；已用计划不可再执行。调试构建桌面端到端 13/13（`tools/lab/probe-ui-path-xinetd.mjs`，输出 `tmp/lab_day5_xinetd_ui.txt`，证据 `target/desktop-debug/ui-xinetd-*/report.json` 与 4 张截图）：`.bak` 名字不出现在菜单；菜单“停用此 xinetd 服务…”；计划写端口与 SIGHUP 重载；确认后独立连接被拒；撤销→确认→服务恢复连接。该次运行 SIGHUP 后守护进程退出，撤销如实报“配置已放回但未被加载”，重启守护进程后端口恢复（探针对两种结局都核对）。
+- NOT_RUN：systemd 管理 xinetd 的 `systemctl reload` 分支在容器内不可达（容器无 systemd），仅代码与单测；`sudo -n` 路径未测；“端口仍被 xinetd 自身占用”与“另一进程占用”共用同一复核分支，实验驱动的是后者；`/etc/inetd.conf` 行删除后 inetd 重载未实现，需人工 `kill -HUP` 或服务重开；`rmmod` 一键卸载维持待决策，不提供；重启后的模块复核为人工重跑条目（条目打印本次开机时间供判断是否已重启），不做自动复核；VM/实机验证未做；`probe-system-info-mutations.mjs` 仍因本机无 WSL `lab-*` 靶机 NOT_RUN。
+- 进程活动监视阶段 A（无上传方式）：core `process_watch.rs` 提供探测（`/proc` 可读、`hidepid`、容器内、无小数 sleep、已有监视在运行，各自作为采集缺口返回）与固定的 POSIX sh 轮询程序（只带入校验过的标记、时长、间隔三个值；先取基线，再按 200/500/1000 毫秒报告新出现的“PID + 启动时间”，命令行十六进制过线；到目标侧时限自行退出，收到中断也退出），事件上限 20000 条或 4 MiB 输出，到上限标记“已截断”并停止；停止后按 PID、启动时间与标记核对进程确已不在，不按名字结束进程。分析为纯函数：命令归一化、重复分组与周期判定（至少 3 次且间隔在中位数 ±20% 内）、摘要。backend `process-watch.probe/start/poll/stop/summary`（句柄化；每个连接同时只允许一个监视，重复开始按 `process-watch-already-running` 拒绝；连接关闭时停止并回收；命令行不写日志）；命令工作台新增可见按钮“进程活动监视”，面板说明方式与固有限制、逐条显示采集缺口、时长 1–30 分钟，运行中显示进度与数量并可取消，结束后给出结论句、时间线（搜索、按用户筛选、“本工具产生”与“开始时已在运行”默认折叠、复制命令与原始行、分页）和重复命令视图（点分组筛选时间线）。有缺口、截断或中断时结论句明确说明结果不完整。
+- 验证：core `process_watch` 12 项、backend `process_watch` 7 项、`emergency_` 46 项、core `xinetd` 8 项、desktop 53 项；backend/desktop `clippy -D warnings` 干净；`pnpm ui:check` 153 个测试文件 1322 项。后端端到端 40/40（`tools/lab/probe-process-watch.mjs`，输出 `tmp/lab_day5_process_watch.txt`，证据 `target/desktop-debug/process-watch-03b765a8-*/report.json`），debian:12-slim 与 alpine:3.20 一次性容器：150 秒监视抓到每分钟一次的 cron 夹具 6 行、每 10 秒一次的标记进程 30 行并判为周期性（约 10.08 秒）；取消后回执“已核对停止”且容器内独立检查无监视进程；运行中重复开始被拒；切断连接后监视进程 0.9 秒内自行退出（时限 60 秒），重连后可再次监视；60 KB 参数的进程把输出推到 4 MiB 上限后状态为“已截断”且远端循环已停；普通账号在 `hidepid=0` 下能看到 root 的命令行；alpine/BusyBox 下抓到 crond 夹具与周期标记。监视进程自身开销在 debian 上 61 秒内约占单核 0.59%（含已回收的子进程，空闲容器，仅此一次测量）。桌面端到端 22/22（`tools/lab/probe-ui-process-watch.mjs`，输出 `tmp/lab_day5_process_watch_ui.txt`，证据 `target/desktop-debug/ui-process-watch-1d29ffa4-*/report.json` 与 6 张截图）：说明与容器缺口可见、打开不自动开始、连点只启动一次、进度更新、取消后独立检查无残留、结论句、周期性分组、分组筛选、搜索、折叠开关、关闭后焦点返回、无控制台错误。
+- 实验中发现并修正的缺陷：轮询程序在关闭通配后遍历 `/proc/[0-9]*`，一个进程都采不到；读取 `Uid:` 时清空了分隔符，所有进程的用户都成了未知；停止后只核对一次，偶发把正在退出的进程报成未停止（改为最多 8 次、间隔 0.5 秒）；页面校验把正常的探测结果判为无效，面板无法打开；取消后页面停在“正在停止…”不再刷新。前四项单测都未覆盖，已补页面契约测试 7 项；后两项界面缺陷由桌面探针覆盖。
+- NOT_RUN 与未做：容器内只能看到本容器进程，宿主机上的效果需 VM/实机；`hidepid=2` 缺口因非特权容器不能重新挂载 `/proc` 未驱动，仅单测；300 毫秒级的进程在 500 毫秒间隔下只抓到约六成（一次运行 30 次中 18 次），属该方式固有限制；监视运行中关闭再打开面板的重新接续、离开页面与切换目标时的停止未由探针驱动；alpine 上未测开销；arm64 等架构未测。阶段 B–D 见下。
+- 进程活动监视阶段 B（上传 pspy 运行）：core `process_watch_upload.rs`、backend `process_watch_api/upload.rs`。程序不进安装包，用户经宿主文件对话框选择；宿主读取后只把大小、架构、SHA-256 和识别结果交给页面，本机路径不进页面。内置上游 v1.2.1 四个发布文件（`pspy32`/`pspy32s`/`pspy64`/`pspy64s`）的摘要表，一致时显示版本；不一致时标为“不是已知的 pspy 发布文件”，需额外勾选确认才能继续。非普通文件、非 Linux 程序、超过 16 MiB、与目标架构不符分别按各自的码拒绝。计划只读探测：依次检查 `$XDG_RUNTIME_DIR`、`/dev/shm`、`/tmp`、`/var/tmp`、主目录，跳过 `noexec` 与空间不足的目录，给出落点、账号、时长、摘要与缺口，不向目标写入；计划 5 分钟内有效、只能用一次。执行在权限为 0700 的私有目录 `.lovelyhawk-watch-<16 位十六进制>` 落地、回读摘要一致后以当前 SSH 账号运行，不安装到系统目录；目标侧到时限自行结束，到时与取消后删除文件和目录并独立回读“进程不在、目录不存在”。断连时目标侧自行停止进程但文件留在原处，下一次连接按目录名与内容列出残留，经一次确认清除并回读；伪造的残留句柄不触碰任何东西，句柄只能用一次。可选的文件访问事件只覆盖 `/etc`、`/tmp`、`/var/tmp`、`/dev/shm`、`/var/spool/cron` 和 `/var/www`，界面写明范围与“此时别处的短命进程更容易漏掉”。操作记录写入摘要、落点与清理结果，不写命令行。界面在确认前写明：会在目标上留下文件、新进程和访问时间变化；防护软件可能告警或删除；只能看到命令行，看不到输出；没有观察到不代表没有发生。
+- 进程活动监视阶段 C（来源归类与检查动作推断）：core `process_watch_analysis.rs`，纯函数。按父进程链把事件归为计划任务、SSH 登录、系统服务、其他；只读取一次计划任务文件，把计划任务来源的命令对应到具体文件（如 `/etc/cron.d/<名字>`），界面写明这是推断。命令按固定表对应到命令工作台条目，对应不上的逐条列在“未对应”里，不丢弃，并写明对应表不完整；每个对应项有“前往该检查项”按钮。命令行里的地址、域名、URL 汇总为线索并标注保留地址。
+- 进程活动监视阶段 D（已有记录的只读接入）：core `process_watch_sources.rs`，backend `process-watch.sources` 与 `process-watch.accounting.read`。探测四种来源并分别给出“正在记录且可读 / 有记录但当前账号不可读 / 已安装未记录 / 没有”：进程记账、审计 execve 规则、execsnoop、bpftrace。只有进程记账可以读取（`dump-acct`，最近 1–120 分钟，至多 20000 条），按程序名分组并判定周期；界面写明记账只有程序名没有参数、运行中的进程结束后才出现、本工具自己的命令也会被记进去且无法区分。记账按整秒记录，间隔不足 2 秒的不判为周期性。不开启记账、不安装工具、不提权。审计规则、execsnoop、bpftrace 只做探测和说明，记录不读取、程序不调用，状态为未适配。
+- 阶段 B–D 验证：core `process_watch` 31 项、backend `process_watch` 12 项、desktop 53 项；core/backend/desktop `clippy -D warnings` 干净；桌面源码门禁通过；`pnpm ui:check` 153 个测试文件 1335 项。上传方式后端端到端 55/55（`tools/lab/probe-process-watch-upload.mjs`，输出 `tmp/lab_day5_process_watch_upload.txt`，证据 `target/desktop-debug/process-watch-upload-07a7d7f2-*/report.json`），debian:12-slim 一次性容器，`/tmp` 与 `/var/tmp` 为 `noexec`、`/dev/shm` 仅 1 MiB：计划跳过三者落在主目录；计划不写目标；目标上的文件与所选文件逐字节一致；到时、取消后独立回读无进程无目录；断连后 2 秒内进程自行停止，残留恰为落地目录，重连后列出并清除；已用计划、运行中再次开始、伪造残留句柄均被拒绝；只有 `noexec` 目录的账号按自己的码拒绝且未写入；普通账号在自己主目录运行并看到 root 的短命进程；cron 夹具归到计划任务及其所在文件，10 秒标记不被称为计划任务；夹具检查脚本的 4 步对应到工作台条目，1 步列为未对应；命令行里的 `203.0.113.9` 成为线索；`/etc` 下的写入出现为文件事件并单独计数；操作记录含摘要与清理结果、不含命令行。上传方式桌面端到端 22/22（`tools/lab/probe-ui-process-watch-upload.mjs`，证据 `target/desktop-debug/ui-process-watch-upload-7514de2e-*/report.json`）：默认不上传；未选文件不能生成计划；选文件不写目标；焦点落在计划标题而非确认按钮；返回不写目标；运行与清理独立回读；来源视图注明推断；“前往该检查项”选中对应条目；无控制台错误。已有记录后端端到端 26/26（`tools/lab/probe-process-watch-sources.mjs`，输出 `tmp/lab_day5_process_watch_sources.txt`，证据 `target/desktop-debug/process-watch-sources-043a290d-*/report.json`），debian:12-slim（为让探针自己开启记账加了 `CAP_SYS_PACCT`，非特权）与 alpine:3.20：未安装时四种来源均为“没有”且读取按 `process-watch-accounting-unavailable` 拒绝而不是返回空；安装未开启时报“已安装未记录”，询问后记账文件仍为空；开启后每 5 秒一次的夹具 9 条与目标自身 `lastcomm` 一致、判为周期约 5 秒，参数未进入结果，读取后文件属主、权限、inode 不变；普通账号报“不可读”且读取被拒；alpine/BusyBox 四种均为“没有”。已有记录桌面端到端 17/17（`tools/lab/probe-ui-process-watch-sources.mjs`，证据 `target/desktop-debug/ui-process-watch-sources-1b1899fe-*/report.json`）。阶段 A 两个探针在最终代码上重跑 40/40 与 22/22。
+- 阶段 B–D 实验中发现并修正的缺陷：取消监视时，目标已报告但尚未被读取的行会随通道关闭丢失（未轮询 30 秒后取消只剩 63 行，修正后同一场景 465 行），现在取消前先取完；一次读取被条数上限截断时游标直接跳到末尾，超出的行被跳过（超过 500 个进程的主机首屏就会丢行），现在游标停在实际返回的最后一行，未读完前不报告结束；普通账号的 `PATH` 不含 `/usr/sbin` 时，不可读的记账文件被报成“已安装未记录”；同一秒内的一串记账记录被判为“约每 0 秒一次”的周期；新增的参数结构插在抓包参数结构之间，破坏了抓包接口的源码约束测试，已移开。
+- 阶段 B–D NOT_RUN 与未做：只在 x86_64 容器上跑过，aarch64 等架构没有摘要表也没有实验，架构不符只有单测；宿主机进程可见性、`hidepid=2`、`sudo -n`、防护软件拦截 pspy 的失败路径、VM/实机均未驱动；空间不足的拒绝只有单测；审计规则在非特权容器里无法加载，探测只有单测，记录未接入；execsnoop/bpftrace 只按名字探测，未调用；RPM 系的记账（`psacct`、`/var/account/pacct`）未驱动；超过 20000 条的记账文件只有单测；记账“不可读”在桌面端未驱动，只有后端探针；容器的 1 号进程不回收子进程，被结束的 pspy 在夹具里以僵尸进程留在基线中，真实主机由 init 回收，未在实机核对；本工具清理与核对时的个别子进程（如 `readlink`）在其父进程已退出时无法识别为本工具产生，会留在普通活动和“未对应”里；监视结果导出到本机未实现。本机启用了系统代理（127.0.0.1:7890），core `ai`/`net_guard` 与 backend `ai_assist` 共 4–8 项依赖回环 HTTP 的单测因代理对回环目标返回 502 而失败，失败项随代理环境变量变化，相关文件不在本次改动内，未在无代理环境复核。
+
+### 进程活动监视（上传 pspy 运行并采集）
+
+**目标。** 现有采集都是某一时刻的快照，看不到“每分钟跑一下就退出”的进程。上传 [pspy](https://github.com/DominicBreuker/pspy) 运行一段时间，可在不需要 root 的情况下记录这段时间内出现过的命令行与（可选的）文件访问。两个用途：
+
+- 应急：发现短命的 cron 任务、后门复活、是谁在不断改回某个文件、Web 进程派生的命令。
+- 验收/竞赛：看到自动检查程序实际执行了哪些命令、读了哪些文件，从而知道它在核对什么，反推还有哪些项没处理。
+
+**与现有规范的关系。** 这会改变此前“不向目标上传静态工具”的默认决策（见下方 2026-11-10 节“可信工具”与“本轮保留的决策”，已同步改写）。AGENTS 禁止的是“为运行检测而**静默**安装目标工具”；本功能必须是用户主动发起、逐次确认、不提权、不常驻、用完清理，并留操作记录。它只解决“看到短命进程”，不解决“目标上的 `ps`/`ls` 被替换后结果不可信”，后者仍为待决策。
+
+**开工前要定的事。**
+
+| 事项 | 默认决策（可改） |
+| --- | --- |
+| 程序从哪来 | 不把 pspy 打进安装包。用户通过宿主文件对话框选择本机上的 pspy 文件，宿主计算 SHA-256；与内置的“已知上游发布版本摘要表”一致时显示版本号，不一致时明确说明“未识别的文件”并要求再次确认。摘要表的数值在实现时从上游发布页取得并注明出处，不凭记忆填写 |
+| 许可证 | 上游标注为 GPL-3.0，实现前需核对。不随包分发则不进第三方清单；若日后改为内置，必须先过许可证与 SBOM 门禁 |
+| 架构 | 上游只发布 x86 的 32/64 位静态程序。按 `uname -m` 选择；arm64、loongarch、mips 等没有官方程序，记为“未适配”，走下面的无上传方式 |
+| 是否需要 root | 不需要，也不提权。以当前 SSH 账号运行 |
+| 运行时长 | 默认 3 分钟，可选 1–30 分钟；到时自动停止。观察每分钟一次的任务至少需要 2 分钟以上，界面说明这一点 |
+
+**先探测再选择实现。** 发起后先做一次只读探测，再决定走哪条路并在计划里写明：
+
+1. 目标已有等价来源时优先用它，不上传：auditd 已启用 execve 规则（读 `ausearch`）、已安装 `execsnoop`/`bpftrace`、已启用进程记账（`lastcomm`）。只读取，不替用户开启。
+2. 可上传运行 pspy：架构受支持；存在可写且未以 `noexec` 挂载的目录（依次检查 `$XDG_RUNTIME_DIR`、`/dev/shm`、`/tmp`、`/var/tmp`、用户主目录）；剩余空间足够；`sha256sum` 与 `timeout`（或可替代的写法）可用。
+3. 都不行时使用无上传方式：固定的 POSIX sh 循环按间隔扫描 `/proc/[0-9]*/cmdline` 并输出新出现的进程。界面明确说明“两次扫描之间启动并退出的进程会漏掉”。
+4. 探测同时报告会降低结果完整度的条件：`/proc` 以 `hidepid` 挂载（非 root 只能看到自己的进程）、处于容器内（看不到宿主与其他容器的进程）、inotify 配额不足（`max_user_watches`/`max_user_instances`）、已有同名监视在运行。这些作为“采集缺口”随结果显示，不能显示成“这段时间没有活动”。
+
+**执行链路（core `process_watch.rs`）。**
+
+1. 计划：绑定目标身份与会话、探测结果、所选方式、程序摘要与大小、落地路径、运行参数、时长。计划不可变；目标或探测结果变化后重新规划。
+2. 确认对话框写明：将向哪台主机的哪个目录写入一个多大的文件、以哪个账号运行多久、会留下什么痕迹（磁盘写入、一个新进程、inotify 监视）、结束后会删除什么。真实环境逐次确认，一次确认只对应这一次运行。
+3. 上传：在所选目录下新建仅属主可访问（0700）的随机名子目录，文件 0700；走既有 SFTP 通道（无 SFTP 时用已有的 SCP 回退）；上传后在目标上重新计算 SHA-256 并与本机一致才继续，不一致即删除并报错。
+4. 运行：固定参数，不接受用户自由输入的参数串。关闭彩色输出；默认只记录进程事件；“同时记录文件访问”为可选项且默认只监视有限目录（`/etc`、`/tmp`、`/var/tmp`、`/dev/shm`、cron 与 Web 根），因为全盘文件事件量极大。具体参数名以所选版本的 `--help` 输出为准，实现时核对，不照抄记忆。由目标侧的时限包裹运行，保证连接断开后程序也会到时自行退出，不留常驻进程。
+5. 采集：输出流式回传，行数与总字节有上限，到上限后明确标记“已截断”并停止；界面显示已运行时间、已收到的事件数，可随时取消。
+6. 结束与清理（到时、取消、出错、断连重连后都要走）：按“PID + 启动时间 + 程序路径”核对后停止进程，不按名字杀；删除文件与目录；独立回读确认进程不在、路径不存在。清理失败时明确告知残留位置和手动清理方法。断连后无法清理的情况，在下次连接同一目标时凭本机记录的路径与摘要提示“上次监视可能有残留”，由用户确认后清理。
+7. 记录：操作日志写入上传的文件摘要、落地路径、运行账号、起止时间、清理结果。原始输出可保存到本机并导出。
+
+**解析与分析。**
+
+- 逐行解析为事件：时间、类型（进程/文件）、UID、PID、（可取得时）父 PID、命令行或文件路径。无法解析的行保留原文并计数，不丢弃。
+- 自身噪声剔除：本次监视自己的进程、LovelyHawk 当前 SSH 会话派生的命令单独归为“本工具产生”，默认折叠而不是删除。
+- 视图一（时间线）：按时间排列，可按 UID、命令、路径筛选与搜索，复制原始行。
+- 视图二（重复出现的命令）：按“归一化后的命令行”分组，给出次数与间隔；间隔稳定的标为“周期性”，并尝试与已采集的 cron/timer 条目对应，对应不上的标为“来源未知的周期任务”。
+- 视图三（会话与来源）：把事件按父进程链归到“cron 派生”“某次 SSH 登录派生（来源地址取自已有登录记录）”“Web/数据库服务派生”“其他”。
+- 视图四（检查动作推断）：把观察到的只读类命令映射到工作台已有的排查项，例如读取 `/etc/crontab` → 计划任务、`lsmod`/读取 `/sys/module` → 内核模块、`find -perm` → SUID、连接某端口 → 该监听服务、读取 `/etc/profile` 或 init 脚本 → 启动项；每条给出“前往对应条目”的入口，并显示该条目当前是否仍有未处理的命中。明确标注这是根据命令推断的，不代表对方的全部检查内容，也不代表对应项已通过。
+- 命令行里出现的地址、域名、URL 进入已有的线索汇总。
+- 新手看到的是结论句（“这 3 分钟里有 2 个每分钟执行一次的任务，其中 1 个找不到对应的计划任务”）加下一步建议；专家可直接看原始输出与全部事件。
+
+**接线。** core `process_watch.rs`（探测、计划、执行、清理、解析）→ backend 方法（发起探测、生成计划、确认执行、取消、取结果、清理残留；句柄化，落地路径与摘要不由页面传入）→ shared DTO 与请求/响应校验 → 宿主：选择本机程序文件属于带本机路径的操作，只能是专用宿主命令，页面只拿到不透明句柄、文件名与摘要 → `ui/src/host` 桥 → 命令工作台新增“进程活动监视”入口（可见按钮，不藏在右键里）。离开页面、切换目标、关闭窗口时先停止并清理再放行；迟到的输出不得写入新目标的结果。
+
+**分阶段。**
+
+| 阶段 | 内容 | 完成标准 |
+| --- | --- | --- |
+| A | 无上传方式（`/proc` 轮询）+ 事件模型 + 时间线与重复命令视图 + 取消/时限/截断 | 不写目标磁盘即可用；容器靶机上能抓到每分钟一次的 cron 夹具。已实现，debian/alpine 容器已验证，见上方实施进度；VM/实机 NOT_RUN |
+| B | 探测、计划确认、上传 pspy、运行、清理、残留回收、操作记录 | 上传前后摘要一致；到时/取消后目标上无进程与文件残留，断连后进程自行停止、文件由下次连接确认清除。已实现，debian 容器已验证；其他架构与 VM/实机 NOT_RUN |
+| C | 会话与来源归类、检查动作推断、与工作台条目互相跳转、线索汇总 | 夹具“检查脚本”执行的每条命令都能在视图四中对应到条目或明确列为未对应。已实现，debian 容器已验证 |
+| D | 已有等价来源（auditd/execsnoop/记账）的只读接入；其他架构的处理方式 | 各来源分别有靶机证据；无证据的保持“未适配”。进程记账已接入并在 debian 容器验证；auditd、execsnoop、bpftrace 只探测不读取，保持未适配；其他架构按“架构不符”拒绝，无实验 |
+
+**验证计划。**
+
+- core 单测：输出解析（含超长行、控制字符、非 UTF-8 字节、恶意构造的命令行）、周期判定、噪声归类、落地路径与参数的拒绝测试。
+- 一次性容器靶机（debian、alpine/BusyBox、无 `timeout` 的精简镜像）：夹具为每分钟执行的短命 cron 与一个模拟检查脚本；分别驱动 `/tmp` 为 `noexec`、非 root 账号、`hidepid=2`、inotify 配额很小、磁盘已满、上传中途断连、运行中途断连、重复点击开始、运行中切换目标。
+- 桌面端到端探针（`tools/lab/probe-ui-process-watch.mjs`）：确认对话框内容、进度与取消、清理后的独立回读、焦点与键盘。
+- 容器内运行只能看到本容器进程；宿主上的效果必须在 VM/实机验证，未验证前记 NOT_RUN。arm64 等架构记“未适配”。
+
+**风险与边界（需要写进界面说明）。**
+
+- 会在目标上留下痕迹：写入一个文件、出现一个新进程、目录访问时间可能变化。取证要求严格的现场应先完成磁盘/内存留证再使用。
+- 攻击者或对方的检查程序同样可能看到这个进程和文件；终端防护软件可能把 pspy 识别为黑客工具并告警或删除，此时按“运行失败”如实报告。
+- 看到的是命令行，不是命令的输出或判定逻辑；没观察到不代表没有检查，时长之外、进程内完成的检查（如直接读文件、远程连端口）看不到或只看到一部分。
+- 命令行里可能带有口令等敏感内容；原始输出按敏感数据处理，导出前提示，不进入 AI 分析的默认上下文。
+- 仅在已获授权的主机上使用；竞赛场景下是否允许观察检查程序由规则决定，工具不做判断。
+
 ## 2026-11-10 外部应急材料对照的待补能力清单
 
 对照本机外部材料逐项核对现有代码后确认以下缺口。材料来源：运维竞赛 writeup（运维1.5、运维2、运维3）、培训课件与笔记（Day1/Day2/课件1/课件2）、`sec_baseline_check.sh`（约 2580 行的基线与后门狩猎脚本）、LinuxIR 整合包（LinuxCheck_plus + unhide 三件套 + rkhunter 1.4.6）、D 盾（闭源 Windows 工具，仅参考使用方式）与 `tunnel_key.sh`；材料在本机 `tmp/` 下，不入库。基础排查面（进程、网络、账号、cron、systemd、init.d/rc 文件、`ld.so.preload`、authorized_keys、SUID 白名单判定、高危 capability 判定、挖矿、反弹 shell、iptables 只读、SSH 爆破统计、直接读取 cron spool、账号锁定/删除、容器内排查与文件编辑）已由 `detection.rs`、`command_workbench.rs`、`command_findings.rs`、`system_info.rs`、`file_analysis.rs` 覆盖，不在此重复；包完整性与隐藏进程只有基础实现，深度缺口见下文。清单按建议优先级排列，不代表全覆盖；每项实施时仍按 core → backend → DTO → 宿主 → UI 链路补拒绝测试与真实环境验证。
@@ -42,7 +169,7 @@
 - ~~隐藏进程深度~~：已实现（两次 `/proc` 目录列表 + 按 PID 直接探测，上限 65536，排除自身子进程与瞬时进程）。容器不能伪造隐藏进程，真实命中仍需 VM/实机（NOT_RUN）。
 - ~~系统命令依赖库注入~~：已实现（`perm-dt-needed` 批量核对系统命令 `DT_NEEDED`）。
 - 命令被替换的旁证：与同目录其他命令修改时间不一致、`strings` 中出现 curl/socket/`/bin/sh` 等网络或回连特征，未实现。
-- 可信工具（待决策）：工作台全部依赖目标上的 `ps`/`ls`/`find`/`dpkg`，命令被替换时结果整体不可信。LinuxIR 用自带静态 unhide 绕开；是否提供“确认后上传静态工具到临时目录执行、用完清理”的路线，与“默认不在目标上安装工具”的规范冲突，需产品决定。决策（默认，用户可改）：维持不上传静态工具，保持 待决策。
+- 可信工具（待决策）：工作台全部依赖目标上的 `ps`/`ls`/`find`/`dpkg`，命令被替换时结果整体不可信。LinuxIR 用自带静态 unhide 绕开；是否提供“确认后上传静态工具到临时目录执行、用完清理”的路线，与“默认不在目标上安装工具”的规范冲突，需产品决定。决策更新（2026-11-13）：仅对“进程活动监视”放开“逐次确认后上传 pspy、限时运行、用完清理”，规划见上方 2026-11-13 节（不上传的 `/proc` 轮询方式已实现，上传 pspy 尚未实现）；用自带静态工具替代目标上可能被替换的 `ps`/`ls`/`find` 仍为 待决策。
 
 ### 持久化与后门判定深度
 
@@ -117,7 +244,7 @@
 
 以下为本轮采用的默认决策，可按需要改变：
 
-- 不向目标上传静态工具（与“默认不在目标上安装工具”一致），可信工具路线保持 待决策。
+- 默认不向目标上传静态工具；例外是用户主动发起并逐次确认的“进程活动监视”（规划见 2026-11-13 节；不上传的轮询方式与上传 pspy 均已实现，容器内验证，VM/实机 NOT_RUN）。可信工具路线的其余部分保持 待决策。
 - 不做 Diamorphine 的 kill -63/-64 信号探测（会改变攻击者状态），检测经 kallsyms 与 `/sys/module` 差集。
 - TLS keylog 解密按议题推迟，未实现也不暗示支持。
 - 冰蝎 v4 默认 Accept/Content-Type 头模式无可靠出处，未纳入判定。

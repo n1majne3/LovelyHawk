@@ -13,7 +13,9 @@ export type EmergencyPathMenuAction =
   | "disarm"
   | "remove-capabilities"
   | "restore-residue"
-  | "quarantine";
+  | "quarantine"
+  | "delete-lines"
+  | "disable-xinetd-service";
 
 export interface EmergencyPathMenuProps {
   /** Where the menu was summoned, in client coordinates. */
@@ -50,6 +52,18 @@ const ITEMS: MenuItem[] = [
     action: "remove-capabilities",
     label: "移除文件能力",
     icon: <PermissionIcon />,
+  },
+  {
+    action: "delete-lines",
+    label: "删除指定行…",
+    icon: <TrashIcon />,
+    dangerous: true,
+  },
+  {
+    action: "disable-xinetd-service",
+    label: "停用此 xinetd 服务…",
+    icon: <TrashIcon />,
+    dangerous: true,
   },
   {
     action: "restore-residue",
@@ -128,7 +142,15 @@ export function EmergencyPathMenu({
       <p className="emergency-path-menu-title" title={offer.path}>{offer.path}</p>
       {/* Fetching to the local scan area only exists where the page wired it;
           the item stays off menus that never handle the action. */}
-      {ITEMS.filter((item) => item.action !== "local-scan" || localScan).map((item) => (
+      {ITEMS.filter((item) =>
+        (item.action !== "local-scan" || localScan) &&
+        // Offered only where the path is one line deletion manages; the
+        // backend refuses anywhere else, so a hidden entry is not a bypass.
+        (item.action !== "delete-lines" || offer.lineEditable) &&
+        // Same rule for the xinetd service action: only files xinetd
+        // actually loads ever show it.
+        (item.action !== "disable-xinetd-service" || offer.xinetdService),
+      ).map((item) => (
         <Fragment key={item.action}>
           {item.action === "disarm" ? <div className="emergency-path-menu-separator" role="separator" /> : null}
           <button

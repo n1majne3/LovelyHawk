@@ -540,6 +540,14 @@ impl SystemInfoService {
         if is_private_address(&request.address) {
             warnings.push("内网地址，可能是跳板或业务主机，请确认。".to_owned());
         }
+        // 出方向封禁本会话或其他在线 SSH 登录的对端，效果同样是切断远程接入；
+        // 入方向命中已在前面整体拒绝。
+        if !request.direction.blocks_inbound() && probe.own_ips.contains(&request.address) {
+            warnings.push(
+                "该地址是 SSH 连接的对端。可能影响远程接入或对外业务，请确认仍有其他接入方式。"
+                    .to_owned(),
+            );
+        }
         if backend == FirewallBackend::IpTables
             && probe.docker_user
             && request.direction.blocks_inbound()

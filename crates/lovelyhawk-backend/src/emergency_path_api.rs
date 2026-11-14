@@ -29,6 +29,11 @@ use lovelyhawk_core::{
         RESTORE_KIND_REFUSAL, RESTORE_LOCATION_REFUSAL, RESTORE_PRIVILEGE_REFUSAL,
         RESTORE_TOOLS_REFUSAL,
     },
+    line_delete::{
+        LINE_DELETE_KIND_REFUSAL, LINE_DELETE_LOCATION_REFUSAL, LINE_DELETE_RANGE_REFUSAL,
+        LINE_DELETE_SIZE_REFUSAL, LINE_DELETE_STALE_REFUSAL, LineDeleteOperation, PreviewLine,
+        line_delete_path_allowed, preview_lines,
+    },
     operations::{DangerousConfirmation, OperationPlan, OperationState, VerificationResult},
     sftp::{
         BoundSftpSession, MAX_EDIT_BYTES, RemotePath, SftpFileKind, SftpMutation,
@@ -36,6 +41,11 @@ use lovelyhawk_core::{
     },
     ssh::BoundSshSession,
     target::TargetGuard,
+    xinetd_service::{
+        XINETD_IGNORED_REFUSAL, XINETD_KIND_REFUSAL, XINETD_LOCATION_REFUSAL,
+        XINETD_PRIVILEGE_REFUSAL, XINETD_TOOLS_REFUSAL, XinetdDisableOperation, XinetdPathCheck,
+        xinetd_service_path_check,
+    },
 };
 use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
@@ -96,6 +106,14 @@ pub(crate) enum EmergencyPathAction {
     /// Write a backup residue found beside a system command back over the
     /// command, keeping the replaced bytes for one undo.
     RestoreResidue,
+    /// Remove a contiguous range of lines from a managed startup or cron
+    /// file. Needs the preview-and-range flow of `path.lines`/`path.plan-lines`;
+    /// `plan` and `plan_batch` refuse it.
+    DeleteLines,
+    /// Isolate a service file under /etc/xinetd.d and reload the daemon.
+    /// Emergency semantics: once the file is moved it stays isolated even
+    /// when the port check fails — putting it back would re-arm the service.
+    DisableXinetdService,
 }
 
 impl EmergencyPathAction {
@@ -105,6 +123,8 @@ impl EmergencyPathAction {
             Self::Quarantine => "quarantine",
             Self::RemoveCapabilities => "remove-capabilities",
             Self::RestoreResidue => "restore-residue",
+            Self::DeleteLines => "delete-lines",
+            Self::DisableXinetdService => "disable-xinetd-service",
         }
     }
 }
@@ -119,6 +139,12 @@ pub(crate) struct EmergencyPathDto {
     /// The path as the host printed it, so the menu can name what it will act
     /// on. The renderer displays it; it cannot act with it.
     pub(crate) path: String,
+    /// Whether the path sits in the line-delete allow-list, so the menu only
+    /// offers the entry where it can apply.
+    pub(crate) line_editable: bool,
+    /// Whether the path is a file xinetd would load, so the menu can offer
+    /// the service-disable action where it applies.
+    pub(crate) xinetd_service: bool,
 }
 
 /// What the host says about the file right now.
@@ -152,6 +178,58 @@ pub(crate) struct EmergencyPathPlanDto {
     /// What a restore plan found beside the command; absent for other
     /// actions. All text is bounded at the boundary like the summary.
     pub(crate) residue: Option<ResiduePlanDto>,
+}
+
+/// One display-safe line of a file preview or a removal list.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EmergencyPathLineDto {
+    pub(crate) number: u32,
+    pub(crate) text: String,
+    pub(crate) clipped: bool,
+}
+
+impl From<&PreviewLine> for EmergencyPathLineDto {
+    fn from(line: &PreviewLine) -> Self {
+        Self {
+            number: line.number,
+            text: bounded_text(&line.text),
+            clipped: line.clipped,
+        }
+    }
+}
+
+/// The numbered, sanitized lines of a file the operator may delete from. The
+/// preview handle binds the digest of exactly these bytes to whatever plan is
+/// made from them; it never crosses the boundary.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EmergencyPathLinesPreviewDto {
+    pub(crate) preview_handle: String,
+    pub(crate) path_handle: String,
+    pub(crate) path: String,
+    pub(crate) total_lines: u32,
+    pub(crate) lines: Vec<EmergencyPathLineDto>,
+    /// The file has more lines than `lines` carries.
+    pub(crate) truncated: bool,
+}
+
+/// A line-deletion plan: the same plan DTO `plan` returns, plus the exact
+/// lines the delete would take out so the confirmation lists all of them.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EmergencyPathLinesPlanDto {
+    pub(crate) plan_handle: String,
+    pub(crate) path_handle: String,
+    pub(crate) path: String,
+    pub(crate) action: String,
+    pub(crate) summary: String,
+    pub(crate) dangerous: bool,
+    pub(crate) restore_description: Option<String>,
+    pub(crate) state: String,
+    pub(crate) expires_in_seconds: u32,
+    pub(crate) residue: Option<ResiduePlanDto>,
+    pub(crate) removed_lines: Vec<EmergencyPathLineDto>,
 }
 
 /// One regular file the restore probe saw beside the command.
@@ -273,6 +351,17 @@ struct StoredPath {
     expires_at: Instant,
 }
 
+/// What a `path.lines` preview read: the digest the plan must bind, kept on
+/// this side so a file that moved between preview and planning is refused.
+struct StoredPreview {
+    scope: PathScope,
+    preview_handle: String,
+    path_handle: String,
+    path: RemotePath,
+    sha256: String,
+    expires_at: Instant,
+}
+
 struct PlannedPath {
     plan_handle: String,
     path_handle: String,
@@ -381,6 +470,8 @@ enum PathOperation {
     Sftp(SftpPlannedOperation),
     CapabilityStrip(CapabilityStripOperation),
     CommandRestore(CommandRestoreOperation),
+    LineDelete(Box<LineDeleteOperation>),
+    XinetdDisable(Box<XinetdDisableOperation>),
 }
 
 impl PathOperation {
@@ -389,6 +480,8 @@ impl PathOperation {
             Self::Sftp(operation) => operation.definition(),
             Self::CapabilityStrip(operation) => operation.definition(),
             Self::CommandRestore(operation) => operation.definition(),
+            Self::LineDelete(operation) => operation.definition(),
+            Self::XinetdDisable(operation) => operation.definition(),
         }
     }
 
@@ -397,6 +490,8 @@ impl PathOperation {
             Self::Sftp(operation) => operation.state(),
             Self::CapabilityStrip(operation) => operation.state(),
             Self::CommandRestore(operation) => operation.state(),
+            Self::LineDelete(operation) => operation.state(),
+            Self::XinetdDisable(operation) => operation.state(),
         }
     }
 
@@ -405,6 +500,8 @@ impl PathOperation {
             Self::Sftp(operation) => operation.confirm(confirmation),
             Self::CapabilityStrip(operation) => operation.confirm(confirmation),
             Self::CommandRestore(operation) => operation.confirm(confirmation),
+            Self::LineDelete(operation) => operation.confirm(confirmation),
+            Self::XinetdDisable(operation) => operation.confirm(confirmation),
         }
     }
 
@@ -413,6 +510,8 @@ impl PathOperation {
             Self::Sftp(operation) => operation.execute_and_verify().await,
             Self::CapabilityStrip(operation) => operation.execute_and_verify().await,
             Self::CommandRestore(operation) => operation.execute_and_verify().await,
+            Self::LineDelete(operation) => operation.execute_and_verify().await,
+            Self::XinetdDisable(operation) => operation.execute_and_verify().await,
         }
     }
 
@@ -421,6 +520,8 @@ impl PathOperation {
             Self::Sftp(operation) => operation.restore().await,
             Self::CapabilityStrip(operation) => operation.restore().await,
             Self::CommandRestore(operation) => operation.restore().await,
+            Self::LineDelete(operation) => operation.restore().await,
+            Self::XinetdDisable(operation) => operation.restore().await,
         }
     }
 
@@ -429,6 +530,8 @@ impl PathOperation {
             Self::Sftp(operation) => operation.can_undo(),
             Self::CapabilityStrip(operation) => operation.can_undo(),
             Self::CommandRestore(operation) => operation.can_undo(),
+            Self::LineDelete(operation) => operation.can_undo(),
+            Self::XinetdDisable(operation) => operation.can_undo(),
         }
     }
 
@@ -437,7 +540,17 @@ impl PathOperation {
             Self::Sftp(operation) => operation.undo().await,
             Self::CapabilityStrip(operation) => operation.undo().await,
             Self::CommandRestore(operation) => operation.undo().await,
+            Self::LineDelete(operation) => operation.undo().await,
+            Self::XinetdDisable(operation) => operation.undo().await,
         }
+    }
+
+    /// Whether a failed verification puts the file back. The xinetd disable
+    /// keeps the file isolated by design: an automatic put-back would re-arm
+    /// the service on the next reload, so undo — an explicit ask — is the
+    /// only way back.
+    fn restores_on_failed_verification(&self) -> bool {
+        !matches!(self, Self::XinetdDisable(_))
     }
 
     /// The residue facts a restore plan gathered; other actions have none.
@@ -457,6 +570,19 @@ impl PathOperation {
     }
 }
 
+/// Whether the operator may undo after execution. A completed isolation that
+/// does not auto-restore stays undoable even when verification failed — the
+/// failed check is exactly when undo matters most. Operations that restore on
+/// failure keep the older rule: once the original is put back there is nothing
+/// left to undo.
+fn undoable_after_verification(
+    passed: bool,
+    restores_on_failed_verification: bool,
+    can_undo: bool,
+) -> bool {
+    (passed || !restores_on_failed_verification) && can_undo
+}
+
 /// Digests are host-reported text: bounded like every other boundary string,
 /// and no longer than the 64 hex characters a sha256 can be.
 fn residue_candidate_dto(
@@ -473,6 +599,7 @@ fn residue_candidate_dto(
 #[derive(Default)]
 struct PathRegistry {
     paths: HashMap<String, StoredPath>,
+    previews: HashMap<String, StoredPreview>,
     plans: HashMap<String, PlannedPath>,
     /// Verified and reversible: kept for a while so the operator can undo
     /// them from the receipt.
@@ -483,6 +610,7 @@ struct PathRegistry {
 impl PathRegistry {
     fn prune(&mut self, now: Instant) {
         self.paths.retain(|_, stored| stored.expires_at > now);
+        self.previews.retain(|_, stored| stored.expires_at > now);
         self.plans.retain(|_, plan| plan.expires_at > now);
         self.done.retain(|_, plan| plan.expires_at > now);
         self.batches.retain(|_, batch| batch.expires_at > now);
@@ -490,6 +618,8 @@ impl PathRegistry {
 
     fn close_binding(&mut self, binding_handle: &str) {
         self.paths
+            .retain(|_, stored| stored.scope.binding_handle != binding_handle);
+        self.previews
             .retain(|_, stored| stored.scope.binding_handle != binding_handle);
         self.plans
             .retain(|_, plan| plan.scope.binding_handle != binding_handle);
@@ -637,6 +767,44 @@ impl PathRegistry {
         Ok(())
     }
 
+    /// One preview per binding: a new `path.lines` call replaces whichever
+    /// file the same window was looking at before.
+    fn store_preview(&mut self, preview: StoredPreview) -> Result<(), EmergencyPathApiError> {
+        self.previews
+            .retain(|_, stored| stored.scope.binding_handle != preview.scope.binding_handle);
+        if self.previews.len() >= MAX_PLANS {
+            return Err(EmergencyPathApiError::Capacity);
+        }
+        self.previews
+            .insert(preview.preview_handle.clone(), preview);
+        Ok(())
+    }
+
+    /// The stored preview's own copy — a plan is bound to what the preview
+    /// read, not to anything the caller claims about it.
+    fn preview(
+        &self,
+        scope: &PathScope,
+        preview_handle: &str,
+        now: Instant,
+    ) -> Result<StoredPreview, EmergencyPathApiError> {
+        let stored = self
+            .previews
+            .get(preview_handle)
+            .ok_or(EmergencyPathApiError::PlanStale)?;
+        if !still_live(&stored.scope, stored.expires_at, scope, now) {
+            return Err(EmergencyPathApiError::PlanStale);
+        }
+        Ok(StoredPreview {
+            scope: stored.scope.clone(),
+            preview_handle: stored.preview_handle.clone(),
+            path_handle: stored.path_handle.clone(),
+            path: stored.path.clone(),
+            sha256: stored.sha256.clone(),
+            expires_at: stored.expires_at,
+        })
+    }
+
     fn plan_mut(
         &mut self,
         scope: &PathScope,
@@ -703,6 +871,26 @@ pub(crate) enum PathRefusal {
     RestoreLocation,
     RestoreEmpty,
     RestoreAmbiguous,
+    /// The path is not one of the managed startup/cron files.
+    LineLocation,
+    /// Not a regular file (symlink, directory, anything else).
+    LineKind,
+    /// Empty or past the managed-edit size cap.
+    LineSize,
+    /// Line numbers outside the file or past the per-delete cap.
+    LineRange,
+    /// The file moved between preview and planning.
+    LineStale,
+    /// Outside /etc/xinetd.d or an unusable name there.
+    XinetdLocation,
+    /// Not a regular file.
+    XinetdKind,
+    /// A name xinetd itself does not load (contains a dot or ends with ~).
+    XinetdIgnored,
+    /// Needs root or passwordless sudo.
+    XinetdPrivilege,
+    /// The host lacks a tool the isolation cannot proceed without.
+    XinetdTools,
 }
 
 /// The refusal key a batch item carries back to the page.
@@ -719,6 +907,16 @@ fn path_refusal_key(refusal: PathRefusal) -> &'static str {
         PathRefusal::RestoreLocation => "restore-location",
         PathRefusal::RestoreEmpty => "restore-empty",
         PathRefusal::RestoreAmbiguous => "restore-ambiguous",
+        PathRefusal::LineLocation => "line-location",
+        PathRefusal::LineKind => "line-kind",
+        PathRefusal::LineSize => "line-size",
+        PathRefusal::LineRange => "line-range",
+        PathRefusal::LineStale => "line-stale",
+        PathRefusal::XinetdLocation => "xinetd-location",
+        PathRefusal::XinetdKind => "xinetd-kind",
+        PathRefusal::XinetdIgnored => "xinetd-ignored",
+        PathRefusal::XinetdPrivilege => "xinetd-privilege",
+        PathRefusal::XinetdTools => "xinetd-tools",
     }
 }
 
@@ -749,6 +947,39 @@ fn restore_plan_failure(error: &CoreError) -> EmergencyPathApiError {
             RESTORE_LOCATION_REFUSAL => PathRefusal::RestoreLocation,
             RESTORE_EMPTY_REFUSAL => PathRefusal::RestoreEmpty,
             RESTORE_AMBIGUOUS_REFUSAL => PathRefusal::RestoreAmbiguous,
+            _ => return EmergencyPathApiError::Core,
+        },
+        _ => return EmergencyPathApiError::Core,
+    };
+    EmergencyPathApiError::Refused(refusal)
+}
+
+/// Line-delete planning refuses for reasons the page names one by one;
+/// anything else stays generic.
+fn line_delete_plan_failure(error: &CoreError) -> EmergencyPathApiError {
+    let refusal = match error {
+        CoreError::Validation { subject, .. } => match *subject {
+            LINE_DELETE_LOCATION_REFUSAL => PathRefusal::LineLocation,
+            LINE_DELETE_KIND_REFUSAL => PathRefusal::LineKind,
+            LINE_DELETE_SIZE_REFUSAL => PathRefusal::LineSize,
+            LINE_DELETE_RANGE_REFUSAL => PathRefusal::LineRange,
+            LINE_DELETE_STALE_REFUSAL => PathRefusal::LineStale,
+            _ => return EmergencyPathApiError::Core,
+        },
+        _ => return EmergencyPathApiError::Core,
+    };
+    EmergencyPathApiError::Refused(refusal)
+}
+
+/// Xinetd-disable planning refuses for reasons the page names one by one.
+fn xinetd_plan_failure(error: &CoreError) -> EmergencyPathApiError {
+    let refusal = match error {
+        CoreError::Validation { subject, .. } => match *subject {
+            XINETD_LOCATION_REFUSAL => PathRefusal::XinetdLocation,
+            XINETD_KIND_REFUSAL => PathRefusal::XinetdKind,
+            XINETD_IGNORED_REFUSAL => PathRefusal::XinetdIgnored,
+            XINETD_PRIVILEGE_REFUSAL => PathRefusal::XinetdPrivilege,
+            XINETD_TOOLS_REFUSAL => PathRefusal::XinetdTools,
             _ => return EmergencyPathApiError::Core,
         },
         _ => return EmergencyPathApiError::Core,
@@ -813,10 +1044,17 @@ impl EmergencyPathApi {
                 continue;
             };
             let path_handle = Uuid::new_v4().to_string();
+            let line_editable = line_delete_path_allowed(&remote);
+            let xinetd_service = matches!(
+                xinetd_service_path_check(&remote),
+                XinetdPathCheck::Applicable
+            );
             offered.push(EmergencyPathDto {
                 path_handle: path_handle.clone(),
                 line,
                 path,
+                line_editable,
+                xinetd_service,
             });
             stored.push((path_handle, remote));
         }
@@ -914,6 +1152,148 @@ impl EmergencyPathApi {
         })
     }
 
+    /// The numbered, sanitized lines of a managed file, so the operator can
+    /// pick the range to delete. The digest of the bytes read stays behind
+    /// the preview handle: a file that moves between preview and planning is
+    /// refused rather than edited blind.
+    pub(crate) async fn preview_lines(
+        &self,
+        binding_handle: &str,
+        path_handle: &str,
+    ) -> Result<EmergencyPathLinesPreviewDto, EmergencyPathApiError> {
+        validate_handle(path_handle)?;
+        let scope = self.capture_binding(binding_handle)?;
+        let path = {
+            let now = Instant::now();
+            let mut registry = self.lock_registry()?;
+            registry.prune(now);
+            registry.path(&scope, path_handle, now)?
+        };
+        if !line_delete_path_allowed(&path) {
+            return Err(EmergencyPathApiError::Refused(PathRefusal::LineLocation));
+        }
+        let session = self.bind_sftp(&scope).await?;
+        let metadata = timeout(
+            INSPECT_DEADLINE,
+            self.services.sftp().metadata(&session, &path, false),
+        )
+        .await
+        .map_err(|_| EmergencyPathApiError::Deadline)?
+        .map_err(|_| EmergencyPathApiError::Core)?;
+        if metadata.kind != SftpFileKind::File {
+            return Err(EmergencyPathApiError::Refused(PathRefusal::LineKind));
+        }
+        if metadata.size == 0 || metadata.size > MAX_EDIT_BYTES {
+            return Err(EmergencyPathApiError::Refused(PathRefusal::LineSize));
+        }
+        let content = timeout(
+            INSPECT_DEADLINE,
+            self.services.sftp().read_file(&session, &path),
+        )
+        .await
+        .map_err(|_| EmergencyPathApiError::Deadline)?
+        .map_err(|_| EmergencyPathApiError::Core)?;
+        self.validate_binding(&scope)?;
+
+        let preview = preview_lines(&content);
+        let preview_handle = Uuid::new_v4().to_string();
+        let dto = EmergencyPathLinesPreviewDto {
+            preview_handle: preview_handle.clone(),
+            path_handle: path_handle.to_owned(),
+            path: path.as_str().to_owned(),
+            total_lines: preview.total_lines,
+            lines: preview
+                .lines
+                .iter()
+                .map(EmergencyPathLineDto::from)
+                .collect(),
+            truncated: preview.truncated,
+        };
+        let now = Instant::now();
+        let mut registry = self.lock_registry()?;
+        registry.prune(now);
+        registry.store_preview(StoredPreview {
+            scope,
+            preview_handle,
+            path_handle: path_handle.to_owned(),
+            path,
+            sha256: preview.sha256,
+            expires_at: now + PLAN_TTL,
+        })?;
+        Ok(dto)
+    }
+
+    /// Plans a contiguous-line delete from the preview the operator picked
+    /// the range on. The plan is the same single-use kind `plan` stores, so
+    /// confirm, execute, cancel and undo all work on it unchanged.
+    pub(crate) async fn plan_lines(
+        &self,
+        binding_handle: &str,
+        preview_handle: &str,
+        first_line: u32,
+        last_line: u32,
+    ) -> Result<EmergencyPathLinesPlanDto, EmergencyPathApiError> {
+        validate_handle(preview_handle)?;
+        let scope = self.capture_binding(binding_handle)?;
+        let preview = {
+            let now = Instant::now();
+            let mut registry = self.lock_registry()?;
+            registry.prune(now);
+            registry.preview(&scope, preview_handle, now)?
+        };
+        let session = self.bound_ssh(&scope)?;
+        let operation = timeout(
+            INSPECT_DEADLINE,
+            self.services.system_info().plan_line_delete(
+                &session,
+                &preview.path,
+                first_line,
+                last_line,
+                &preview.sha256,
+            ),
+        )
+        .await
+        .map_err(|_| EmergencyPathApiError::Deadline)?
+        .map_err(|error| line_delete_plan_failure(&error))?;
+        self.validate_binding(&scope)?;
+
+        let removed_lines: Vec<EmergencyPathLineDto> = operation
+            .removed_lines()
+            .iter()
+            .map(EmergencyPathLineDto::from)
+            .collect();
+        let now = Instant::now();
+        let plan = PlannedPath {
+            plan_handle: Uuid::new_v4().to_string(),
+            path_handle: preview.path_handle.clone(),
+            path: preview.path.as_str().to_owned(),
+            action: EmergencyPathAction::DeleteLines,
+            scope,
+            operation: PathOperation::LineDelete(Box::new(operation)),
+            expires_at: now + PLAN_TTL,
+        };
+        let definition = plan.operation.definition();
+        let remaining = plan.expires_at.saturating_duration_since(now).as_secs();
+        let dto = EmergencyPathLinesPlanDto {
+            plan_handle: plan.plan_handle.clone(),
+            path_handle: plan.path_handle.clone(),
+            path: plan.path.clone(),
+            action: plan.action.label().to_owned(),
+            summary: bounded_text(&definition.summary),
+            dangerous: definition.dangerous,
+            restore_description: definition.restore_description.as_deref().map(bounded_text),
+            state: "planned".to_owned(),
+            expires_in_seconds: u32::try_from(remaining.max(1))
+                .map_err(|_| EmergencyPathApiError::Core)?,
+            residue: None,
+            removed_lines,
+        };
+        let mut registry = self.lock_registry()?;
+        registry.prune(now);
+        registry.store_plan(plan)?;
+        Ok(dto)
+    }
+
     /// Describes what an action would do, without doing any of it.
     pub(crate) async fn plan(
         &self,
@@ -922,6 +1302,11 @@ impl EmergencyPathApi {
         action: EmergencyPathAction,
     ) -> Result<EmergencyPathPlanDto, EmergencyPathApiError> {
         validate_handle(path_handle)?;
+        // A delete needs the range the preview flow carries, so the generic
+        // plan entry is where it gets refused — not where it guesses one.
+        if action == EmergencyPathAction::DeleteLines {
+            return Err(EmergencyPathApiError::UnsupportedBatchAction);
+        }
         let scope = self.capture_binding(binding_handle)?;
         let path = {
             let now = Instant::now();
@@ -1027,12 +1412,14 @@ impl EmergencyPathApi {
             }
             Ok(Ok(verification)) => verification,
         };
-        let restored = if verification.passed {
-            false
-        } else {
-            plan.operation.restore().await.is_ok()
-        };
-        let undoable = verification.passed && plan.operation.can_undo();
+        let restored = !verification.passed
+            && plan.operation.restores_on_failed_verification()
+            && plan.operation.restore().await.is_ok();
+        let undoable = undoable_after_verification(
+            verification.passed,
+            plan.operation.restores_on_failed_verification(),
+            plan.operation.can_undo(),
+        );
         let receipt = EmergencyPathReceiptDto {
             plan_handle: plan.plan_handle.clone(),
             path: plan.path.clone(),
@@ -1381,6 +1768,21 @@ impl EmergencyPathApi {
                 .map_err(|error| restore_plan_failure(&error))?;
                 Ok(PathOperation::CommandRestore(operation))
             }
+            EmergencyPathAction::DisableXinetdService => {
+                let session = self.bound_ssh(scope)?;
+                let operation = timeout(
+                    INSPECT_DEADLINE,
+                    self.services.system_info().plan_xinetd_disable(
+                        &session,
+                        path,
+                        self.services.operation_journal().clone(),
+                    ),
+                )
+                .await
+                .map_err(|_| EmergencyPathApiError::Deadline)?
+                .map_err(|error| xinetd_plan_failure(&error))?;
+                Ok(PathOperation::XinetdDisable(Box::new(operation)))
+            }
             _ => {
                 let session = self.bind_sftp(scope).await?;
                 let mutation = self.sftp_mutation(&session, path, action).await?;
@@ -1464,7 +1866,10 @@ impl EmergencyPathApi {
             // SSH-carried actions are matched above the SFTP arm; a
             // new variant must pick a transport there, not fall into
             // this match silently.
-            EmergencyPathAction::RemoveCapabilities | EmergencyPathAction::RestoreResidue => {
+            EmergencyPathAction::RemoveCapabilities
+            | EmergencyPathAction::RestoreResidue
+            | EmergencyPathAction::DeleteLines
+            | EmergencyPathAction::DisableXinetdService => {
                 unreachable!()
             }
         };
@@ -2119,6 +2524,135 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn the_delete_lines_action_round_trips_kebab_case_and_label() {
+        let action: EmergencyPathAction = serde_json::from_str("\"delete-lines\"").unwrap();
+        assert!(matches!(action, EmergencyPathAction::DeleteLines));
+        assert_eq!(action.label(), "delete-lines");
+        assert!(serde_json::from_str::<EmergencyPathAction>("\"deleteLines\"").is_err());
+    }
+
+    #[test]
+    fn line_delete_refusals_map_to_their_own_codes_and_nothing_else() {
+        for (subject, expected) in [
+            (LINE_DELETE_LOCATION_REFUSAL, PathRefusal::LineLocation),
+            (LINE_DELETE_KIND_REFUSAL, PathRefusal::LineKind),
+            (LINE_DELETE_SIZE_REFUSAL, PathRefusal::LineSize),
+            (LINE_DELETE_RANGE_REFUSAL, PathRefusal::LineRange),
+            (LINE_DELETE_STALE_REFUSAL, PathRefusal::LineStale),
+        ] {
+            let error = CoreError::Validation {
+                subject,
+                message: "m".to_owned(),
+            };
+            match line_delete_plan_failure(&error) {
+                EmergencyPathApiError::Refused(found) => {
+                    assert!(std::mem::discriminant(&found) == std::mem::discriminant(&expected));
+                }
+                _ => panic!("{subject} should be a named refusal"),
+            }
+        }
+        let other = CoreError::Validation {
+            subject: CAPABILITY_TOOLS_REFUSAL,
+            message: "m".to_owned(),
+        };
+        assert!(matches!(
+            line_delete_plan_failure(&other),
+            EmergencyPathApiError::Core
+        ));
+        let io = CoreError::InvalidOperationState {
+            state: "planned",
+            action: "confirm",
+        };
+        assert!(matches!(
+            line_delete_plan_failure(&io),
+            EmergencyPathApiError::Core
+        ));
+    }
+
+    #[test]
+    fn xinetd_refusals_map_to_their_own_codes_and_nothing_else() {
+        for (subject, expected) in [
+            (XINETD_LOCATION_REFUSAL, PathRefusal::XinetdLocation),
+            (XINETD_KIND_REFUSAL, PathRefusal::XinetdKind),
+            (XINETD_IGNORED_REFUSAL, PathRefusal::XinetdIgnored),
+            (XINETD_PRIVILEGE_REFUSAL, PathRefusal::XinetdPrivilege),
+            (XINETD_TOOLS_REFUSAL, PathRefusal::XinetdTools),
+        ] {
+            let error = CoreError::Validation {
+                subject,
+                message: "m".to_owned(),
+            };
+            match xinetd_plan_failure(&error) {
+                EmergencyPathApiError::Refused(found) => {
+                    assert!(std::mem::discriminant(&found) == std::mem::discriminant(&expected));
+                }
+                _ => panic!("{subject} should be a named refusal"),
+            }
+        }
+        let other = CoreError::Validation {
+            subject: LINE_DELETE_KIND_REFUSAL,
+            message: "m".to_owned(),
+        };
+        assert!(matches!(
+            xinetd_plan_failure(&other),
+            EmergencyPathApiError::Core
+        ));
+    }
+
+    #[test]
+    fn the_xinetd_action_round_trips_kebab_case_and_label() {
+        let action: EmergencyPathAction =
+            serde_json::from_str("\"disable-xinetd-service\"").unwrap();
+        assert_eq!(action, EmergencyPathAction::DisableXinetdService);
+        assert_eq!(action.label(), "disable-xinetd-service");
+    }
+
+    #[test]
+    fn a_preview_is_live_only_for_the_binding_and_window_that_made_it() {
+        let mine = scope("binding-a", "target-a", 0);
+        let theirs = scope("binding-b", "target-a", 0);
+        let mut registry = PathRegistry::default();
+        let now = Instant::now();
+        registry
+            .store_preview(StoredPreview {
+                scope: mine.clone(),
+                preview_handle: "preview-1".to_owned(),
+                path_handle: "path-1".to_owned(),
+                path: RemotePath::new("/etc/crontab").unwrap(),
+                sha256: "a".repeat(64),
+                expires_at: now + PLAN_TTL,
+            })
+            .unwrap();
+        assert!(registry.preview(&mine, "preview-1", now).is_ok());
+        // Another binding naming the same handle names nothing.
+        assert!(matches!(
+            registry.preview(&theirs, "preview-1", now),
+            Err(EmergencyPathApiError::PlanStale)
+        ));
+        // An expired preview names nothing either.
+        assert!(matches!(
+            registry.preview(&mine, "preview-1", now + PLAN_TTL),
+            Err(EmergencyPathApiError::PlanStale)
+        ));
+        // A newer preview for the same binding replaces the first.
+        registry
+            .store_preview(StoredPreview {
+                scope: mine.clone(),
+                preview_handle: "preview-2".to_owned(),
+                path_handle: "path-2".to_owned(),
+                path: RemotePath::new("/etc/profile").unwrap(),
+                sha256: "b".repeat(64),
+                expires_at: now + PLAN_TTL,
+            })
+            .unwrap();
+        assert!(registry.preview(&mine, "preview-1", now).is_err());
+        assert!(registry.preview(&mine, "preview-2", now).is_ok());
+        // Closing the binding drops them all.
+        registry.close_binding("binding-a");
+        assert!(registry.preview(&mine, "preview-2", now).is_err());
+    }
+
     /// A previewable row at this level has no live operation behind it —
     /// the step path that runs one is exercised against a real target in the
     /// lab. `finished` controls whether the row still counts as pending.
@@ -2250,5 +2784,21 @@ mod tests {
         registry.store_batch(stored).unwrap();
         registry.prune(Instant::now());
         assert!(registry.batches.is_empty());
+    }
+
+    #[test]
+    fn undo_after_verification_keeps_failed_restores_closed_and_isolations_open() {
+        // A verified change is undoable either way.
+        assert!(undoable_after_verification(true, true, true));
+        assert!(undoable_after_verification(true, false, true));
+        // Failed verification on a restoring action already put the file
+        // back: offering undo would act on the restored original.
+        assert!(!undoable_after_verification(false, true, true));
+        // Failed verification on an action that keeps the file isolated is
+        // exactly when the operator needs undo.
+        assert!(undoable_after_verification(false, false, true));
+        // Nothing is ever undoable when the operation has no undo.
+        assert!(!undoable_after_verification(true, false, false));
+        assert!(!undoable_after_verification(false, false, false));
     }
 }
