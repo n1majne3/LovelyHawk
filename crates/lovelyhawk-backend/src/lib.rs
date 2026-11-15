@@ -2479,6 +2479,17 @@ impl BackendState {
                     Err(failure) => Err(failure),
                 }
             }
+            RpcMethod::PacketCaptureDiscard => {
+                match parse_params::<PacketCaptureHandleParams>(request.params) {
+                    Ok(params) => self
+                        .packet_capture_live
+                        .discard(&params.binding_handle, &params.capture_handle)
+                        .await
+                        .map(to_value)
+                        .map_err(packet_capture_live_failure),
+                    Err(failure) => Err(failure),
+                }
+            }
             RpcMethod::PacketCaptureStop => {
                 match parse_params::<PacketCaptureHandleParams>(request.params) {
                     Ok(params) => self
@@ -3662,6 +3673,8 @@ enum RpcMethod {
     PacketCaptureStart,
     #[serde(rename = "packet-capture.poll")]
     PacketCapturePoll,
+    #[serde(rename = "packet-capture.discard")]
+    PacketCaptureDiscard,
     #[serde(rename = "packet-capture.stop")]
     PacketCaptureStop,
     #[serde(rename = "process-watch.probe")]
@@ -6672,6 +6685,10 @@ fn pod_file_evidence_failure(error: PodFileEvidenceError) -> RpcFailure {
 fn packet_capture_evidence_failure(error: PacketCaptureEvidenceError) -> RpcFailure {
     let (code, message) = match error {
         PacketCaptureEvidenceError::Invalid => ("invalid-params", "抓包留证请求无效。"),
+        PacketCaptureEvidenceError::NotFinished => (
+            "packet-capture-evidence-not-finished",
+            "抓包还在进行，请等它结束后或先停止再导出。",
+        ),
         PacketCaptureEvidenceError::Stale => (
             "packet-capture-evidence-stale",
             "连接或网卡列表已失效，请重新读取网卡后再抓包留证。",
@@ -7461,6 +7478,12 @@ fn packet_capture_live_failure(error: PacketCaptureLiveApiError) -> RpcFailure {
             operation: "validate live packet capture interface capability",
             code: "packet-capture-interface-unavailable",
             public_message: "The packet capture interface is missing, expired, or stale.",
+            source: None,
+        },
+        PacketCaptureLiveApiError::StillRunning => RpcFailure {
+            operation: "validate live packet capture state",
+            code: "packet-capture-still-running",
+            public_message: "The live packet capture is still running.",
             source: None,
         },
         PacketCaptureLiveApiError::CaptureUnavailable => RpcFailure {

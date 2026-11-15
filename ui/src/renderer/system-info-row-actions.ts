@@ -4,6 +4,7 @@ import {
   isSystemInfoRowActions,
   isSystemInfoRowInspection,
   isSystemInfoRowPlan,
+  isSystemInfoRowUndo,
   isSystemInfoRowReceipt,
   type SystemInfoApi,
   type SystemInfoRow,
@@ -329,7 +330,7 @@ export function useSystemInfoRowActions(
       : { ...previous, undoBusy: true, undoError: null });
     try {
       const result = await api.undoSystemInfoRowAction(bindingHandle, undoHandle);
-      if (typeof result.undone !== "boolean") {
+      if (!isSystemInfoRowUndo(result)) {
         throw new Error("目标机返回的撤销结果无法识别。");
       }
       setState((previous) => previous === null ? null

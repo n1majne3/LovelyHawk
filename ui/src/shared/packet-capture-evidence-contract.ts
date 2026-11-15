@@ -7,6 +7,7 @@ import { isPacketCaptureOpaqueHandle, isPacketCaptureStartInput, type PacketCapt
  */
 export type PacketCaptureEvidenceRequest =
   | { action: "begin"; bindingHandle: string; interfaceHandle: string; input: PacketCaptureStartInput }
+  | { action: "export"; bindingHandle: string; captureHandle: string }
   | { action: "poll" | "cancel"; bindingHandle: string; jobHandle: string };
 
 export type PacketCaptureEvidenceState = "capturing" | "collecting" | "completed" | "saved-unlinked" | "failed" | "cancelled";
@@ -62,6 +63,11 @@ export function isPacketCaptureEvidenceRequest(value: unknown): value is PacketC
       isPacketCaptureOpaqueHandle(value.bindingHandle) && isPacketCaptureOpaqueHandle(value.interfaceHandle) &&
       isPacketCaptureStartInput(value.input);
   }
+  if (value.action === "export") {
+    return exact(value, ["action", "bindingHandle", "captureHandle"]) &&
+      isPacketCaptureOpaqueHandle(value.bindingHandle) &&
+      isPacketCaptureOpaqueHandle(value.captureHandle);
+  }
   return (value.action === "poll" || value.action === "cancel") &&
     exact(value, ["action", "bindingHandle", "jobHandle"]) &&
     isPacketCaptureOpaqueHandle(value.bindingHandle) && text(value.jobHandle, 128);
@@ -100,6 +106,7 @@ export function matchesPacketCaptureEvidenceResult(
 ): result is PacketCaptureEvidenceResult | null {
   if (result === null) return request.action === "begin";
   if (!isPacketCaptureEvidenceResult(result)) return false;
+  if (request.action === "export") return result.state === "collecting";
   if (request.action !== "begin") return result.jobHandle === request.jobHandle;
   return result.state === "capturing" && result.durationSeconds === request.input.durationSeconds &&
     result.packetLimit === request.input.packetLimit && result.filtered === (request.input.filter !== null);

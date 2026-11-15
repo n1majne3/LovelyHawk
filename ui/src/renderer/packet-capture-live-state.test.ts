@@ -9,6 +9,7 @@ import {
   createPacketCaptureLiveState,
   packetCaptureLiveReducer,
 } from "./packet-capture-live-state";
+import { packetCaptureScope } from "./packet-capture-live-helpers";
 
 const interfaceHandle = "11111111-1111-4111-8111-111111111111";
 const captureHandle = "22222222-2222-4222-8222-222222222222";
@@ -86,6 +87,37 @@ function runningState(scope = "scope-one") {
     capture: { captureHandle, status: "running", expiresInSeconds: 150 },
   });
 }
+
+describe("raw file lifecycle after a capture ends", () => {
+  const scope = packetCaptureScope("binding-secret-capability");
+  const handle = "22222222-2222-4222-8222-222222222222";
+
+  it("keeps the ended capture's handle exportable, and loses it on discard", () => {
+    const running = { ...createPacketCaptureLiveState(scope), captureStatus: "running" as const, captureHandle: handle };
+    const released = packetCaptureLiveReducer(running, {
+      type: "capture-released", scope, captureHandle: handle, failed: false,
+    });
+    expect(released.exportHandle).toBe(handle);
+    expect(released.captureHandle).toBeNull();
+    const discarded = packetCaptureLiveReducer(released, {
+      type: "raw-discarded", scope, captureHandle: handle,
+    });
+    expect(discarded.exportHandle).toBeNull();
+    // A discard for a handle that is not the kept one changes nothing.
+    const wrong = packetCaptureLiveReducer(released, {
+      type: "raw-discarded", scope, captureHandle: "99999999-9999-4999-8999-999999999999",
+    });
+    expect(wrong.exportHandle).toBe(handle);
+  });
+
+  it("a failed release keeps nothing to export", () => {
+    const running = { ...createPacketCaptureLiveState(scope), captureStatus: "running" as const, captureHandle: handle };
+    const released = packetCaptureLiveReducer(running, {
+      type: "capture-released", scope, captureHandle: handle, failed: true,
+    });
+    expect(released.exportHandle).toBeNull();
+  });
+});
 
 describe("packet capture live reducer", () => {
   it("retains a stable interface handle and rejects an older target result", () => {

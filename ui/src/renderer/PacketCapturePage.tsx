@@ -3,6 +3,7 @@ import { useEffect, useReducer, useRef, useState, useSyncExternalStore } from "r
 
 import type { PacketCaptureEvidenceApi } from "../shared/packet-capture-evidence-contract";
 import {
+  isPacketCaptureDiscarded,
   isPacketCaptureInterfaceList,
   isPacketCapturePoll,
   isPacketCaptureStartInput,
@@ -108,6 +109,7 @@ export function PacketCapturePage({
   const [refreshVersion, setRefreshVersion] = useState(0);
   const requestRef = useRef(0);
   const ownerRef = useRef<CaptureOwner | null>(null);
+  const exportRef = useRef<CaptureOwner | null>(null);
   const startPendingRef = useRef(false);
   const mountedRef = useRef(true);
   const apiRef = useRef(api);
@@ -126,6 +128,11 @@ export function PacketCapturePage({
       ownerRef.current = null;
       void stopOwner(api, owner);
     }
+    const finished = exportRef.current;
+    if (finished !== null && finished.scope !== scope) {
+      exportRef.current = null;
+      void discardOwner(api, finished);
+    }
     dispatch({ type: "scope-changed", scope });
   }, [api, scope]);
 
@@ -136,6 +143,9 @@ export function PacketCapturePage({
       ownerRef.current = null;
       void stopOwner(api, owner);
     }
+    const finished = exportRef.current;
+    exportRef.current = null;
+    if (finished !== null) void discardOwner(api, finished);
     dispatch({ type: "deactivated", scope });
   }, [api, enabled, scope]);
 
@@ -147,6 +157,9 @@ export function PacketCapturePage({
       const owner = ownerRef.current;
       ownerRef.current = null;
       if (owner !== null) void stopOwner(apiRef.current, owner);
+      const finished = exportRef.current;
+      exportRef.current = null;
+      if (finished !== null) void discardOwner(apiRef.current, finished);
     };
   }, []);
 
@@ -233,6 +246,9 @@ export function PacketCapturePage({
               captureHandle,
               failed: result.status === "failed" || !stopped,
             });
+            // The ended capture's owner keeps its raw file exportable; a scope
+            // change or a discard retires it.
+            if (result.status !== "failed" && stopped) exportRef.current = owner;
           }
           return;
         }
@@ -353,6 +369,7 @@ export function PacketCapturePage({
         throw new Error();
       }
       ownerRef.current = { scope, bindingHandle, captureHandle: result.captureHandle };
+      exportRef.current = null;
       dispatch({
         type: "start-loaded",
         scope,
@@ -379,12 +396,27 @@ export function PacketCapturePage({
     });
     ownerRef.current = null;
     const stopped = await stopOwner(api, owner);
+    if (stopped) exportRef.current = owner;
     dispatch({
       type: "capture-released",
       scope: connectedScope,
       captureHandle: owner.captureHandle,
       failed: !stopped,
     });
+  }
+
+  function exportRaw() {
+    if (evidence === null || visibleState.exportHandle === null) return;
+    void evidence.exportCapture(visibleState.exportHandle);
+  }
+
+  async function discardRaw() {
+    const finished = exportRef.current;
+    const handle = visibleState.exportHandle;
+    if (finished === null || handle === null) return;
+    exportRef.current = null;
+    await discardOwner(api, finished);
+    dispatch({ type: "raw-discarded", scope: finished.scope, captureHandle: handle });
   }
 
   return (
@@ -526,6 +558,31 @@ export function PacketCapturePage({
           </p>
         ) : null}
       </section>
+
+      {visibleState.exportHandle !== null ? (
+        <section className="packet-capture-raw" aria-label="原始抓包文件">
+          <div className="packet-capture-raw-actions">
+            <button
+              type="button"
+              disabled={evidence === null || evidenceRunning || liveBusy}
+              onClick={exportRaw}
+            >
+              导出为 pcap…
+            </button>
+            <button
+              type="button"
+              className="danger"
+              disabled={liveBusy}
+              onClick={() => void discardRaw()}
+            >
+              丢弃原始包
+            </button>
+          </div>
+          <p className="packet-capture-raw-note">
+            抓包的原始数据还在目标的 /tmp（文件名以 lovelyres-pcap- 开头）；断开连接时它会留在那里。导出核对完成、丢弃或开始新的抓包都会删除它。
+          </p>
+        </section>
+      ) : null}
 
       {evidence !== null ? (
         <PacketCaptureEvidencePanel
@@ -669,6 +726,15 @@ async function stopOwner(api: PacketCaptureLiveApi, owner: CaptureOwner): Promis
   try {
     const result = await api.stopPacketCapture(owner.bindingHandle, owner.captureHandle);
     return isPacketCaptureStopped(result);
+  } catch {
+    return false;
+  }
+}
+
+async function discardOwner(api: PacketCaptureLiveApi, owner: CaptureOwner): Promise<boolean> {
+  try {
+    const result = await api.discardPacketCapture(owner.bindingHandle, owner.captureHandle);
+    return isPacketCaptureDiscarded(result);
   } catch {
     return false;
   }

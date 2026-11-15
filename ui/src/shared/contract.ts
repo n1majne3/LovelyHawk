@@ -173,6 +173,7 @@ import type {
   PacketCapturePoll,
   PacketCaptureStarted,
   PacketCaptureStartInput,
+  PacketCaptureDiscarded,
   PacketCaptureStopped,
 } from "./packet-capture-live-contract.js";
 import type {
@@ -868,6 +869,10 @@ export interface LovelyHawkApi {
     bindingHandle: string,
     captureHandle: string,
   ): Promise<PacketCaptureStopped>;
+  discardPacketCapture(
+    bindingHandle: string,
+    captureHandle: string,
+  ): Promise<PacketCaptureDiscarded>;
   probeProcessWatch(bindingHandle: string): Promise<ProcessWatchProbe>;
   startProcessWatch(
     bindingHandle: string,

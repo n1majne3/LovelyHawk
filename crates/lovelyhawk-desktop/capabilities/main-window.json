@@ -25,6 +25,7 @@
     "allow-java-class-stage",
     "allow-file-evidence-begin",
     "allow-packet-capture-evidence-begin",
+    "allow-packet-capture-export-begin",
     "allow-pod-file-evidence-begin",
     "allow-local-scan",
     "allow-local-scan-configure",

@@ -757,6 +757,7 @@ mod tests {
             target_sha256: "ab".repeat(32),
             target_temporary_path: proof.remote_path.clone(),
             target_temporary_removed: true,
+            live_capture: false,
             limitations: crate::packet_capture::PCAP_EVIDENCE_LIMITATIONS.to_owned(),
         };
         let manifest = bundle

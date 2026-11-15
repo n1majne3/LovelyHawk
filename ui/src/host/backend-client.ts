@@ -98,6 +98,7 @@ import {
   type PacketCapturePoll,
   type PacketCaptureStarted,
   type PacketCaptureStartInput,
+  type PacketCaptureDiscarded,
   type PacketCaptureStopped,
   type ProcessWatchAccounting,
   type ProcessWatchCleanup,
@@ -283,6 +284,7 @@ import {
   isPacketCapturePoll,
   isPacketCaptureStarted,
   isPacketCaptureStartInput,
+  isPacketCaptureDiscarded,
   isPacketCaptureStopped,
   isProcessWatchHandle,
   isProcessWatchPoll,
@@ -607,6 +609,7 @@ export const PACKET_CAPTURE_LIVE_RPC_METHODS = Object.freeze({
   start: "packet-capture.start",
   poll: "packet-capture.poll",
   stop: "packet-capture.stop",
+  discard: "packet-capture.discard",
 } as const);
 
 export const PROCESS_WATCH_RPC_METHODS = Object.freeze({
@@ -2468,6 +2471,26 @@ export class BackendClient {
     }, PACKET_CAPTURE_STOP_TIMEOUT_MS);
     if (!isPacketCaptureStopped(value)) {
       throw new Error("The backend returned an invalid packet capture stop result.");
+    }
+    return value;
+  }
+
+  async discardPacketCapture(
+    bindingHandle: string,
+    captureHandle: string,
+  ): Promise<PacketCaptureDiscarded> {
+    if (
+      !isPacketCaptureOpaqueHandle(bindingHandle) ||
+      !isPacketCaptureOpaqueHandle(captureHandle)
+    ) {
+      throw new Error("The packet capture discard request is invalid.");
+    }
+    const value = await this.#request(PACKET_CAPTURE_LIVE_RPC_METHODS.discard, {
+      bindingHandle,
+      captureHandle,
+    }, PACKET_CAPTURE_STOP_TIMEOUT_MS);
+    if (!isPacketCaptureDiscarded(value)) {
+      throw new Error("The backend returned an invalid packet capture discard result.");
     }
     return value;
   }

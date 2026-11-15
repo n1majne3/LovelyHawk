@@ -5,7 +5,9 @@
 //! dialog result and never a page input, and the page names the interface only
 //! by the handle the live capture surface gave it.
 use crate::{
-    packet_capture_live_api::{PacketCaptureLiveApi, PacketCaptureStartInput},
+    packet_capture_live_api::{
+        PacketCaptureLiveApi, PacketCaptureLiveApiError, PacketCaptureStartInput,
+    },
     ssh_api::SshApi,
 };
 use lovelyhawk_core::{
@@ -16,12 +18,14 @@ use lovelyhawk_core::{
     },
     investigation::{AddEvidence, EvidenceKind, MAX_EVIDENCE, MAX_TIMELINE},
     packet_capture::{
-        PCAP_EVIDENCE_LIMITATIONS, PacketCaptureService, PcapEvidenceContext, PcapEvidenceFailure,
+        PCAP_EVIDENCE_LIMITATIONS, PCAP_LIVE_EXPORT_LIMITATIONS, PacketCaptureService,
+        PcapCapturePlan, PcapEvidenceContext, PcapEvidenceFailure, RemotePcapMetadata,
     },
     path_guard::PathGuard,
     sftp::RemotePath,
     ssh::BoundSshSession,
 };
+use chrono::Utc;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -44,6 +48,9 @@ const CANCELLED: &str = "已取消。正在停止目标上的这次 tcpdump 并�
 const TCPDUMP_REFUSED: &str =
     "tcpdump 没有完成这次抓包，目标上没有留下文件。下面是 tcpdump 自己的说法。";
 const EMPTY: &str = "tcpdump 结束了，但没有写出抓包文件，目标上没有留下任何东西。";
+const EXPORT_MISSING: &str =
+    "目标上的临时抓包文件已不存在或已被清除，无法导出。重新开始抓包，或在断开连接后登到目标检查 /tmp 下以 lovelyres-pcap- 开头的文件。";
+const EXPORT_EMPTY: &str = "目标上的临时抓包文件是空的，没有可导出的内容，已保持原样未删除。";
 const FAILED: &str = "抓包没有完成，目标上没有留下可用的文件。请检查连接后再试。";
 const INTERRUPTED: &str =
     "抓包没有完成：连接中断、目标已切换或命令超时。目标上的临时文件已尝试删除。";
@@ -76,6 +83,13 @@ pub(crate) enum PacketCaptureEvidenceRequest {
         binding_handle: String,
         job_handle: String,
     },
+    /// Collect the managed file a finished live capture already wrote — no
+    /// second capture, same collection path as Begin.
+    Export {
+        binding_handle: String,
+        capture_handle: String,
+        selected_directory: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -103,6 +117,17 @@ pub(crate) struct PacketCaptureEvidenceDto {
     temporary_file: &'static str,
 }
 
+/// Everything one evidence job needs, whether the file is captured now or a
+/// finished live capture already wrote it.
+struct JobOpening {
+    binding_handle: String,
+    binding: BoundSshSession,
+    plan: Option<PcapCapturePlan>,
+    existing: Option<crate::packet_capture_live_api::ExportableCapture>,
+    export_capture: Option<String>,
+    directory: PathBuf,
+}
+
 struct Job {
     binding_handle: String,
     session: BoundSshSession,
@@ -112,6 +137,9 @@ struct Job {
     /// The local capture.pcap after a verified save; lets offline analysis
     /// re-read the evidence without exposing the path to the page.
     saved_pcap: Option<PathBuf>,
+    /// The finished live capture this job exports, when it is one; consumed
+    /// once the job reaches a terminal state.
+    export_capture: Option<String>,
     abort: Option<tokio::task::AbortHandle>,
     created: Instant,
 }
@@ -160,6 +188,8 @@ impl std::fmt::Debug for PacketCaptureEvidenceApi {
 pub(crate) enum PacketCaptureEvidenceError {
     Invalid,
     Stale,
+    /// The live capture whose file was asked for is still running.
+    NotFinished,
     Busy,
     Capacity,
     CaseCapacity,
@@ -223,11 +253,19 @@ impl PacketCaptureEvidenceApi {
             PacketCaptureEvidenceRequest::Poll {
                 binding_handle,
                 job_handle,
-            } => self.poll(&binding_handle, &job_handle, false),
+            } => self.poll(live, &binding_handle, &job_handle, false),
             PacketCaptureEvidenceRequest::Cancel {
                 binding_handle,
                 job_handle,
-            } => self.poll(&binding_handle, &job_handle, true),
+            } => self.poll(live, &binding_handle, &job_handle, true),
+            PacketCaptureEvidenceRequest::Export {
+                binding_handle,
+                capture_handle,
+                selected_directory,
+            } => {
+                self.export(live, &binding_handle, &capture_handle, selected_directory)
+                    .await
+            }
         }
     }
 
@@ -241,6 +279,7 @@ impl PacketCaptureEvidenceApi {
 
     fn poll(
         &self,
+        live: &PacketCaptureLiveApi,
         binding: &str,
         handle: &str,
         cancel: bool,
@@ -283,7 +322,18 @@ impl PacketCaptureEvidenceApi {
                 }
             });
         }
-        Ok(job.snapshot())
+        let finished_export = if !job.running() {
+            job.export_capture.take()
+        } else {
+            None
+        };
+        let snapshot = job.snapshot();
+        // The export's finished-capture record is spent once the job is
+        // decided, whatever the outcome.
+        if let Some(capture) = finished_export {
+            live.consume_export(&capture);
+        }
+        Ok(snapshot)
     }
 
     async fn begin(
@@ -309,6 +359,76 @@ impl PacketCaptureEvidenceApi {
             .map_err(|_| PacketCaptureEvidenceError::Invalid)?;
         let plan =
             PacketCaptureService::plan(request).map_err(|_| PacketCaptureEvidenceError::Invalid)?;
+        self.open_job(JobOpening {
+            binding_handle: binding_handle.to_owned(),
+            binding,
+            plan: Some(plan),
+            existing: None,
+            export_capture: None,
+            directory,
+        })
+        .await
+    }
+
+    /// Export the raw file a finished live capture already wrote on the
+    /// target: same host folder dialog result and the same collect path as a
+    /// capture started only to be kept — it does not capture a second time.
+    async fn export(
+        &self,
+        live: &PacketCaptureLiveApi,
+        binding_handle: &str,
+        capture_handle: &str,
+        directory: PathBuf,
+    ) -> Result<PacketCaptureEvidenceDto, PacketCaptureEvidenceError> {
+        if !valid_handle(binding_handle)
+            || !valid_handle(capture_handle)
+            || !directory.is_absolute()
+            || directory.as_os_str().len() > 32768
+        {
+            return Err(PacketCaptureEvidenceError::Invalid);
+        }
+        let export = live
+            .resolve_export(binding_handle, capture_handle)
+            .map_err(|error| match error {
+                PacketCaptureLiveApiError::StillRunning => {
+                    PacketCaptureEvidenceError::NotFinished
+                }
+                _ => PacketCaptureEvidenceError::Stale,
+            })?;
+        self.open_job(JobOpening {
+            binding_handle: binding_handle.to_owned(),
+            binding: export.binding.clone(),
+            plan: None,
+            existing: Some(export),
+            export_capture: Some(capture_handle.to_owned()),
+            directory,
+        })
+        .await
+    }
+
+    async fn open_job(
+        &self,
+        opening: JobOpening,
+    ) -> Result<PacketCaptureEvidenceDto, PacketCaptureEvidenceError> {
+        let JobOpening {
+            binding_handle,
+            binding,
+            plan,
+            existing,
+            export_capture,
+            directory,
+        } = opening;
+        let live_capture = existing.is_some();
+        let request = plan
+            .as_ref()
+            .map(|plan| plan.request.clone())
+            .or_else(|| existing.as_ref().map(|export| export.request.clone()))
+            .ok_or(PacketCaptureEvidenceError::Invalid)?;
+        let remote_path = plan
+            .as_ref()
+            .map(|plan| plan.remote_path.clone())
+            .or_else(|| existing.as_ref().map(|export| export.remote_path.clone()))
+            .ok_or(PacketCaptureEvidenceError::Invalid)?;
         let sftp_session = self
             .services
             .sftp()
@@ -337,7 +457,7 @@ impl PacketCaptureEvidenceApi {
         if target_label.len() > 1024 {
             return Err(PacketCaptureEvidenceError::Unavailable);
         }
-        if !self.binding_current(binding_handle, &binding) {
+        if !self.binding_current(&binding_handle, &binding) {
             return Err(PacketCaptureEvidenceError::Stale);
         }
         let mut jobs = self.jobs.lock();
@@ -389,25 +509,25 @@ impl PacketCaptureEvidenceApi {
         let destination = bundle
             .take_destination()
             .map_err(|_| PacketCaptureEvidenceError::Unavailable)?;
-        let remote = RemotePath::new(plan.remote_path.clone())
+        let remote = RemotePath::new(remote_path.clone())
             .map_err(|_| PacketCaptureEvidenceError::Unavailable)?;
         let id = uuid::Uuid::new_v4().to_string();
         let progress = FileEvidenceProgress::default();
         let dto = PacketCaptureEvidenceDto {
             job_handle: id.clone(),
-            interface,
-            duration_seconds: plan.request.duration_seconds,
-            packet_limit: plan.request.packet_limit,
-            filtered: plan.request.filter.is_some(),
+            interface: request.interface.clone(),
+            duration_seconds: request.duration_seconds,
+            packet_limit: request.packet_limit,
+            filtered: request.filter.is_some(),
             target_label,
             folder_name: bundle.folder_name().to_owned(),
             case_title: incident.title.clone(),
-            state: "capturing",
+            state: if live_capture { "collecting" } else { "capturing" },
             copied_bytes: 0,
             verified_bytes: 0,
             total_bytes: 0,
             sha256: None,
-            detail: CAPTURING,
+            detail: if live_capture { COLLECTING } else { CAPTURING },
             tcpdump_line: None,
             temporary_file: "pending",
         };
@@ -416,10 +536,11 @@ impl PacketCaptureEvidenceApi {
             Job {
                 binding_handle: binding_handle.to_owned(),
                 session: binding.clone(),
-                remote_path: plan.remote_path.clone(),
+                remote_path: remote_path.clone(),
                 progress: progress.clone(),
                 dto: dto.clone(),
                 saved_pcap: Some(saved_pcap.clone()),
+                export_capture,
                 abort: None,
                 created: Instant::now(),
             },
@@ -429,19 +550,46 @@ impl PacketCaptureEvidenceApi {
         let incident_id = incident.id.clone();
         let task = tokio::spawn(async move {
             let _collection_reservation = reservation;
-            let capture_started_at = chrono::Utc::now();
-            let metadata = match api
-                .services
-                .packet_capture()
-                .capture_planned(&binding, &plan)
-                .await
-            {
+            // The file arrives two ways: a capture run only to be kept writes
+            // it now, or a finished live capture already wrote it. Either way
+            // it is one managed remote file with a target-side digest, and
+            // everything below is the same collect path.
+            let (produced, capture_started_at, capture_finished_at) = match plan {
+                Some(plan) => {
+                    let started_at = Utc::now();
+                    let produced = api
+                        .services
+                        .packet_capture()
+                        .capture_planned(&binding, &plan)
+                        .await;
+                    (produced, started_at, Utc::now())
+                }
+                None => (
+                    api.services
+                        .packet_capture()
+                        .read_remote_metadata(&binding, &remote_path)
+                        .await,
+                    existing
+                        .as_ref()
+                        .map(|export| export.started_at)
+                        .unwrap_or_else(Utc::now),
+                    existing
+                        .as_ref()
+                        .map(|export| export.finished_at)
+                        .unwrap_or_else(Utc::now),
+                ),
+            };
+            let metadata: RemotePcapMetadata = match produced {
                 Ok(Ok(metadata)) => metadata,
                 Ok(Err(failure)) => {
                     let (detail, line) = match failure {
                         PcapEvidenceFailure::Preflight(reason) => (reason, None),
                         PcapEvidenceFailure::Tcpdump(line) => (TCPDUMP_REFUSED, Some(line)),
-                        PcapEvidenceFailure::Empty => (EMPTY, None),
+                        PcapEvidenceFailure::Empty => (
+                            if live_capture { EXPORT_EMPTY } else { EMPTY },
+                            None,
+                        ),
+                        PcapEvidenceFailure::Missing => (EXPORT_MISSING, None),
                         PcapEvidenceFailure::Failed => (FAILED, None),
                     };
                     api.fail(&job_id, detail, line, "none");
@@ -452,13 +600,13 @@ impl PacketCaptureEvidenceApi {
                     return;
                 }
             };
-            let capture_finished_at = chrono::Utc::now();
             let too_large = metadata.size_bytes > MAX_FILE_EVIDENCE_BYTES;
+            let prior_state = if live_capture { "collecting" } else { "capturing" };
             {
                 let mut jobs = api.jobs.lock();
                 let Some(job) = jobs
                     .get_mut(&job_id)
-                    .filter(|job| job.dto.state == "capturing")
+                    .filter(|job| job.dto.state == prior_state)
                 else {
                     return;
                 };
@@ -474,7 +622,7 @@ impl PacketCaptureEvidenceApi {
                 let removed = api
                     .services
                     .packet_capture()
-                    .cleanup_remote(&binding, &plan.remote_path)
+                    .cleanup_remote(&binding, &remote_path)
                     .await
                     .is_ok();
                 api.fail(
@@ -498,7 +646,7 @@ impl PacketCaptureEvidenceApi {
             let removed = api
                 .services
                 .packet_capture()
-                .cleanup_remote(&binding, &plan.remote_path)
+                .cleanup_remote(&binding, &remote_path)
                 .await
                 .is_ok();
             // No await after this point: once a cancel has been answered a late
@@ -527,17 +675,23 @@ impl PacketCaptureEvidenceApi {
             let sha256 = proof.sha256.clone();
             let context = PcapEvidenceContext {
                 tool: "tcpdump".to_owned(),
-                interface: plan.request.interface.clone(),
-                filter: plan.request.filter.clone(),
-                packet_limit: plan.request.packet_limit,
-                duration_seconds: plan.request.duration_seconds,
+                interface: request.interface.clone(),
+                filter: request.filter.clone(),
+                packet_limit: request.packet_limit,
+                duration_seconds: request.duration_seconds,
                 capture_started_at,
                 capture_finished_at,
                 target_bytes: metadata.size_bytes,
                 target_sha256: metadata.sha256.clone(),
-                target_temporary_path: plan.remote_path.clone(),
+                target_temporary_path: remote_path.clone(),
                 target_temporary_removed: removed,
-                limitations: PCAP_EVIDENCE_LIMITATIONS.to_owned(),
+                live_capture,
+                limitations: if live_capture {
+                    PCAP_LIVE_EXPORT_LIMITATIONS
+                } else {
+                    PCAP_EVIDENCE_LIMITATIONS
+                }
+                .to_owned(),
             };
             let preview = format!(
                 "来源主机：{}\n接口：{}\n过滤条件：{}\n时长上限：{} 秒；包数上限：{}\n抓包开始（UTC）：{}\n抓包结束（UTC）：{}\n字节：{}\n方法：tcpdump 写入目标临时文件，目标上的 SHA-256 与两次 SFTP 读取及本地回读一致；临时文件{}。完整参数与限制见同目录 manifest.json。",
@@ -567,8 +721,18 @@ impl PacketCaptureEvidenceApi {
                 &incident_id,
                 AddEvidence {
                     kind: EvidenceKind::Pcap,
-                    label: "抓包留证".to_owned(),
-                    source: "packet-capture-evidence".to_owned(),
+                    label: if live_capture {
+                        "实时抓包导出留证"
+                    } else {
+                        "抓包留证"
+                    }
+                    .to_owned(),
+                    source: if live_capture {
+                        "packet-capture-live-export"
+                    } else {
+                        "packet-capture-evidence"
+                    }
+                    .to_owned(),
                     preview,
                     locator: Some(bundle.sample_locator()),
                     external_sha256: Some(sha256),

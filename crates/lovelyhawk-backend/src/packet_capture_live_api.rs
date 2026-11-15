@@ -2,8 +2,9 @@
 //!
 //! Core owns every remote command and the `tcpdump` lifecycle. The renderer can select only an
 //! opaque interface capability, bounded capture parameters, and an opaque live-capture handle.
-//! PCAP artifacts, paths, downloads, exports, evidence persistence, and generic execution are
-//! deliberately absent from this phase-one surface.
+//! A finished capture keeps its managed raw file on the target so it can be exported as
+//! evidence through the packet-capture evidence job; remote paths stay inside the backend and
+//! never reach a DTO.
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -24,6 +25,7 @@ use lovelyhawk_core::{
     ssh::BoundSshSession,
     target::TargetGuard,
 };
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -57,6 +59,7 @@ const START_TIMEOUT: Duration = Duration::from_secs(30);
 const START_RESERVATION_TTL: Duration = Duration::from_secs(35);
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 const CAPTURE_RETENTION_GRACE: Duration = Duration::from_secs(90);
+const FINISHED_CAPTURE_TTL: Duration = Duration::from_secs(30 * 60);
 const CLOSED_BINDING_TTL: Duration = Duration::from_secs(5 * 60);
 const MAX_CLOSED_BINDINGS: usize = 128;
 const REDACTED_PACKET_CAPTURE_TEXT: &str = "[SENSITIVE PACKET CAPTURE TEXT REDACTED]";
@@ -66,6 +69,7 @@ pub(crate) struct PacketCaptureLiveApi {
     ssh_api: Arc<SshApi>,
     interfaces: Mutex<InterfaceRegistry>,
     captures: Mutex<CaptureRegistry>,
+    finished: Mutex<HashMap<String, FinishedCapture>>,
     operations: Arc<Mutex<OperationState>>,
 }
 
@@ -96,6 +100,7 @@ impl PacketCaptureLiveApi {
             ssh_api,
             interfaces: Mutex::new(InterfaceRegistry::default()),
             captures: Mutex::new(CaptureRegistry::default()),
+            finished: Mutex::new(HashMap::new()),
             operations: Arc::new(Mutex::new(OperationState::default())),
         }
     }
@@ -164,10 +169,26 @@ impl PacketCaptureLiveApi {
         let (capture_handle, evicted) = self
             .lock_captures()?
             .reserve(scope.clone(), Instant::now())?;
-        close_live_captures(evicted).await;
+        close_live_captures(evicted.clone()).await;
+        // Starting the next capture retires what the last one left on the
+        // target: its raw file and its export record are gone together.
+        self.cleanup_remote_files(
+            evicted
+                .iter()
+                .map(|active| (active.binding.clone(), active.live.remote_pcap_path().to_owned()))
+                .chain(
+                    self.take_finished_for_binding(binding_handle)
+                        .into_iter()
+                        .map(|finished| (finished.binding, finished.remote_path)),
+                )
+                .collect(),
+        )
+        .await;
         let started = tokio::time::timeout(
             START_TIMEOUT,
-            self.services.packet_capture().start_live(&binding, request),
+            self.services
+                .packet_capture()
+                .start_live(&binding, request.clone()),
         )
         .await;
         let live = match started {
@@ -196,6 +217,8 @@ impl PacketCaptureLiveApi {
             binding,
             scope: scope.clone(),
             live,
+            request,
+            started_at: Utc::now(),
             expires_at: Instant::now() + expires_in,
             state: Mutex::new(LiveCaptureState::default()),
         });
@@ -242,14 +265,16 @@ impl PacketCaptureLiveApi {
         }
         let polled = {
             let mut state = active.lock_state()?;
-            state.poll(
+            let polled = state.poll(
                 &active.live,
                 capture_handle,
                 after_sequence,
                 &active.scope.sensitive_literals(),
-            )
+            );
+            (polled, state.status)
         };
-        let (response, terminal_finished) = match polled {
+        let (polled_result, status) = polled;
+        let (response, terminal_finished) = match polled_result {
             Ok(response) => response,
             Err(error) => {
                 self.invalidate(capture_handle, &active).await;
@@ -264,7 +289,18 @@ impl PacketCaptureLiveApi {
             return Err(error);
         }
         if terminal_finished {
-            close_live_capture(&active.live).await;
+            if status == CaptureStatus::Stopped {
+                let evicted = self.retain_finished(capture_handle, &active);
+                close_live_capture(&active.live).await;
+                self.cleanup_remote_files(evicted).await;
+            } else {
+                close_live_capture(&active.live).await;
+                self.cleanup_remote_files(vec![(
+                    active.binding.clone(),
+                    active.live.remote_pcap_path().to_owned(),
+                )])
+                .await;
+            }
         }
         Ok(response)
     }
@@ -294,8 +330,18 @@ impl PacketCaptureLiveApi {
             self.invalidate(capture_handle, &active).await;
             return Err(PacketCaptureLiveApiError::BindingUnavailable);
         }
+        let status = active.lock_state()?.status;
         self.remove_active(capture_handle, &active)?;
+        let retired = if status == CaptureStatus::Failed {
+            vec![(
+                active.binding.clone(),
+                active.live.remote_pcap_path().to_owned(),
+            )]
+        } else {
+            self.retain_finished(capture_handle, &active)
+        };
         close_live_capture(&active.live).await;
+        self.cleanup_remote_files(retired).await;
         self.ensure_binding(&scope, &binding)?;
         Ok(PacketCaptureStoppedDto { stopped: true })
     }
@@ -306,13 +352,183 @@ impl PacketCaptureLiveApi {
             .lock()
             .map(|mut captures| captures.close_binding(binding_handle, Instant::now()))
             .unwrap_or_default();
+        let finished = self
+            .finished
+            .lock()
+            .map(|mut records| {
+                let handles = records
+                    .iter()
+                    .filter(|(_, record)| record.binding_handle == binding_handle)
+                    .map(|(handle, _)| handle.clone())
+                    .collect::<Vec<_>>();
+                handles
+                    .into_iter()
+                    .filter_map(|handle| records.remove(&handle))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         if let Ok(mut interfaces) = self.interfaces.lock() {
             interfaces.remove_binding(binding_handle);
         }
         if let Ok(mut operations) = self.operations.lock() {
             operations.close_binding(binding_handle);
         }
-        close_live_captures(active).await;
+        close_live_captures(active.clone()).await;
+        // A binding closed while still connected takes its managed files with
+        // it; a lost connection never reaches here, and its file stays in /tmp.
+        self.cleanup_remote_files(
+            active
+                .iter()
+                .map(|active| (active.binding.clone(), active.live.remote_pcap_path().to_owned()))
+                .chain(
+                    finished
+                        .into_iter()
+                        .map(|record| (record.binding, record.remote_path)),
+                )
+                .collect(),
+        )
+        .await;
+    }
+
+    /// Keep a finished capture's raw file exportable: the record holds what a
+    /// later export needs — session, request, times — and the path stays here.
+    /// Only the newest finished capture of a binding is kept; older ones are
+    /// handed back so their files can be removed.
+    fn retain_finished(
+        &self,
+        capture_handle: &str,
+        active: &ActiveCapture,
+    ) -> Vec<(BoundSshSession, String)> {
+        let record = FinishedCapture {
+            binding_handle: active.binding_handle.clone(),
+            scope: active.scope.clone(),
+            binding: active.binding.clone(),
+            remote_path: active.live.remote_pcap_path().to_owned(),
+            request: active.request.clone(),
+            started_at: active.started_at,
+            finished_at: Utc::now(),
+            expires_at: Instant::now() + FINISHED_CAPTURE_TTL,
+        };
+        let mut retired = Vec::new();
+        if let Ok(mut records) = self.finished.lock() {
+            let evicted = records
+                .iter()
+                .filter(|(_, old)| old.binding_handle == record.binding_handle)
+                .map(|(handle, _)| handle.clone())
+                .collect::<Vec<_>>();
+            for handle in evicted {
+                if let Some(old) = records.remove(&handle) {
+                    retired.push((old.binding, old.remote_path));
+                }
+            }
+            records.insert(capture_handle.to_owned(), record);
+        }
+        retired
+    }
+
+    fn take_finished_for_binding(&self, binding_handle: &str) -> Vec<FinishedCapture> {
+        self.finished
+            .lock()
+            .map(|mut records| {
+                let handles = records
+                    .iter()
+                    .filter(|(_, record)| record.binding_handle == binding_handle)
+                    .map(|(handle, _)| handle.clone())
+                    .collect::<Vec<_>>();
+                handles
+                    .into_iter()
+                    .filter_map(|handle| records.remove(&handle))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Best-effort removal of managed remote files; failures are silent because
+    /// the file lives in the target's own /tmp either way and the page says so.
+    async fn cleanup_remote_files(&self, files: Vec<(BoundSshSession, String)>) {
+        for (binding, path) in files {
+            let _ = self
+                .services
+                .packet_capture()
+                .cleanup_remote(&binding, &path)
+                .await;
+        }
+    }
+
+    /// The operator threw the raw file away: the export record and the managed
+    /// file on the target go together.
+    pub(crate) async fn discard(
+        &self,
+        binding_handle: &str,
+        capture_handle: &str,
+    ) -> Result<PacketCaptureDiscardedDto, PacketCaptureLiveApiError> {
+        validate_handle(binding_handle)?;
+        validate_handle(capture_handle)?;
+        let (binding, scope) = self.capture_binding(binding_handle)?;
+        let record = self
+            .finished
+            .lock()
+            .ok()
+            .and_then(|mut records| records.remove(capture_handle))
+            .ok_or(PacketCaptureLiveApiError::CaptureUnavailable)?;
+        if record.scope != scope || record.binding != binding {
+            let _ = self
+                .finished
+                .lock()
+                .map(|mut records| records.insert(capture_handle.to_owned(), record));
+            return Err(PacketCaptureLiveApiError::BindingUnavailable);
+        }
+        let _ = self
+            .services
+            .packet_capture()
+            .cleanup_remote(&binding, &record.remote_path)
+            .await;
+        Ok(PacketCaptureDiscardedDto { discarded: true })
+    }
+
+    /// Resolve the raw file of a capture that already ended, for the evidence
+    /// job to collect. A still-running capture is refused, so is one whose
+    /// binding is no longer this one.
+    pub(crate) fn resolve_export(
+        &self,
+        binding_handle: &str,
+        capture_handle: &str,
+    ) -> Result<ExportableCapture, PacketCaptureLiveApiError> {
+        validate_handle(binding_handle)?;
+        validate_handle(capture_handle)?;
+        if let Ok(active) = self.active(capture_handle) {
+            let running = active
+                .lock_state()
+                .is_ok_and(|state| state.status == CaptureStatus::Running);
+            if running {
+                return Err(PacketCaptureLiveApiError::StillRunning);
+            }
+        }
+        let records = self
+            .finished
+            .lock()
+            .map_err(|_| PacketCaptureLiveApiError::RegistryUnavailable)?;
+        let record = records
+            .get(capture_handle)
+            .ok_or(PacketCaptureLiveApiError::CaptureUnavailable)?;
+        let (binding, scope) = self.capture_binding(binding_handle)?;
+        if record.scope != scope || record.binding != binding {
+            return Err(PacketCaptureLiveApiError::BindingUnavailable);
+        }
+        Ok(ExportableCapture {
+            binding: record.binding.clone(),
+            remote_path: record.remote_path.clone(),
+            request: record.request.clone(),
+            started_at: record.started_at,
+            finished_at: record.finished_at,
+        })
+    }
+
+    /// The verified export removed the remote file itself; the record goes.
+    pub(crate) fn consume_export(&self, capture_handle: &str) {
+        if let Ok(mut records) = self.finished.lock() {
+            records.remove(capture_handle);
+        }
     }
 
     fn capture_binding(
@@ -392,7 +608,48 @@ impl PacketCaptureLiveApi {
             .lock()
             .map(|mut captures| captures.take_stale(Instant::now(), current))
             .unwrap_or_default();
-        close_live_captures(stale).await;
+        close_live_captures(stale.clone()).await;
+        let now = Instant::now();
+        let expired = self
+            .finished
+            .lock()
+            .map(|mut records| {
+                let handles = records
+                    .iter()
+                    .filter(|(_, record)| {
+                        record.expires_at <= now
+                            || current.is_some_and(|current| {
+                                record.binding_handle == current.binding_handle
+                                    && &record.scope != current
+                            })
+                    })
+                    .map(|(handle, _)| handle.clone())
+                    .collect::<Vec<_>>();
+                handles
+                    .into_iter()
+                    .filter_map(|handle| records.remove(&handle))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        // A reaped record is a finished capture nobody exported; removing its
+        // file is best effort — a dead session just leaves it in /tmp.
+        self.cleanup_remote_files(
+            stale
+                .iter()
+                .filter(|active| {
+                    active
+                        .lock_state()
+                        .is_ok_and(|state| state.status != CaptureStatus::Running)
+                })
+                .map(|active| (active.binding.clone(), active.live.remote_pcap_path().to_owned()))
+                .chain(
+                    expired
+                        .into_iter()
+                        .map(|record| (record.binding, record.remote_path)),
+                )
+                .collect(),
+        )
+        .await;
     }
 
     fn active(&self, handle: &str) -> Result<Arc<ActiveCapture>, PacketCaptureLiveApiError> {
@@ -524,6 +781,12 @@ pub(crate) struct PacketCaptureStartedDto {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PacketCaptureStoppedDto {
     stopped: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PacketCaptureDiscardedDto {
+    discarded: bool,
 }
 
 #[derive(Serialize)]
@@ -661,8 +924,33 @@ struct ActiveCapture {
     binding: BoundSshSession,
     scope: BindingScope,
     live: Arc<LivePacketCapture>,
+    request: PcapCaptureRequest,
+    started_at: DateTime<Utc>,
     expires_at: Instant,
     state: Mutex<LiveCaptureState>,
+}
+
+/// A capture that ended cleanly, kept so its raw file can be exported. The
+/// remote path lives here and only here; no DTO carries it.
+struct FinishedCapture {
+    binding_handle: String,
+    scope: BindingScope,
+    binding: BoundSshSession,
+    remote_path: String,
+    request: PcapCaptureRequest,
+    started_at: DateTime<Utc>,
+    finished_at: DateTime<Utc>,
+    expires_at: Instant,
+}
+
+/// What the evidence job needs to collect a finished capture's raw file.
+#[derive(Debug)]
+pub(crate) struct ExportableCapture {
+    pub(crate) binding: BoundSshSession,
+    pub(crate) remote_path: String,
+    pub(crate) request: PcapCaptureRequest,
+    pub(crate) started_at: DateTime<Utc>,
+    pub(crate) finished_at: DateTime<Utc>,
 }
 
 impl ActiveCapture {
@@ -1610,6 +1898,7 @@ pub(crate) enum PacketCaptureLiveApiError {
     InvalidCursor,
     InterfaceUnavailable,
     CaptureUnavailable,
+    StillRunning,
     CaptureAlreadyActive,
     RegistryCapacity,
     RegistryUnavailable,
@@ -1629,6 +1918,7 @@ impl fmt::Debug for PacketCaptureLiveApiError {
             Self::InvalidCursor => "InvalidCursor",
             Self::InterfaceUnavailable => "InterfaceUnavailable",
             Self::CaptureUnavailable => "CaptureUnavailable",
+            Self::StillRunning => "StillRunning",
             Self::CaptureAlreadyActive => "CaptureAlreadyActive",
             Self::RegistryCapacity => "RegistryCapacity",
             Self::RegistryUnavailable => "RegistryUnavailable",
@@ -1656,6 +1946,7 @@ impl fmt::Display for PacketCaptureLiveApiError {
             Self::ConcurrencyLimit => "too many packet capture operations are active",
             Self::OutputLimit => "the packet capture output exceeded its safety limit",
             Self::ProtocolViolation => "the packet capture stream is invalid",
+            Self::StillRunning => "the live capture is still running",
             Self::TimedOut => "the packet capture operation timed out",
         })
     }
@@ -1683,6 +1974,50 @@ mod tests {
     use lovelyhawk_core::target::TargetIdentity;
 
     use super::*;
+
+    const BINDING: &str = "123e4567-e89b-42d3-a456-426614174000";
+    const CAPTURE: &str = "123e4567-e89b-42d3-a456-426614174001";
+
+    fn live_api() -> Option<PacketCaptureLiveApi> {
+        let dir = std::env::temp_dir().join(format!("lh-live-api-{}", Uuid::new_v4()));
+        let store = lovelyhawk_core::PortableStore::prepare(dir).ok()?;
+        let services = BackendServices::with_runtime(store, tokio::runtime::Handle::current())
+            .ok()?;
+        let ssh = Arc::new(SshApi::new(services.clone()));
+        Some(PacketCaptureLiveApi::new(services, ssh))
+    }
+
+    /// A capture handle that has no finished record — never exported, already
+    /// discarded, or made up — cannot be resolved for export.
+    #[tokio::test]
+    async fn export_refuses_a_capture_with_no_finished_record() {
+        let api = live_api().expect("live api");
+        let error = api.resolve_export(BINDING, CAPTURE).unwrap_err();
+        assert!(matches!(error, PacketCaptureLiveApiError::CaptureUnavailable));
+        // Handles that are not canonical handles are refused before lookup.
+        let error = api.resolve_export(BINDING, "pcap-not-a-uuid").unwrap_err();
+        assert!(matches!(error, PacketCaptureLiveApiError::InvalidHandle));
+    }
+
+    /// Discarding is bound to the connection it came from: a binding that is
+    /// gone — closed, switched, or never existed — refuses before any record
+    /// or remote file is touched.
+    #[tokio::test]
+    async fn discard_refuses_a_binding_that_is_gone() {
+        let api = live_api().expect("live api");
+        let error = api.discard(BINDING, CAPTURE).await.unwrap_err();
+        assert!(matches!(error, PacketCaptureLiveApiError::BindingUnavailable));
+    }
+
+    /// The finished record is consumed once spent: a second take finds
+    /// nothing, so the file it named cannot be collected twice.
+    #[tokio::test]
+    async fn a_finished_record_is_taken_once() {
+        let api = live_api().expect("live api");
+        assert!(api.take_finished_for_binding(BINDING).is_empty());
+        api.consume_export(CAPTURE);
+        assert!(api.take_finished_for_binding(BINDING).is_empty());
+    }
 
     fn scope(name: &str, generation: u64) -> BindingScope {
         BindingScope {
@@ -2075,7 +2410,7 @@ mod tests {
             .unwrap();
         assert!(start.contains("let request = PcapCaptureRequest"));
         assert!(start.contains("request.validate()?"));
-        assert!(start.contains(".start_live(&binding, request)"));
+        assert!(start.contains(".start_live(&binding, request.clone())"));
         for forbidden in ["shell_escape", "shq(", "CommandRunner", ".execute_bound("] {
             assert!(!start.contains(forbidden));
         }

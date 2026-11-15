@@ -277,6 +277,7 @@ export interface SystemInfoApi {
   confirmSystemInfoRowAction(bindingHandle: string, planHandle: string): Promise<unknown>;
   executeSystemInfoRowAction(bindingHandle: string, planHandle: string): Promise<unknown>;
   cancelSystemInfoRowAction(bindingHandle: string, planHandle: string): Promise<void>;
+  undoSystemInfoRowAction(bindingHandle: string, undoHandle: string): Promise<unknown>;
   planSystemInfoFirewallBlock(bindingHandle: string, address: string, direction: SystemInfoFirewallDirection): Promise<unknown>;
   executeSystemInfoFirewallBlock(bindingHandle: string, planHandle: string): Promise<unknown>;
   planSystemInfoFirewallRestore(bindingHandle: string, restoreHandle: string): Promise<unknown>;

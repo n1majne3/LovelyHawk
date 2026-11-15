@@ -248,6 +248,7 @@ pub fn run() -> ExitCode {
             main_commands::java_class_stage,
             main_commands::file_evidence_begin,
             main_commands::packet_capture_evidence_begin,
+            main_commands::packet_capture_export_begin,
             main_commands::pod_file_evidence_begin,
             main_commands::local_scan,
             main_commands::local_scan_configure,

@@ -331,6 +331,9 @@ describe("system-info row action dialog", () => {
           receipt: null,
           busy: false,
           error: null,
+          undoBusy: false,
+          undoResult: null,
+          undoError: null,
         }}
         onConfirm={() => undefined}
         onSubmitPassword={() => undefined}
@@ -357,6 +360,9 @@ describe("system-info row action dialog", () => {
       inspection: null,
       busy: false,
       error: null,
+          undoBusy: false,
+          undoResult: null,
+          undoError: null,
     };
     const planning = renderToStaticMarkup(
       <SystemInfoRowActionDialog
@@ -423,6 +429,9 @@ describe("system-info row action dialog", () => {
       inspection: null,
       busy: false,
       error: null,
+          undoBusy: false,
+          undoResult: null,
+          undoError: null,
     };
     // Text planted inside the remote detail can never switch the panel on.
     const hostile = renderToStaticMarkup(

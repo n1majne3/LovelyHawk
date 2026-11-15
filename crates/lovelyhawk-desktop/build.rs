@@ -13,6 +13,7 @@ const COMMANDS: &[&str] = &[
     "java_class_stage",
     "file_evidence_begin",
     "packet_capture_evidence_begin",
+    "packet_capture_export_begin",
     "pod_file_evidence_begin",
     "kubernetes_manifest_export",
     "application_log_export",

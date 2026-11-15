@@ -24,6 +24,7 @@ const api: PacketCaptureLiveApi = {
   startPacketCapture: vi.fn(async () => ({})),
   pollPacketCapture: vi.fn(async () => ({})),
   stopPacketCapture: vi.fn(async () => ({})),
+  discardPacketCapture: vi.fn(async () => ({})),
 };
 
 function packet(sequence = 2): PacketCapturePacketEvent {
@@ -85,6 +86,42 @@ describe("standalone packet capture live page", () => {
     }
     // Something thrown that is not an Error still reads as a sentence.
     expect(startFailureMessage(undefined).length).toBeGreaterThan(8);
+  });
+
+  it("offers export and discard for a cleanly ended capture", () => {
+    const html = renderToStaticMarkup(
+      <PacketCapturePage
+        bindingHandle={bindingHandle}
+        api={api}
+        initialState={readyState({
+          captureStatus: "stopped",
+          captureHandle: null,
+          exportHandle: captureHandle,
+        })}
+      />,
+    );
+    expect(html).toContain("导出为 pcap…");
+    expect(html).toContain("丢弃原始包");
+    expect(html).toContain("lovelyres-pcap-");
+    expect(html).not.toContain(captureHandle);
+  });
+
+  it("offers neither button while a capture runs nor after a failed one", () => {
+    for (const overrides of [
+      { captureStatus: "running" as const, captureHandle, exportHandle: null },
+      { captureStatus: "failed" as const, captureHandle: null, exportHandle: null },
+      { captureStatus: "stopped" as const, captureHandle: null, exportHandle: null },
+    ]) {
+      const html = renderToStaticMarkup(
+        <PacketCapturePage
+          bindingHandle={bindingHandle}
+          api={api}
+          initialState={readyState(overrides)}
+        />,
+      );
+      expect(html).not.toContain("导出为 pcap…");
+      expect(html).not.toContain("丢弃原始包");
+    }
   });
 
   it("renders hostile packet fields literally without exposing opaque capabilities", () => {
@@ -197,6 +234,7 @@ describe("standalone packet capture live page", () => {
   it("keeps the API fixed and contains no phase-two or generic execution surface", () => {
     const source = readFileSync(new URL("./PacketCapturePage.tsx", import.meta.url), "utf8");
     expect([...source.matchAll(/\bapi\.(\w+)/gu)].map((match) => match[1]).sort()).toEqual([
+      "discardPacketCapture",
       "listPacketCaptureInterfaces",
       "pollPacketCapture",
       "startPacketCapture",

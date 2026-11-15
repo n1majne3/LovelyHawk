@@ -18,6 +18,7 @@ const api: SystemInfoApi = {
   getSystemInfoDetail: vi.fn(async () => ({})),
   listSystemInfoRowActions: vi.fn(async () => ({})),
   inspectSystemInfoRow: vi.fn(async () => ({})),
+  undoSystemInfoRowAction: vi.fn(async () => ({})),
   planSystemInfoRowAction: vi.fn(async () => ({})),
   confirmSystemInfoRowAction: vi.fn(async () => ({})),
   executeSystemInfoRowAction: vi.fn(async () => ({})),

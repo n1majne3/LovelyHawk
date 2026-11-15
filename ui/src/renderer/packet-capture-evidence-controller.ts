@@ -22,9 +22,13 @@ function running(result: PacketCaptureEvidenceResult): boolean {
  * It owns its job: leaving the page or the connection disposes it, and a job
  * still running is cancelled so nothing goes on capturing that no page shows.
  */
+export type PacketCaptureEvidenceBegin =
+  | { interfaceHandle: string; input: PacketCaptureStartInput }
+  | { exportCaptureHandle: string };
+
 export class PacketCaptureEvidenceController extends EvidenceJobController<
   PacketCaptureEvidenceResult,
-  { interfaceHandle: string; input: PacketCaptureStartInput }
+  PacketCaptureEvidenceBegin
 > {
   constructor(api: PacketCaptureEvidenceApi, binding: string, now: () => number = Date.now) {
     const request = async (request: PacketCaptureEvidenceRequest): Promise<PacketCaptureEvidenceResult | null> => {
@@ -35,8 +39,10 @@ export class PacketCaptureEvidenceController extends EvidenceJobController<
       return result;
     };
     super({
-      begin: (bindingHandle, { interfaceHandle, input }) =>
-        request({ action: "begin", bindingHandle, interfaceHandle, input }),
+      begin: (bindingHandle, fields) =>
+        "exportCaptureHandle" in fields
+          ? request({ action: "export", bindingHandle, captureHandle: fields.exportCaptureHandle })
+          : request({ action: "begin", bindingHandle, interfaceHandle: fields.interfaceHandle, input: fields.input }),
       poll: (bindingHandle, jobHandle) => request({ action: "poll", bindingHandle, jobHandle }),
       cancel: (bindingHandle, jobHandle) => request({ action: "cancel", bindingHandle, jobHandle }),
       running,
@@ -50,4 +56,8 @@ export class PacketCaptureEvidenceController extends EvidenceJobController<
 
   begin = (interfaceHandle: string, input: PacketCaptureStartInput): Promise<void> =>
     this.start({ interfaceHandle, input }, input.durationSeconds * 1_000 + COLLECTION_MS);
+
+  /** Collect the raw file a finished live capture already wrote — no second capture. */
+  exportCapture = (captureHandle: string): Promise<void> =>
+    this.start({ exportCaptureHandle: captureHandle }, COLLECTION_MS);
 }

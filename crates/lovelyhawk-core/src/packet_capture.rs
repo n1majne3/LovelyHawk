@@ -127,6 +127,7 @@ pub struct LivePacketCapture {
     target: TargetGuard,
     terminal: Arc<SshTerminalSession>,
     events: PacketCaptureEventReceiver,
+    remote_path: String,
 }
 
 impl LivePacketCapture {
@@ -140,6 +141,12 @@ impl LivePacketCapture {
 
     pub fn events(&self) -> &PacketCaptureEventReceiver {
         &self.events
+    }
+
+    /// The managed file the raw stream landed in, kept inside the crate's
+    /// boundary: it never reaches a page.
+    pub fn remote_pcap_path(&self) -> &str {
+        &self.remote_path
     }
 
     pub async fn recv(&self) -> CoreResult<PacketCaptureEvent> {
@@ -293,7 +300,8 @@ impl PacketCaptureService {
                 "refuses to remove an unmanaged path",
             ));
         }
-        Ok(format!("rm -f -- {}", shq(remote_path)))
+        let fifo = remote_fifo_path(remote_path).unwrap_or_else(|| remote_path.to_owned());
+        Ok(format!("rm -f -- {} {}", shq(remote_path), shq(&fifo)))
     }
 
     /// Stop a capture still writing its managed file, then remove the file.
@@ -369,7 +377,11 @@ test ! -e {remote}"
         request.validate()?;
         self.target.validate(session.target())?;
         let capture_id = format!("pcap-{}", uuid::Uuid::new_v4().simple());
-        let command = generate_live_capture_command(&request)?;
+        let remote_path = new_remote_pcap_path();
+        let fifo_path = remote_fifo_path(&remote_path).ok_or_else(|| {
+            CoreError::validation("remote FIFO path", "could not derive the sibling path")
+        })?;
+        let command = generate_live_capture_command(&request, &remote_path, &fifo_path)?;
         let terminal = Arc::new(
             self.ssh
                 .open_packet_capture_bound(
@@ -405,6 +417,7 @@ test ! -e {remote}"
             target: session.target().clone(),
             terminal,
             events,
+            remote_path,
         })
     }
 
@@ -468,6 +481,39 @@ test ! -e {remote}"
         }
     }
 
+    /// Read the size and SHA-256 of a managed remote pcap that already
+    /// exists — a finished live capture's file — without capturing again.
+    pub async fn read_remote_metadata(
+        &self,
+        session: &BoundSshSession,
+        remote_path: &str,
+    ) -> CoreResult<Result<RemotePcapMetadata, PcapEvidenceFailure>> {
+        let command = generate_live_metadata_command(remote_path)?;
+        self.target.validate(session.target())?;
+        let output = self
+            .ssh
+            .execute_bound(session, command, Duration::from_secs(30))
+            .await?;
+        self.target.validate(session.target())?;
+        if output.output.len() > 64 * 1024 {
+            return Err(CoreError::validation(
+                "PCAP metadata",
+                "remote output exceeds 65536 bytes",
+            ));
+        }
+        if output.timed_out || output.exit_code.is_some_and(|code| code != 0) {
+            return Ok(Err(if output.timed_out {
+                PcapEvidenceFailure::Failed
+            } else {
+                parse_pcap_evidence_failure(&output.output)
+            }));
+        }
+        match parse_pcap_evidence_output(&output.output) {
+            Ok(metadata) => Ok(Ok(metadata)),
+            Err(_) => Ok(Err(PcapEvidenceFailure::Failed)),
+        }
+    }
+
     pub async fn capture_evidence_remote(
         &self,
         session: &BoundSshSession,
@@ -483,6 +529,7 @@ test ! -e {remote}"
                     PcapEvidenceFailure::Preflight(_) => "preflight",
                     PcapEvidenceFailure::Tcpdump(_) => "tcpdump error",
                     PcapEvidenceFailure::Empty => "empty",
+                    PcapEvidenceFailure::Missing => "missing",
                     PcapEvidenceFailure::Failed => "failed",
                 };
                 CoreError::validation(
@@ -948,6 +995,7 @@ fn is_tcpdump_info(line: &str) -> bool {
         // and the RHEL family's build reports giving up root the same way.
         || lower.starts_with("listening on ")
         || lower.starts_with("dropped privs to ")
+        || lower.starts_with("reading from file ")
         || lower.contains("packets captured")
         || lower.contains("packets received by filter")
         || lower.contains("packets dropped by kernel")
@@ -1001,6 +1049,21 @@ pub fn new_remote_pcap_path() -> String {
 pub fn is_managed_remote_pcap_path(path: &str) -> bool {
     path.strip_prefix(PCAP_REMOTE_PREFIX)
         .and_then(|value| value.strip_suffix(".pcap"))
+        .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+}
+
+/// The byte stream the live writer feeds: the managed pcap's sibling with the
+/// same UUID and the `.fifo` extension.
+pub fn remote_fifo_path(pcap_path: &str) -> Option<String> {
+    pcap_path
+        .strip_suffix(".pcap")
+        .map(|stem| format!("{stem}.fifo"))
+        .filter(|fifo| is_managed_remote_fifo_path(fifo))
+}
+
+pub fn is_managed_remote_fifo_path(path: &str) -> bool {
+    path.strip_prefix(PCAP_REMOTE_PREFIX)
+        .and_then(|value| value.strip_suffix(".fifo"))
         .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
 }
 
@@ -1105,6 +1168,8 @@ pub enum PcapEvidenceFailure {
     Preflight(&'static str),
     Tcpdump(String),
     Empty,
+    /// The managed file the operator asked to keep is no longer on the target.
+    Missing,
     Failed,
 }
 
@@ -1122,6 +1187,7 @@ pub fn parse_pcap_evidence_failure(output: &str) -> PcapEvidenceFailure {
     let (kind, text) = line.split_once('\t').unwrap_or((line, ""));
     match kind {
         "empty" => PcapEvidenceFailure::Empty,
+        "missing" => PcapEvidenceFailure::Missing,
         "tcpdump" => {
             let text: String = text
                 .chars()
@@ -1154,8 +1220,14 @@ pub struct PcapEvidenceContext {
     pub target_sha256: String,
     pub target_temporary_path: String,
     pub target_temporary_removed: bool,
+    /// Whether the file came from a live capture's own stream (`true`) or a
+    /// capture started only to be kept (`false`, the original behaviour).
+    #[serde(default)]
+    pub live_capture: bool,
     pub limitations: String,
 }
+
+pub const PCAP_LIVE_EXPORT_LIMITATIONS: &str = "这份抓包文件来自一次实时抓包的原始字节流：tcpdump 以 -nn -U 把所选接口上、符合过滤条件的数据包边抓边写入目标机上的临时文件，到时长或包数上限即停止；目标机上计算的 SHA-256 与两次 SFTP 读取及本地回读一致。文件只包含内核在这段时间交给 tcpdump 的数据包，内核丢包与未匹配过滤条件的流量不在其中，不代表这段时间的全部网络活动。抓包期间 tcpdump 需要 root 或免密码 sudo。";
 
 pub const PCAP_EVIDENCE_LIMITATIONS: &str = "tcpdump 以 -nn -U -w 把所选接口上、符合过滤条件的数据包写入目标机上的临时文件，到时长或包数上限即停止；目标机上计算的 SHA-256 与两次 SFTP 读取及本地回读一致。文件只包含内核在这段时间交给 tcpdump 的数据包，内核丢包与未匹配过滤条件的流量不在其中，不代表这段时间的全部网络活动。抓包期间 tcpdump 需要 root 或免密码 sudo。";
 
@@ -1296,8 +1368,18 @@ pub fn generate_tcpdump_command(request: &PcapCaptureRequest) -> CoreResult<Stri
 /// hangup reaches tcpdump directly, the trap stops it on HUP/INT/TERM, and a
 /// timer job sends TERM when the duration is up. tcpdump ends on TERM with
 /// its own exit status.
-pub fn generate_live_capture_command(request: &PcapCaptureRequest) -> CoreResult<String> {
+pub fn generate_live_capture_command(
+    request: &PcapCaptureRequest,
+    remote_path: &str,
+    fifo_path: &str,
+) -> CoreResult<String> {
     request.validate()?;
+    if !is_managed_remote_pcap_path(remote_path) || !is_managed_remote_fifo_path(fifo_path) {
+        return Err(CoreError::validation(
+            "remote PCAP path",
+            "path is outside the LovelyHawk-managed namespace",
+        ));
+    }
     let count_arg = request
         .packet_limit
         .map(|count| format!(" -c {count}"))
@@ -1306,16 +1388,45 @@ pub fn generate_live_capture_command(request: &PcapCaptureRequest) -> CoreResult
         .map(|filter| format!(" {}", shq(&filter)))
         .unwrap_or_default();
     Ok(format!(
-        "set -u; command -v tcpdump >/dev/null 2>&1 || {{ echo 'tcpdump unavailable' >&2; exit 127; }}; \
+        "set -u; umask 077; command -v tcpdump >/dev/null 2>&1 || {{ echo 'tcpdump unavailable' >&2; exit 127; }}; \
+command -v mkfifo >/dev/null 2>&1 || {{ echo 'mkfifo unavailable' >&2; exit 127; }}; \
+command -v tee >/dev/null 2>&1 || {{ echo 'tee unavailable' >&2; exit 127; }}; \
 pcap_runner='tcpdump'; if [ \"$(id -u)\" -ne 0 ]; then \
 command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1 || {{ echo 'capture requires root or non-interactive sudo' >&2; exit 126; }}; \
 pcap_runner='sudo -n tcpdump'; fi; \
-$pcap_runner -nn -l -tttt -i {interface}{count_arg}{filter_arg} 2>&1 & pcap_pid=$!; \
+pcap_fifo={fifo}; rm -f -- \"$pcap_fifo\" 2>/dev/null; mkfifo \"$pcap_fifo\" || {{ echo 'mkfifo unavailable' >&2; exit 1; }}; \
+$pcap_runner -nn -U -i {interface}{count_arg} -w -{filter_arg} 2>&1 >\"$pcap_fifo\" & pcap_pid=$!; \
+tee {remote} <\"$pcap_fifo\" | tcpdump -nn -l -tttt -r - 2>&1 & pcap_reader=$!; \
 ( trap 'kill \"$pcap_sleep\" 2>/dev/null; exit 0' TERM; sleep {duration} & pcap_sleep=$!; wait \"$pcap_sleep\" && kill -TERM \"$pcap_pid\" 2>/dev/null ) & pcap_timer=$!; \
-trap 'kill -TERM \"$pcap_pid\" \"$pcap_timer\" 2>/dev/null; exit 129' HUP INT TERM; \
-wait \"$pcap_pid\"; pcap_rc=$?; kill -TERM \"$pcap_timer\" 2>/dev/null; exit \"$pcap_rc\"",
+trap 'kill -TERM \"$pcap_pid\" \"$pcap_timer\" 2>/dev/null; rm -f -- \"$pcap_fifo\"; exit 129' HUP INT TERM; \
+wait \"$pcap_pid\"; pcap_rc=$?; kill -TERM \"$pcap_timer\" 2>/dev/null; wait \"$pcap_reader\" 2>/dev/null; rm -f -- \"$pcap_fifo\"; exit \"$pcap_rc\"",
         duration = request.duration_seconds,
         interface = shq(&request.interface),
+        remote = shq(remote_path),
+        fifo = shq(fifo_path),
+    ))
+}
+
+/// Stat a finished live capture's managed file: size and SHA-256 like the
+/// evidence command reports, `missing` when it is gone and `empty` when it
+/// has no bytes.
+pub fn generate_live_metadata_command(remote_path: &str) -> CoreResult<String> {
+    if !is_managed_remote_pcap_path(remote_path) {
+        return Err(CoreError::validation(
+            "remote PCAP path",
+            "path is outside the LovelyHawk-managed namespace",
+        ));
+    }
+    let remote = shq(remote_path);
+    Ok(format!(
+        "set -u
+command -v wc >/dev/null 2>&1 || {{ echo 'wc unavailable' >&2; exit 127; }}
+command -v sha256sum >/dev/null 2>&1 || {{ echo 'sha256sum unavailable' >&2; exit 127; }}
+test -f {remote} || {{ printf '{PCAP_FAILURE_MARKER}\tmissing\t\n'; exit 1; }}
+pcap_size=$(wc -c < {remote})
+[ \"$pcap_size\" -gt 0 ] 2>/dev/null || {{ printf '{PCAP_FAILURE_MARKER}\tempty\t\n'; exit 1; }}
+pcap_hash=$(sha256sum {remote} | awk '{{print $1}}')
+printf '{PCAP_RESULT_MARKER}\t%s\t%s\n' \"$pcap_size\" \"$pcap_hash\""
     ))
 }
 
@@ -1371,7 +1482,7 @@ mod tests {
         // The commands still ask those questions before they capture, so the
         // lines this function knows are lines it can actually receive. The
         // live command keeps its own time and needs no timeout(1).
-        let live = generate_live_capture_command(&request()).unwrap();
+        let live = live_command_for(&request());
         assert!(live.contains("tcpdump unavailable"));
         assert!(!live.contains("timeout"));
         let evidence = generate_pcap_evidence_command(&request(), &new_remote_pcap_path()).unwrap();
@@ -1381,6 +1492,12 @@ mod tests {
                 "{expected} missing from {evidence}"
             );
         }
+    }
+
+    fn live_command_for(request: &PcapCaptureRequest) -> String {
+        let remote_path = new_remote_pcap_path();
+        let fifo_path = remote_fifo_path(&remote_path).unwrap();
+        generate_live_capture_command(request, &remote_path, &fifo_path).unwrap()
     }
 
     fn request() -> PcapCaptureRequest {
@@ -1623,10 +1740,13 @@ mod tests {
         // over two lines, which this parser cannot join; the command must not
         // ask for them.
         for command in [
-            generate_live_capture_command(&request()).unwrap(),
+            live_command_for(&request()),
             generate_tcpdump_command(&request()).unwrap(),
         ] {
-            assert!(command.contains(" -nn -l -tttt -i "), "{command}");
+            assert!(
+                command.contains(" -nn -l -tttt -i ") || command.contains(" -nn -l -tttt -r - "),
+                "{command}"
+            );
             assert!(
                 !command.contains("-nne") && !command.contains("-tttt -v"),
                 "{command}"
@@ -1634,24 +1754,106 @@ mod tests {
         }
     }
 
+    /// The raw stream the page never sees: tcpdump writes pcap bytes to a
+    /// fifo, `tee` lands them in the managed file, and a second tcpdump decodes
+    /// them back into the lines the page shows. Ending the capture stops the
+    /// writer, and the fifo is removed on every way out.
     #[test]
-    fn live_command_is_bounded_quoted_and_time_limited() {
-        let command = generate_live_capture_command(&request()).unwrap();
-        // tcpdump is a job of the shell, so a hangup from the closed PTY
-        // reaches it; the timer sends TERM at the duration; the trap stops
-        // both on HUP/INT/TERM; the shell exits with tcpdump's status.
-        assert!(command.contains("2>&1 & pcap_pid=$!;"));
+    fn live_command_writes_raw_bytes_through_a_fifo_and_stays_bounded() {
+        let remote_path = "/tmp/lovelyres-pcap-123e4567-e89b-12d3-a456-426614174000.pcap";
+        let fifo_path = "/tmp/lovelyres-pcap-123e4567-e89b-12d3-a456-426614174000.fifo";
+        let command =
+            generate_live_capture_command(&request(), remote_path, fifo_path).unwrap();
+        // Writer: raw bytes to the fifo, its own stderr still on the PTY, and
+        // the job PID stays the one the trap and timer can kill through sudo.
+        assert!(command.contains("-nn -U -i 'eth0' -c 500 -w - 'tcp port 443; id' 2>&1 >\"$pcap_fifo\""));
+        assert!(command.contains(&format!("pcap_fifo='{fifo_path}'")));
+        assert!(command.contains("& pcap_pid=$!;"));
+        // Reader: tee writes the managed file, tcpdump decodes it line by line.
+        assert!(command.contains(&format!(
+            "tee '{remote_path}' <\"$pcap_fifo\" | tcpdump -nn -l -tttt -r - 2>&1 & pcap_reader=$!;"
+        )));
+        // Same timer, same trap on the writer, fifo removed both ways out.
         assert!(command.contains("sleep 15 & pcap_sleep=$!;"));
         assert!(command.contains("wait \"$pcap_sleep\" && kill -TERM \"$pcap_pid\""));
         assert!(command.contains(
-            "trap 'kill -TERM \"$pcap_pid\" \"$pcap_timer\" 2>/dev/null; exit 129' HUP INT TERM;"
+            "trap 'kill -TERM \"$pcap_pid\" \"$pcap_timer\" 2>/dev/null; rm -f -- \"$pcap_fifo\"; exit 129' HUP INT TERM;"
         ));
-        assert!(command.ends_with("wait \"$pcap_pid\"; pcap_rc=$?; kill -TERM \"$pcap_timer\" 2>/dev/null; exit \"$pcap_rc\""));
+        assert!(command.ends_with(
+            "wait \"$pcap_pid\"; pcap_rc=$?; kill -TERM \"$pcap_timer\" 2>/dev/null; wait \"$pcap_reader\" 2>/dev/null; rm -f -- \"$pcap_fifo\"; exit \"$pcap_rc\""
+        ));
+        assert!(command.contains("umask 077"));
+        assert!(command.contains("mkfifo unavailable"));
+        assert!(command.contains("tee unavailable"));
+        assert!(command.contains("mkfifo \"$pcap_fifo\""));
         assert!(!command.contains("timeout"));
         assert!(command.contains("sudo -n true"));
-        assert!(command.contains("-c 500"));
-        assert!(command.contains("'tcp port 443; id'"));
         assert!(!command.contains("eth0;"));
+        // Paths outside the managed namespace are refused.
+        for (remote, fifo) in [
+            ("/etc/passwd", fifo_path),
+            (remote_path, "/tmp/other.fifo"),
+            (remote_path, remote_path),
+        ] {
+            assert!(
+                generate_live_capture_command(&request(), remote, fifo).is_err(),
+                "{remote} {fifo}"
+            );
+        }
+    }
+
+    /// The reader's own banner is tcpdump reporting on itself, not a packet.
+    #[test]
+    fn the_reader_banner_is_info_not_a_packet() {
+        assert!(is_tcpdump_info("reading from file -, link-type EN10MB (Ethernet)"));
+        assert!(!is_tcpdump_info(
+            "2026-10-11 06:10:41.818757 IP 172.17.0.13 > 172.17.0.1: ICMP echo request"
+        ));
+    }
+
+    /// Export reads the file that is already there: same digest marker the
+    /// evidence command prints, and the file itself is never written.
+    #[test]
+    fn metadata_command_only_reads_a_managed_file() {
+        let remote_path = "/tmp/lovelyres-pcap-123e4567-e89b-12d3-a456-426614174000.pcap";
+        let command = generate_live_metadata_command(remote_path).unwrap();
+        assert!(command.contains(&format!("test -f '{remote_path}'")));
+        assert!(command.contains(&format!("wc -c < '{remote_path}'")));
+        assert!(command.contains(&format!("sha256sum '{remote_path}'")));
+        assert!(command.contains(&format!("{PCAP_FAILURE_MARKER}	missing	")));
+        assert!(command.contains(&format!("{PCAP_FAILURE_MARKER}	empty	")));
+        assert!(command.contains(PCAP_RESULT_MARKER));
+        assert!(!command.contains("tcpdump") && !command.contains("-w "));
+        for path in ["/etc/passwd", "/tmp/lovelyres-pcap-x.pcap", remote_path.trim_end_matches(".pcap")] {
+            assert!(generate_live_metadata_command(path).is_err(), "{path}");
+        }
+        for (output, failure) in [
+            ("LOVELYHAWK_PCAP_FAILURE_V1	missing	
+", PcapEvidenceFailure::Missing),
+            ("LOVELYHAWK_PCAP_FAILURE_V1	empty	
+", PcapEvidenceFailure::Empty),
+        ] {
+            assert_eq!(parse_pcap_evidence_failure(output), failure, "{output}");
+        }
+    }
+
+    /// A pcap and its fifo are one managed pair: either side validates and
+    /// cleanup removes both.
+    #[test]
+    fn the_fifo_is_managed_beside_its_pcap_and_cleanup_takes_both() {
+        let remote_path = new_remote_pcap_path();
+        let fifo_path = remote_fifo_path(&remote_path).unwrap();
+        assert!(is_managed_remote_pcap_path(&remote_path));
+        assert!(is_managed_remote_fifo_path(&fifo_path));
+        assert_eq!(
+            remote_fifo_path(&remote_path).as_deref(),
+            Some(fifo_path.as_str())
+        );
+        assert!(!is_managed_remote_fifo_path(&remote_path));
+        assert!(!is_managed_remote_pcap_path(&fifo_path));
+        assert!(remote_fifo_path("/etc/passwd").is_none());
+        let cleanup = PacketCaptureService::cleanup_command(&remote_path).unwrap();
+        assert!(cleanup.contains(&remote_path) && cleanup.contains(&fifo_path));
     }
 
     #[test]

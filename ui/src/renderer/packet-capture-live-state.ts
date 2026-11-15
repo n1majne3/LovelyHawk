@@ -29,6 +29,8 @@ export interface PacketCaptureLiveState {
   captureStatus: PacketCaptureUiStatus;
   captureRequest: number;
   captureHandle: string | null;
+  /** A cleanly ended capture whose raw file may still be exportable. */
+  exportHandle: string | null;
   startInterfaceHandle: string | null;
   pollRequest: number;
   pollAfterSequence: number;
@@ -100,6 +102,8 @@ export type PacketCaptureLiveAction =
     }
   | { type: "stop-started"; scope: string; request: number; captureHandle: string }
   | { type: "capture-released"; scope: string; captureHandle: string; failed: boolean }
+  /** The operator threw the raw file away; there is nothing left to export. */
+  | { type: "raw-discarded"; scope: string; captureHandle: string }
   | { type: "packet-selected"; sequence: number }
   | { type: "search-changed"; value: string }
   | { type: "notice-cleared" }
@@ -119,6 +123,7 @@ export function createPacketCaptureLiveState(
     captureStatus: "idle",
     captureRequest: 0,
     captureHandle: null,
+    exportHandle: null,
     startInterfaceHandle: null,
     pollRequest: 0,
     pollAfterSequence: 0,
@@ -218,6 +223,7 @@ export function packetCaptureLiveReducer(
         ...state,
         captureStatus: "starting",
         captureRequest: action.request,
+        exportHandle: null,
         startInterfaceHandle: action.interfaceHandle,
         error: null,
         notice: "正在开始实时抓包…",
@@ -333,10 +339,14 @@ export function packetCaptureLiveReducer(
       return {
         ...state,
         captureHandle: null,
+        exportHandle: action.failed ? null : action.captureHandle,
         captureStatus: action.failed ? "failed" : "stopped",
         notice: action.failed ? null : "实时抓包已停止并释放。",
         error: action.failed ? state.error ?? "停止抓包时目标已断开。" : null,
       };
+    case "raw-discarded":
+      if (action.scope !== state.scope || action.captureHandle !== state.exportHandle) return state;
+      return { ...state, exportHandle: null };
     case "packet-selected":
       return state.packets.some((packet) => packet.sequence === action.sequence)
         ? { ...state, selectedPacketSequence: action.sequence }

@@ -165,16 +165,16 @@ describe("packet capture live strict boundary", () => {
     expect(isPacketCaptureStopped({ stopped: true, path: "/tmp/capture.pcap" })).toBe(false);
   });
 
-  it("has exactly four methods and no renderer-supplied interface identity or remote primitive", () => {
+  it("has exactly five methods and no renderer-supplied interface identity or remote primitive", () => {
     const source = readFileSync(new URL("./packet-capture-live-contract.ts", import.meta.url), "utf8");
     const api = source.slice(
       source.indexOf("export interface PacketCaptureLiveApi"),
       source.indexOf("type JsonRecord"),
     );
-    expect((api.match(/Promise<unknown>/gu) ?? [])).toHaveLength(4);
+    expect((api.match(/Promise<unknown>/gu) ?? [])).toHaveLength(5);
     for (const method of [
       "listPacketCaptureInterfaces", "startPacketCapture",
-      "pollPacketCapture", "stopPacketCapture",
+      "pollPacketCapture", "stopPacketCapture", "discardPacketCapture",
     ]) expect(api).toContain(method);
     for (const forbidden of [
       "interfaceName", "sessionId", "targetGuard", "generation", "identity",

@@ -152,7 +152,7 @@ describe("AI history backend client boundary", () => {
 });
 
 describe("system-info backend client boundary", () => {
-  it("pins exactly eleven RPC methods and validates every response DTO", () => {
+  it("pins exactly twelve RPC methods and validates every response DTO", () => {
     expect(SYSTEM_INFO_RPC_METHODS).toEqual({
       catalog: "system-info.catalog.get",
       summary: "system-info.summary.get",
@@ -164,9 +164,10 @@ describe("system-info backend client boundary", () => {
       rowConfirm: "system-info.row.action.confirm",
       rowExecute: "system-info.row.action.execute",
       rowCancel: "system-info.row.action.cancel",
+      rowUndo: "system-info.row.action.undo",
       firewall: "system-info.firewall",
     });
-    expect(Object.keys(SYSTEM_INFO_RPC_METHODS)).toHaveLength(11);
+    expect(Object.keys(SYSTEM_INFO_RPC_METHODS)).toHaveLength(12);
     expect(BackendClient.prototype.planSystemInfoFirewallBlock.toString()).toContain("isSystemInfoFirewallPlan");
     expect(BackendClient.prototype.executeSystemInfoFirewallBlock.toString()).toContain("isSystemInfoFirewallResult");
     expect(BackendClient.prototype.planSystemInfoFirewallRestore.toString()).toContain("isSystemInfoFirewallRestorePlan");
@@ -336,14 +337,15 @@ describe("Docker read backend client boundary", () => {
 });
 
 describe("Packet Capture Live backend client boundary", () => {
-  it("pins exactly four binding-scoped RPC methods and validates correlated DTOs", () => {
+  it("pins exactly five binding-scoped RPC methods and validates correlated DTOs", () => {
     expect(PACKET_CAPTURE_LIVE_RPC_METHODS).toEqual({
       listInterfaces: "packet-capture.interfaces.list",
       start: "packet-capture.start",
       poll: "packet-capture.poll",
       stop: "packet-capture.stop",
+      discard: "packet-capture.discard",
     });
-    expect(Object.keys(PACKET_CAPTURE_LIVE_RPC_METHODS)).toHaveLength(4);
+    expect(Object.keys(PACKET_CAPTURE_LIVE_RPC_METHODS)).toHaveLength(5);
     expect(BackendClient.prototype.listPacketCaptureInterfaces.toString())
       .toContain("isPacketCaptureInterfaceList");
     expect(BackendClient.prototype.startPacketCapture.toString())
@@ -354,11 +356,14 @@ describe("Packet Capture Live backend client boundary", () => {
       .toContain("event.sequence <= afterSequence");
     expect(BackendClient.prototype.stopPacketCapture.toString())
       .toContain("isPacketCaptureStopped");
+    expect(BackendClient.prototype.discardPacketCapture.toString())
+      .toContain("isPacketCaptureDiscarded");
     for (const method of [
       BackendClient.prototype.listPacketCaptureInterfaces,
       BackendClient.prototype.startPacketCapture,
       BackendClient.prototype.pollPacketCapture,
       BackendClient.prototype.stopPacketCapture,
+      BackendClient.prototype.discardPacketCapture,
     ]) expect(method.toString()).toContain("isPacketCaptureOpaqueHandle");
   });
 });

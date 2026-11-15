@@ -24,6 +24,15 @@ describe("packet capture evidence boundary", () => {
   it("accepts an interface only by its handle and never a folder, a path or a name", () => {
     expect(isPacketCaptureEvidenceRequest(begin)).toBe(true);
     expect(isPacketCaptureEvidenceRequest({ action: "poll", bindingHandle: BINDING, jobHandle: "job" })).toBe(true);
+    expect(isPacketCaptureEvidenceRequest({
+      action: "export", bindingHandle: BINDING,
+      captureHandle: "123e4567-e89b-42d3-a456-426614174001",
+    })).toBe(true);
+    for (const bad of [
+      { action: "export", bindingHandle: BINDING },
+      { action: "export", bindingHandle: BINDING, captureHandle: "pcap-not-a-uuid" },
+      { action: "export", bindingHandle: BINDING, captureHandle: "123e4567-e89b-42d3-a456-426614174001", jobHandle: "x" },
+    ]) expect(isPacketCaptureEvidenceRequest(bad), JSON.stringify(bad)).toBe(false);
     for (const bad of [
       { ...begin, selectedDirectory: "C:/private" },
       { ...begin, interface: "eth0" },
@@ -62,6 +71,15 @@ describe("packet capture evidence boundary", () => {
   it("ties a start to its own parameters and a poll to its own job", () => {
     const capturing = { ...captureEvidence, state: "capturing", copiedBytes: 0, verifiedBytes: 0, totalBytes: 0, sha256: null, temporaryFile: "pending" };
     expect(matchesPacketCaptureEvidenceResult(begin, capturing)).toBe(true);
+    const exportRequest: PacketCaptureEvidenceRequest = {
+      action: "export", bindingHandle: BINDING,
+      captureHandle: "123e4567-e89b-42d3-a456-426614174001",
+    };
+    const collecting = { ...capturing, state: "collecting" };
+    expect(matchesPacketCaptureEvidenceResult(exportRequest, collecting)).toBe(true);
+    expect(matchesPacketCaptureEvidenceResult(exportRequest, capturing)).toBe(false);
+    expect(matchesPacketCaptureEvidenceResult(exportRequest, null)).toBe(false);
+    expect(matchesPacketCaptureEvidenceResult(exportRequest, captureEvidence)).toBe(false);
     expect(matchesPacketCaptureEvidenceResult(begin, null)).toBe(true);
     expect(matchesPacketCaptureEvidenceResult(begin, { ...capturing, durationSeconds: 30 })).toBe(false);
     expect(matchesPacketCaptureEvidenceResult(begin, { ...capturing, filtered: false })).toBe(false);

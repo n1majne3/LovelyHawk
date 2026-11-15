@@ -125,6 +125,7 @@ const MAIN_WINDOW_METHODS: &[&str] = &[
     "packet-capture.start",
     "packet-capture.poll",
     "packet-capture.stop",
+    "packet-capture.discard",
     "process-watch.probe",
     "process-watch.start",
     "process-watch.poll",
@@ -211,8 +212,12 @@ pub fn main_window_may_call(method: &str, params: &Value) -> bool {
     let action = params.get("action").and_then(Value::as_str);
     match method {
         "case.library" => action != Some("export") && params.get("selectedDestination").is_none(),
-        "emergency.file-evidence" | "packet-capture.evidence" | "kubernetes.pod.file-evidence" => {
+        "emergency.file-evidence" | "kubernetes.pod.file-evidence" => {
             action != Some("begin") && params.get("selectedDirectory").is_none()
+        }
+        "packet-capture.evidence" => {
+            !matches!(action, Some("begin") | Some("export"))
+                && params.get("selectedDirectory").is_none()
         }
         // Reading a local file and handing out the whole text are the host's:
         // one carries a path, the other the contents.

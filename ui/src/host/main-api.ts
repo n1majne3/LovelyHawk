@@ -260,6 +260,14 @@ export function createMainApi(transport: BackendTransport = hostBackendTransport
       requireArity(values, 1, "抓包留证请求无效。");
       const request = values[0];
       if (!isPacketCaptureEvidenceRequest(request)) refuse("抓包留证请求无效。");
+      if (request.action === "export") {
+        const exportResult = await host("packet_capture_export_begin", { request }, DIALOG_TIMEOUT_MS);
+        if (exportResult === null) return null;
+        if (!matchesPacketCaptureEvidenceResult(request as PacketCaptureEvidenceRequest, exportResult)) {
+          refuse("抓包导出响应与本次请求不一致。");
+        }
+        return exportResult;
+      }
       if (request.action !== "begin") return backend.packetCaptureEvidence(request);
       const result = await host("packet_capture_evidence_begin", { request }, DIALOG_TIMEOUT_MS);
       if (result === null) return null;
@@ -1072,6 +1080,12 @@ export function createMainApi(transport: BackendTransport = hostBackendTransport
       const [bindingHandle, captureHandle] = values;
       if (!isPacketCaptureOpaqueHandle(bindingHandle) || !isPacketCaptureOpaqueHandle(captureHandle)) refuse("Invalid packet capture stop request.");
       return backend.stopPacketCapture(bindingHandle, captureHandle);
+    },
+    discardPacketCapture: async (...values: unknown[]) => {
+      requireArity(values, 2, "Invalid packet capture discard request.");
+      const [bindingHandle, captureHandle] = values;
+      if (!isPacketCaptureOpaqueHandle(bindingHandle) || !isPacketCaptureOpaqueHandle(captureHandle)) refuse("Invalid packet capture discard request.");
+      return backend.discardPacketCapture(bindingHandle, captureHandle);
     },
     probeProcessWatch: async (...values: unknown[]) => {
       requireArity(values, 1, "Invalid process watch probe request.");

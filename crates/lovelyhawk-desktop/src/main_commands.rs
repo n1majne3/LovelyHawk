@@ -401,6 +401,39 @@ pub async fn packet_capture_evidence_begin<R: Runtime>(
     host.bridge.call("packet-capture.evidence", params).await
 }
 
+/// Exporting a finished live capture: the folder comes from the same dialog.
+#[tauri::command]
+pub async fn packet_capture_export_begin<R: Runtime>(
+    window: WebviewWindow<R>,
+    host: State<'_, Host>,
+    request: Value,
+) -> CommandResult<Value> {
+    require_main(&window)?;
+    let valid = request.as_object().is_some_and(|fields| {
+        fields.len() == 3
+            && text_field(&request, "action") == Some("export")
+            && ["bindingHandle", "captureHandle"]
+                .iter()
+                .all(|key| fields.get(*key).and_then(Value::as_str).is_some())
+    });
+    if !valid {
+        return Err("抓包导出请求无效。".to_owned());
+    }
+    let Some(path) = local_files::choose(
+        &window,
+        "选择留证目录 · 抓包文件将存进独立证据文件夹",
+        DialogKind::PickFolder,
+        None,
+    )
+    .await
+    else {
+        return Ok(Value::Null);
+    };
+    let mut params = request;
+    params["selectedDirectory"] = Value::String(path.to_string_lossy().into_owned());
+    host.bridge.call("packet-capture.evidence", params).await
+}
+
 /// Fetch-for-local-scan calls carry local paths in both directions, so the
 /// whole surface stays behind dedicated commands rather than the backend
 /// whitelist. `configure` is refused here: the program path comes from the

@@ -225,6 +225,24 @@
   margin-bottom: 0;
 }
 
+.packet-capture-raw {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.packet-capture-raw-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.packet-capture-raw-note {
+  color: var(--console-warning-text);
+  font-size: var(--font-small);
+  margin: 0;
+}
+
 .packet-capture-metrics {
   display: grid;
   gap: 10px;

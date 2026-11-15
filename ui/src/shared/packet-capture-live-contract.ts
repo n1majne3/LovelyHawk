@@ -115,6 +115,10 @@ export interface PacketCaptureStopped {
   stopped: true;
 }
 
+export interface PacketCaptureDiscarded {
+  discarded: true;
+}
+
 export interface PacketCaptureLiveApi {
   listPacketCaptureInterfaces(bindingHandle: string): Promise<unknown>;
   startPacketCapture(
@@ -128,6 +132,7 @@ export interface PacketCaptureLiveApi {
     afterSequence: number,
   ): Promise<unknown>;
   stopPacketCapture(bindingHandle: string, captureHandle: string): Promise<unknown>;
+  discardPacketCapture(bindingHandle: string, captureHandle: string): Promise<unknown>;
 }
 
 type JsonRecord = Record<string, unknown>;
@@ -299,4 +304,8 @@ export function isPacketCapturePoll(value: unknown): value is PacketCapturePoll 
 
 export function isPacketCaptureStopped(value: unknown): value is PacketCaptureStopped {
   return record(value) && exact(value, ["stopped"]) && value.stopped === true;
+}
+
+export function isPacketCaptureDiscarded(value: unknown): value is PacketCaptureDiscarded {
+  return record(value) && exact(value, ["discarded"]) && value.discarded === true;
 }
