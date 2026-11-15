@@ -65,6 +65,10 @@ pub fn line_delete_path_allowed(path: &RemotePath) -> bool {
     if let Some(name) = value.strip_prefix("/etc/modules-load.d/") {
         return name.ends_with(".conf") && is_valid_safe_basename(name) && !name.starts_with('.');
     }
+    // Module revival points (`install x /sbin/insmod …`) live here too.
+    if let Some(name) = value.strip_prefix("/etc/modprobe.d/") {
+        return name.ends_with(".conf") && is_valid_safe_basename(name) && !name.starts_with('.');
+    }
     if let Some(name) = value.strip_prefix("/etc/cron.d/") {
         return is_valid_safe_basename(name) && !name.starts_with('.');
     }
@@ -620,6 +624,7 @@ mod tests {
             "/etc/inetd.conf",
             "/etc/modules",
             "/etc/modules-load.d/blacklist.conf",
+            "/etc/modprobe.d/evil-revival.conf",
         ] {
             assert!(line_delete_path_allowed(&path(value)), "{value}");
         }
@@ -645,6 +650,9 @@ mod tests {
             "/etc/init.d/.hidden",
             "/etc/modules-load.d/.hidden.conf",
             "/etc/modules-load.d/noext",
+            "/etc/modprobe.d/.hidden.conf",
+            "/etc/modprobe.d/noext",
+            "/etc/modprobe.d/nested/evil.conf",
             "/etc/xinetd.d/echo",
             "/usr/bin/something",
             "/etc/passwd",
