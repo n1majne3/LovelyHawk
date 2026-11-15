@@ -3482,6 +3482,48 @@ impl SystemInfoTable {
         Ok(ArtifactMutationRequest { identity, action })
     }
 
+    /// A service or autostart row resolved to the unit a removal would move.
+    /// The unit name alone travels; whether its fragment is a local file the
+    /// action may remove is a host-side question the probe answers.
+    pub fn systemd_unit_removal_request(
+        &self,
+        row_id: &str,
+    ) -> CoreResult<crate::systemd_unit_removal::SystemdUnitRemovalRequest> {
+        let (row, unit) = match self.tab {
+            SystemInfoTab::Services => self.service_row(row_id)?,
+            SystemInfoTab::Autostart => {
+                let row = self
+                    .rows
+                    .iter()
+                    .find(|row| row.id == row_id)
+                    .ok_or_else(|| invalid_detail_key("systemd unit row"))?;
+                let unit = row
+                    .cells
+                    .first()
+                    .ok_or_else(|| invalid_detail_key("systemd unit name"))?;
+                if !(is_valid_service_unit(unit)
+                    && row.cells.get(3).is_some_and(|kind| kind == "systemd"))
+                {
+                    return Err(CoreError::validation(
+                        "systemd unit removal",
+                        "the selected row is not a systemd service row",
+                    ));
+                }
+                (row, unit.clone())
+            }
+            _ => {
+                return Err(CoreError::validation(
+                    "systemd unit removal",
+                    "the selected row is not from the service or autostart inventory",
+                ));
+            }
+        };
+        Ok(crate::systemd_unit_removal::SystemdUnitRemovalRequest {
+            row_id: row.id.clone(),
+            unit,
+        })
+    }
+
     /// The kernel-module row resolved to the module an unload would target.
     /// Only the name travels: everything else the plan needs is re-read from
     /// the host because the table may be minutes old.

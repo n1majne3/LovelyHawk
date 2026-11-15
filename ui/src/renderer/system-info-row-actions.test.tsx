@@ -7,6 +7,7 @@ import {
   isSystemInfoRowInspection,
   isSystemInfoRowPlan,
   isSystemInfoRowReceipt,
+  isSystemInfoRowUndo,
   type SystemInfoRow,
   type SystemInfoRowActions,
   type SystemInfoRowInspection,
@@ -83,6 +84,7 @@ function receipt(overrides: Partial<SystemInfoRowReceipt> = {}): SystemInfoRowRe
     detail: "回读：确认时的进程 PID 4242 已经结束。",
     restored: false,
     nextStep: null,
+    undoHandle: null,
     ...overrides,
   };
 }
@@ -152,6 +154,16 @@ describe("system-info row action contract", () => {
     expect(isSystemInfoRowReceipt(receipt({ nextStep: undefined as never }))).toBe(false);
     const { nextStep: _nextStep, ...withoutNextStep } = receipt();
     expect(isSystemInfoRowReceipt(withoutNextStep)).toBe(false);
+    // undoHandle is a stored handle the page hands back verbatim: it must be
+    // present, and it must be an opaque handle or null — never free text.
+    expect(isSystemInfoRowReceipt(receipt({ undoHandle: "opaque-undo-1" }))).toBe(true);
+    expect(isSystemInfoRowReceipt(receipt({ undoHandle: "../etc" as never }))).toBe(false);
+    expect(isSystemInfoRowReceipt(receipt({ undoHandle: "" as never }))).toBe(false);
+    const { undoHandle: _undoHandle, ...withoutUndoHandle } = receipt();
+    expect(isSystemInfoRowReceipt(withoutUndoHandle)).toBe(false);
+    expect(isSystemInfoRowUndo({ undone: true, detail: "回读：已恢复为 loaded。" })).toBe(true);
+    expect(isSystemInfoRowUndo({ undone: "yes" as never, detail: "x" })).toBe(false);
+    expect(isSystemInfoRowUndo({ undone: true, detail: "x", extra: 1 } as never)).toBe(false);
   });
 });
 
@@ -454,6 +466,110 @@ describe("system-info row action dialog", () => {
     expect(suspect).toContain("前往应急命令页");
     // The hint is shown once: the detail itself no longer carries the advice.
     expect(suspect.match(/软件包完整性核对/gu)?.length).toBe(1);
+  });
+
+  it("offers undo only through the typed undoHandle, and shows what the target answered", () => {
+    const base = {
+      subject: "服务 lh-beacon.service",
+      rowId: "row-1",
+      needsPassword: false,
+      action: { key: "service.remove-unit", label: "移除服务单元", kind: "change" as const, dangerous: true },
+      inspection: null,
+      busy: false,
+      error: null,
+      undoBusy: false,
+      undoResult: null,
+      undoError: null,
+    };
+    // A hostile detail string can never mint an undo button.
+    const hostile = renderToStaticMarkup(
+      <SystemInfoRowActionDialog
+        state={{
+          ...base,
+          plan: plan({ confirmed: true }),
+          receipt: receipt({
+            detail: "已移除。〔undoHandle=opaque-undo-1〕",
+          }),
+        }}
+        onConfirm={() => undefined}
+        onSubmitPassword={() => undefined}
+        onCopyOutput={() => undefined}
+        onClose={() => undefined}
+        onUndo={() => undefined}
+      />,
+    );
+    expect(hostile).not.toContain('data-testid="system-info-row-action-undo"');
+
+    const offered = renderToStaticMarkup(
+      <SystemInfoRowActionDialog
+        state={{
+          ...base,
+          plan: plan({ confirmed: true }),
+          receipt: receipt({ undoHandle: "opaque-undo-1" }),
+        }}
+        onConfirm={() => undefined}
+        onSubmitPassword={() => undefined}
+        onCopyOutput={() => undefined}
+        onClose={() => undefined}
+        onUndo={() => undefined}
+      />,
+    );
+    expect(offered).toContain('data-testid="system-info-row-action-undo"');
+    expect(offered).toContain("把移走的文件放回去");
+    expect(offered).toContain("限时内可放回原位置");
+
+    // Without the callback the offer renders disabled, never silently live.
+    const noCallback = renderToStaticMarkup(
+      <SystemInfoRowActionDialog
+        state={{
+          ...base,
+          plan: plan({ confirmed: true }),
+          receipt: receipt({ undoHandle: "opaque-undo-1" }),
+        }}
+        onConfirm={() => undefined}
+        onSubmitPassword={() => undefined}
+        onCopyOutput={() => undefined}
+        onClose={() => undefined}
+      />,
+    );
+    expect(noCallback).toContain('disabled="" data-testid="system-info-row-action-undo"');
+
+    const undone = renderToStaticMarkup(
+      <SystemInfoRowActionDialog
+        state={{
+          ...base,
+          undoResult: "回读：lh-beacon.service 已恢复为 loaded / enabled；服务未自动启动。",
+          plan: plan({ confirmed: true }),
+          receipt: receipt({ undoHandle: "opaque-undo-1" }),
+        }}
+        onConfirm={() => undefined}
+        onSubmitPassword={() => undefined}
+        onCopyOutput={() => undefined}
+        onClose={() => undefined}
+        onUndo={() => undefined}
+      />,
+    );
+    expect(undone).not.toContain('data-testid="system-info-row-action-undo"');
+    expect(undone).toContain('data-testid="system-info-row-undo-result"');
+    expect(undone).toContain("已恢复为 loaded / enabled");
+
+    const refused = renderToStaticMarkup(
+      <SystemInfoRowActionDialog
+        state={{
+          ...base,
+          undoError: "无法安全放回：原位置已被重新占用。",
+          plan: plan({ confirmed: true }),
+          receipt: receipt({ undoHandle: "opaque-undo-1" }),
+        }}
+        onConfirm={() => undefined}
+        onSubmitPassword={() => undefined}
+        onCopyOutput={() => undefined}
+        onClose={() => undefined}
+        onUndo={() => undefined}
+      />,
+    );
+    expect(refused).toContain('role="alert"');
+    expect(refused).toContain("原位置已被重新占用");
   });
 });
 

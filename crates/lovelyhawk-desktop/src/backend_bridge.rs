@@ -48,6 +48,7 @@ const MAIN_WINDOW_METHODS: &[&str] = &[
     "system-info.row.action.confirm",
     "system-info.row.action.execute",
     "system-info.row.action.cancel",
+    "system-info.row.action.undo",
     "system-info.firewall",
     "baseline.catalog.get",
     "baseline.scan",

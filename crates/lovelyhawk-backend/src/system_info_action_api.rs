@@ -23,6 +23,7 @@ use lovelyhawk_core::{
     CoreError, CoreResult,
     account_password::AccountPasswordPlan,
     kernel_module_unload::KernelModuleUnloadPlan,
+    systemd_unit_removal::{SystemdUnitRemovalPlan, SystemdUnitRemovalUndo},
     crypto::SecretValue,
     firewall_block::{
         FirewallBlockOutcome, FirewallBlockPlan, FirewallBlockRequest, FirewallBlockRestorePlan,
@@ -57,6 +58,8 @@ const MAX_PLAN_TEXT_BYTES: usize = 2_048;
 /// Long enough to read what the plan says and decide; short enough that an
 /// abandoned dialog cannot be executed from later.
 const PLAN_TTL: Duration = Duration::from_secs(5 * 60);
+/// How long a verified unit removal can still be undone from its receipt.
+const UNDO_TTL: Duration = Duration::from_secs(10 * 60);
 /// The slowest read-only action the core allows itself is thirty seconds.
 const INSPECT_DEADLINE: Duration = Duration::from_secs(45);
 const PLAN_DEADLINE: Duration = Duration::from_secs(30);
@@ -88,6 +91,9 @@ pub(crate) enum RowAction {
     /// `kernel-module.unload` — rmmod a Live, refcount-0 module the kernel
     /// module inventory listed.
     KernelModuleUnload,
+    /// `service.remove-unit` — move a local unit's fragment, drop-ins and
+    /// enablement links into a backup tree, with an undo handle.
+    ServiceRemoveUnit,
 }
 
 impl RowAction {
@@ -122,7 +128,8 @@ impl RowAction {
                 ArtifactInvestigationAction::SuidFile(inner) => format!("suid.{}", kebab(inner)),
                 ArtifactInvestigationAction::SshKey(inner) => format!("ssh-key.{}", kebab(inner)),
             },
-            Self::KernelModuleUnload => return "kernel-module.unload".to_owned(),
+            Self::KernelModuleUnload => "kernel-module.unload".to_owned(),
+            Self::ServiceRemoveUnit => "service.remove-unit".to_owned(),
             Self::ArtifactMutation(action) => match action {
                 ArtifactMutationAction::DeleteCronFile => "cron.delete-file",
                 ArtifactMutationAction::CommentShellLine => "shell.comment-line",
@@ -150,9 +157,12 @@ impl RowAction {
                 None if rest == "restart" => Some(Self::ProcessRestart),
                 None => from_kebab(rest).map(Self::ProcessInspect),
             },
-            "service" => match rest.strip_prefix("runtime.") {
-                Some(action) => from_kebab(action).map(Self::ServiceRuntime),
-                None => from_kebab(rest).map(Self::ServiceInspect),
+            "service" => match rest {
+                "remove-unit" => Some(Self::ServiceRemoveUnit),
+                _ => match rest.strip_prefix("runtime.") {
+                    Some(action) => from_kebab(action).map(Self::ServiceRuntime),
+                    None => from_kebab(rest).map(Self::ServiceInspect),
+                },
             },
             "user" => from_kebab(rest).map(Self::UserInspect),
             "account" => match rest {
@@ -252,6 +262,7 @@ impl RowAction {
             Self::ArtifactInspect(action) => action.label(),
             Self::ArtifactMutation(action) => action.label(),
             Self::KernelModuleUnload => "卸载模块",
+            Self::ServiceRemoveUnit => "移除服务单元",
         }
     }
 
@@ -267,6 +278,7 @@ impl RowAction {
                 | Self::NetworkDisconnect
                 | Self::ArtifactMutation(_)
                 | Self::KernelModuleUnload
+                | Self::ServiceRemoveUnit
         )
     }
 
@@ -279,7 +291,8 @@ impl RowAction {
             | Self::ProcessRestart
             | Self::NetworkDisconnect
             | Self::ArtifactMutation(_)
-            | Self::KernelModuleUnload => true,
+            | Self::KernelModuleUnload
+            | Self::ServiceRemoveUnit => true,
             Self::ServiceRuntime(action) => matches!(
                 action,
                 ServiceRuntimeAction::Stop
@@ -310,7 +323,8 @@ impl RowAction {
             | Self::UserPassword
             | Self::NetworkDisconnect
             | Self::ArtifactMutation(_)
-            | Self::KernelModuleUnload => ("change".to_owned(), "处置"),
+            | Self::KernelModuleUnload
+            | Self::ServiceRemoveUnit => ("change".to_owned(), "处置"),
         }
     }
 
@@ -329,6 +343,7 @@ impl RowAction {
             SystemInfoTab::Services => {
                 actions.extend(ServiceInvestigationAction::ALL.map(Self::ServiceInspect));
                 actions.extend(ServiceRuntimeAction::ALL.map(Self::ServiceRuntime));
+                actions.push(Self::ServiceRemoveUnit);
             }
             SystemInfoTab::Autostart => {
                 actions.extend(
@@ -337,6 +352,7 @@ impl RowAction {
                         .map(Self::ArtifactInspect),
                 );
                 actions.extend(ServiceRuntimeAction::AUTOSTART.map(Self::ServiceRuntime));
+                actions.push(Self::ServiceRemoveUnit);
             }
             SystemInfoTab::Timers => {
                 actions.extend(
@@ -489,6 +505,7 @@ fn applies(table: &SystemInfoTable, row_id: &str, action: RowAction) -> bool {
             table.artifact_mutation_request(row_id, inner).is_ok()
         }
         RowAction::KernelModuleUnload => table.kernel_module_unload_request(row_id).is_ok(),
+        RowAction::ServiceRemoveUnit => table.systemd_unit_removal_request(row_id).is_ok(),
     }
 }
 
@@ -610,6 +627,25 @@ pub(crate) struct SystemInfoRowReceiptDto {
     /// marker inside `detail`: remote-controlled text never switches UI
     /// affordances.
     next_step: Option<&'static str>,
+    /// A stored undo the receipt can offer; only actions that moved files
+    /// into a backup tree hand one back.
+    undo_handle: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SystemInfoRowUndoDto {
+    undone: bool,
+    detail: String,
+}
+
+impl fmt::Debug for SystemInfoRowUndoDto {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SystemInfoRowUndoDto")
+            .field("undone", &self.undone)
+            .finish()
+    }
 }
 
 impl fmt::Debug for SystemInfoRowReceiptDto {
@@ -642,6 +678,7 @@ enum RowPlan {
     NetworkDisconnect(NetworkDisconnectPlan),
     ArtifactMutation(ArtifactMutationPlan),
     KernelModuleUnload(KernelModuleUnloadPlan),
+    ServiceRemoveUnit(SystemdUnitRemovalPlan),
 }
 
 impl RowPlan {
@@ -656,6 +693,7 @@ impl RowPlan {
             Self::NetworkDisconnect(plan) => plan.definition(),
             Self::ArtifactMutation(plan) => plan.definition(),
             Self::KernelModuleUnload(plan) => plan.definition(),
+            Self::ServiceRemoveUnit(plan) => plan.definition(),
         }
     }
 }
@@ -674,9 +712,19 @@ struct StoredRowPlan {
     expires_at: Instant,
 }
 
+/// A verified removal's way back: the operation's undo plus the scope that
+/// owns it, kept for the same window every undoable change gets.
+struct StoredRowUndo {
+    undo_handle: String,
+    scope: RowScope,
+    undo: SystemdUnitRemovalUndo,
+    expires_at: Instant,
+}
+
 #[derive(Default)]
 pub(crate) struct RowPlanRegistry {
     plans: HashMap<String, StoredRowPlan>,
+    undos: HashMap<String, StoredRowUndo>,
 }
 
 impl fmt::Debug for RowPlanRegistry {
@@ -691,11 +739,14 @@ impl fmt::Debug for RowPlanRegistry {
 impl RowPlanRegistry {
     fn prune(&mut self, now: Instant) {
         self.plans.retain(|_, plan| plan.expires_at > now);
+        self.undos.retain(|_, undo| undo.expires_at > now);
     }
 
     pub(crate) fn close_binding(&mut self, binding_handle: &str) {
         self.plans
             .retain(|_, plan| plan.scope.binding_handle != binding_handle);
+        self.undos
+            .retain(|_, undo| undo.scope.binding_handle != binding_handle);
     }
 
     fn store(&mut self, plan: StoredRowPlan) -> Result<(), SystemInfoApiError> {
@@ -749,6 +800,29 @@ impl RowPlanRegistry {
         {
             self.plans.remove(plan_handle);
         }
+    }
+
+    fn store_undo(&mut self, undo: StoredRowUndo) {
+        self.undos.insert(undo.undo_handle.clone(), undo);
+    }
+
+    /// Takes a stored undo out, so it can never run twice.
+    fn take_undo(
+        &mut self,
+        scope: &RowScope,
+        undo_handle: &str,
+        now: Instant,
+    ) -> Result<StoredRowUndo, SystemInfoApiError> {
+        let stored = self
+            .undos
+            .get(undo_handle)
+            .ok_or(SystemInfoApiError::PlanStale)?;
+        if &stored.scope != scope || stored.expires_at <= now {
+            return Err(SystemInfoApiError::PlanStale);
+        }
+        self.undos
+            .remove(undo_handle)
+            .ok_or(SystemInfoApiError::PlanStale)
     }
 }
 
@@ -851,7 +925,8 @@ impl SystemInfoApi {
                 | RowAction::UserPassword
                 | RowAction::NetworkDisconnect
                 | RowAction::ArtifactMutation(_)
-                | RowAction::KernelModuleUnload => Err(CoreError::Validation {
+                | RowAction::KernelModuleUnload
+                | RowAction::ServiceRemoveUnit => Err(CoreError::Validation {
                     subject: "system-information row action",
                     message: "this action changes the host and must be planned".to_owned(),
                 }),
@@ -969,6 +1044,13 @@ impl SystemInfoApi {
                         .await
                         .map(RowPlan::KernelModuleUnload)
                 }
+                RowAction::ServiceRemoveUnit => {
+                    let request = table.systemd_unit_removal_request(row_id)?;
+                    service
+                        .plan_systemd_unit_removal(&session, &request)
+                        .await
+                        .map(RowPlan::ServiceRemoveUnit)
+                }
                 RowAction::ProcessInspect(_)
                 | RowAction::ServiceInspect(_)
                 | RowAction::UserInspect(_)
@@ -1050,18 +1132,29 @@ impl SystemInfoApi {
             plan,
             ..
         } = stored;
-        let outcome: Result<CoreResult<(VerificationResult, bool, Option<&'static str>)>, _> =
+        type Executed = CoreResult<(
+            VerificationResult,
+            bool,
+            Option<&'static str>,
+            Option<SystemdUnitRemovalUndo>,
+        )>;
+        let outcome: Result<Executed, _> =
             timeout(EXECUTE_DEADLINE, async move {
                 match plan {
                     RowPlan::ProcessSignal(plan) => service
                         .execute_process_signal(&session, plan, confirmation, journal)
                         .await
-                        .map(|outcome| (outcome.verification, false, None)),
+                        .map(|outcome| (outcome.verification, false, None, None)),
                     RowPlan::ProcessRestart(plan) => service
                         .execute_process_restart(&session, plan, confirmation, journal)
                         .await
                         .map(|outcome| {
-                            (outcome.verification, outcome.relaunched_after_failure, None)
+                            (
+                                outcome.verification,
+                                outcome.relaunched_after_failure,
+                                None,
+                                None,
+                            )
                         }),
                     RowPlan::ServiceRuntime(plan) => service
                         .execute_service_runtime(&session, plan, confirmation, journal)
@@ -1070,6 +1163,7 @@ impl SystemInfoApi {
                             (
                                 outcome.verification,
                                 outcome.restored_after_failed_verification,
+                                None,
                                 None,
                             )
                         }),
@@ -1081,6 +1175,7 @@ impl SystemInfoApi {
                                 outcome.verification,
                                 outcome.restored_after_failed_verification,
                                 None,
+                                None,
                             )
                         }),
                     RowPlan::UserAccount(plan) => service
@@ -1091,6 +1186,7 @@ impl SystemInfoApi {
                                 outcome.verification,
                                 outcome.restored_after_failed_verification,
                                 outcome.tool_suspect.then_some("verify-account-tool"),
+                                None,
                             )
                         }),
                     RowPlan::UserPassword(plan) => service
@@ -1101,12 +1197,13 @@ impl SystemInfoApi {
                                 outcome.verification,
                                 outcome.restored_after_failed_verification,
                                 None,
+                                None,
                             )
                         }),
                     RowPlan::NetworkDisconnect(plan) => service
                         .execute_network_disconnect(&session, plan, confirmation, journal)
                         .await
-                        .map(|outcome| (outcome.verification, false, None)),
+                        .map(|outcome| (outcome.verification, false, None, None)),
                     RowPlan::ArtifactMutation(plan) => service
                         .execute_artifact_mutation(&session, plan, confirmation, journal)
                         .await
@@ -1115,32 +1212,43 @@ impl SystemInfoApi {
                                 outcome.verification,
                                 outcome.restored_after_failed_verification,
                                 None,
+                                None,
                             )
                         }),
                     RowPlan::KernelModuleUnload(plan) => service
                         .execute_kernel_module_unload(&session, plan, confirmation, journal)
                         .await
-                        .map(|outcome| (outcome.verification, false, None)),
+                        .map(|outcome| (outcome.verification, false, None, None)),
+                    RowPlan::ServiceRemoveUnit(plan) => service
+                        .execute_systemd_unit_removal(&session, plan, confirmation, journal)
+                        .await
+                        .map(|outcome| {
+                            (outcome.verification, false, None, outcome.undo)
+                        }),
                 }
             })
             .await;
         self.validate_scope(&scope)?;
 
-        let receipt =
-            |verified: bool, detail: String, restored: bool, next_step: Option<&'static str>| {
-                SystemInfoRowReceiptDto {
-                    plan_handle: plan_handle.clone(),
-                    tab: tab_key(tab),
-                    row_id: row_id.clone(),
-                    action: action.key(),
-                    label: action.label(),
-                    subject: subject.clone(),
-                    verified,
-                    detail,
-                    restored,
-                    next_step,
-                }
-            };
+        let receipt = |verified: bool,
+                       detail: String,
+                       restored: bool,
+                       next_step: Option<&'static str>,
+                       undo_handle: Option<String>| {
+            SystemInfoRowReceiptDto {
+                plan_handle: plan_handle.clone(),
+                tab: tab_key(tab),
+                row_id: row_id.clone(),
+                action: action.key(),
+                label: action.label(),
+                subject: subject.clone(),
+                verified,
+                detail,
+                restored,
+                next_step,
+                undo_handle,
+            }
+        };
         match outcome {
             Err(_) => Err(SystemInfoApiError::Deadline),
             // The core restores on failed verification itself and journals
@@ -1152,13 +1260,33 @@ impl SystemInfoApi {
                 execution_failure_detail(&error),
                 false,
                 None,
+                None,
             )),
-            Ok(Ok((verification, restored, next_step))) => Ok(receipt(
-                verification.passed,
-                bounded_text(&verification.detail, MAX_PLAN_TEXT_BYTES),
-                restored,
-                next_step,
-            )),
+            Ok(Ok((verification, restored, next_step, undo))) => {
+                let undo_handle = match undo {
+                    Some(undo) => {
+                        let now = Instant::now();
+                        let mut registry = self.lock_plans()?;
+                        registry.prune(now);
+                        let undo_handle = Uuid::new_v4().to_string();
+                        registry.store_undo(StoredRowUndo {
+                            undo_handle: undo_handle.clone(),
+                            scope: scope.clone(),
+                            undo,
+                            expires_at: now + UNDO_TTL,
+                        });
+                        Some(undo_handle)
+                    }
+                    None => None,
+                };
+                Ok(receipt(
+                    verification.passed,
+                    bounded_text(&verification.detail, MAX_PLAN_TEXT_BYTES),
+                    restored,
+                    next_step,
+                    undo_handle,
+                ))
+            }
         }
     }
 
@@ -1172,6 +1300,34 @@ impl SystemInfoApi {
         let scope = self.capture_scope(binding_handle)?;
         self.lock_plans()?.remove(&scope, plan_handle);
         Ok(())
+    }
+
+    /// Puts back what a verified removal moved out. The undo is taken from
+    /// the registry before it runs, so one handle restores exactly once.
+    pub(crate) async fn undo_row_action(
+        &self,
+        binding_handle: &str,
+        undo_handle: &str,
+    ) -> Result<SystemInfoRowUndoDto, SystemInfoApiError> {
+        validate_plan_handle(undo_handle)?;
+        let scope = self.capture_scope(binding_handle)?;
+        let stored = {
+            let now = Instant::now();
+            let mut registry = self.lock_plans()?;
+            registry.prune(now);
+            registry.take_undo(&scope, undo_handle, now)?
+        };
+        let session = self.binding_session(&scope.binding_handle)?;
+        let service = self.services.system_info();
+        let detail = timeout(EXECUTE_DEADLINE, stored.undo.undo(service, &session))
+            .await
+            .map_err(|_| SystemInfoApiError::Deadline)?
+            .map_err(action_failure)?;
+        self.validate_scope(&scope)?;
+        Ok(SystemInfoRowUndoDto {
+            undone: true,
+            detail: bounded_text(&detail, MAX_PLAN_TEXT_BYTES),
+        })
     }
 
     fn capture_scope(&self, binding_handle: &str) -> Result<RowScope, SystemInfoApiError> {
@@ -2216,6 +2372,73 @@ mod tests {
             "kernel-module",
             "module.unload",
             "kernel-module.remove",
+        ] {
+            assert_eq!(RowAction::parse(near_miss), None, "{near_miss} parsed");
+        }
+    }
+
+    #[test]
+    fn service_and_autostart_rows_offer_remove_unit_as_a_dangerous_change() {
+        let services = table(
+            SystemInfoTab::Services,
+            vec![vec!["lh-beacon.service", "active (running)", "enabled", "beacon"]],
+        );
+        let actions = actions_for(&services, "row-0");
+        let removal = actions
+            .iter()
+            .find(|(_, key, _)| key == "service.remove-unit")
+            .expect("service rows offer unit removal");
+        assert_eq!(removal.0, "change");
+        assert!(removal.2, "unit removal is marked dangerous");
+        assert_eq!(RowAction::ServiceRemoveUnit.label(), "移除服务单元");
+        assert!(RowAction::ServiceRemoveUnit.changes_host());
+        // A non-unit first cell cannot take it.
+        let broken = table(
+            SystemInfoTab::Services,
+            vec![vec!["not a unit", "active", "enabled", "x"]],
+        );
+        assert!(!applies(&broken, "row-0", RowAction::ServiceRemoveUnit));
+        // Autostart rows only offer it for systemd service entries.
+        let autostart = table(
+            SystemInfoTab::Autostart,
+            vec![
+                vec!["lh-beacon.service", "sleep 3600", "enabled", "systemd"],
+                vec!["lh-rc", "/etc/init.d/lh-rc", "enabled", "init.d"],
+                vec!["lh.timer", "sleep 60", "enabled", "systemd"],
+            ],
+        );
+        let offered: Vec<String> = actions_for(&autostart, "row-0")
+            .into_iter()
+            .map(|(_, key, _)| key)
+            .collect();
+        assert!(offered.contains(&"service.remove-unit".to_owned()));
+        for row_id in ["row-1", "row-2"] {
+            assert!(!applies(&autostart, row_id, RowAction::ServiceRemoveUnit));
+        }
+        // Other tabs never offer it, whatever the row looks like.
+        let timers = table(
+            SystemInfoTab::Timers,
+            vec![vec!["lh.timer", "*-*-* *:00", "-", "-"]],
+        );
+        assert!(
+            !actions_for(&timers, "row-0")
+                .iter()
+                .any(|(_, key, _)| key == "service.remove-unit")
+        );
+    }
+
+    #[test]
+    fn service_remove_unit_key_parses_to_exactly_one_action() {
+        assert_eq!(
+            RowAction::parse("service.remove-unit"),
+            Some(RowAction::ServiceRemoveUnit)
+        );
+        assert_eq!(RowAction::ServiceRemoveUnit.key(), "service.remove-unit");
+        for near_miss in [
+            "service.remove",
+            "service.remove-unit-now",
+            "systemd.remove-unit",
+            "service.runtime.remove-unit",
         ] {
             assert_eq!(RowAction::parse(near_miss), None, "{near_miss} parsed");
         }

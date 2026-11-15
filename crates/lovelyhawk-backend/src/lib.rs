@@ -1137,6 +1137,17 @@ impl BackendState {
                     Err(failure) => Err(failure),
                 }
             }
+            RpcMethod::SystemInfoRowActionUndo => {
+                match parse_params::<SystemInfoUndoParams>(request.params) {
+                    Ok(params) => self
+                        .system_info
+                        .undo_row_action(&params.binding_handle, &params.undo_handle)
+                        .await
+                        .map(to_value)
+                        .map_err(system_info_failure),
+                    Err(failure) => Err(failure),
+                }
+            }
             RpcMethod::SystemInfoFirewall => {
                 match parse_params::<crate::system_info_action_api::FirewallRequest>(request.params)
                 {
@@ -3424,6 +3435,8 @@ enum RpcMethod {
     SystemInfoRowActionExecute,
     #[serde(rename = "system-info.row.action.cancel")]
     SystemInfoRowActionCancel,
+    #[serde(rename = "system-info.row.action.undo")]
+    SystemInfoRowActionUndo,
     #[serde(rename = "system-info.firewall")]
     SystemInfoFirewall,
     #[serde(rename = "baseline.catalog.get")]
@@ -3949,6 +3962,13 @@ struct SystemInfoRowActionParams {
 struct SystemInfoPlanParams {
     binding_handle: String,
     plan_handle: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SystemInfoUndoParams {
+    binding_handle: String,
+    undo_handle: String,
 }
 
 #[derive(Deserialize)]
@@ -5802,6 +5822,78 @@ fn system_info_failure(error: SystemInfoApiError) -> RpcFailure {
                     (
                         "system-info-module-probe",
                         "The kernel-module state read back incomplete or ambiguous; nothing was done.",
+                    )
+                }
+                CoreError::Validation { subject, .. }
+                    if *subject
+                        == lovelyhawk_core::systemd_unit_removal::UNIT_NOT_LOADED_REFUSAL =>
+                {
+                    (
+                        "system-info-unit-not-loaded",
+                        "The unit is not loaded, is masked, or is not a removable unit name.",
+                    )
+                }
+                CoreError::Validation { subject, .. }
+                    if *subject
+                        == lovelyhawk_core::systemd_unit_removal::UNIT_LOCATION_REFUSAL =>
+                {
+                    (
+                        "system-info-unit-location",
+                        "The unit file comes from a package or runtime location; only operator-placed units are removed.",
+                    )
+                }
+                CoreError::Validation { subject, .. }
+                    if *subject
+                        == lovelyhawk_core::systemd_unit_removal::UNIT_PACKAGE_REFUSAL =>
+                {
+                    (
+                        "system-info-unit-package",
+                        "The unit file is owned by a package; use disable or mask instead.",
+                    )
+                }
+                CoreError::Validation { subject, .. }
+                    if *subject
+                        == lovelyhawk_core::systemd_unit_removal::UNIT_PRIVILEGE_REFUSAL =>
+                {
+                    (
+                        "system-info-unit-privilege",
+                        "Removing a systemd unit needs root or passwordless sudo.",
+                    )
+                }
+                CoreError::Validation { subject, .. }
+                    if *subject
+                        == lovelyhawk_core::systemd_unit_removal::UNIT_TOOLS_REFUSAL =>
+                {
+                    (
+                        "system-info-unit-tools",
+                        "No usable systemctl is on the host; the unit file cannot be proven.",
+                    )
+                }
+                CoreError::Validation { subject, .. }
+                    if *subject
+                        == lovelyhawk_core::systemd_unit_removal::UNIT_CHANGED_REFUSAL =>
+                {
+                    (
+                        "system-info-unit-changed",
+                        "The unit changed after the plan was made; nothing was removed.",
+                    )
+                }
+                CoreError::Validation { subject, .. }
+                    if *subject
+                        == lovelyhawk_core::systemd_unit_removal::UNIT_PROBE_REFUSAL =>
+                {
+                    (
+                        "system-info-unit-probe",
+                        "The unit state read back incomplete or ambiguous; nothing was done.",
+                    )
+                }
+                CoreError::Validation { subject, .. }
+                    if *subject
+                        == lovelyhawk_core::systemd_unit_removal::UNIT_UNDO_REFUSAL =>
+                {
+                    (
+                        "system-info-unit-undo",
+                        "The removal could not be safely undone; the backup is kept for manual review.",
                     )
                 }
                 CoreError::Validation { subject, .. }

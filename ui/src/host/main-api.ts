@@ -539,6 +539,14 @@ export function createMainApi(transport: BackendTransport = hostBackendTransport
       }
       return backend.cancelSystemInfoRowAction(bindingHandle, planHandle);
     },
+    undoSystemInfoRowAction: async (...values: unknown[]) => {
+      requireArity(values, 2, "Invalid system-information row undo request.");
+      const [bindingHandle, undoHandle] = values;
+      if (!isSshOpaqueHandle(bindingHandle) || !isSystemInfoOpaqueHandle(undoHandle)) {
+        refuse("Invalid system-information row undo request.");
+      }
+      return backend.undoSystemInfoRowAction(bindingHandle, undoHandle);
+    },
     planSystemInfoFirewallBlock: async (...values: unknown[]) => {
       requireArity(values, 3, "Invalid firewall block plan request.");
       const [bindingHandle, address, direction] = values;

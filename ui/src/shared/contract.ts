@@ -41,6 +41,7 @@ import type {
   SystemInfoRowInspection,
   SystemInfoRowPlan,
   SystemInfoRowReceipt,
+  SystemInfoRowUndo,
   SystemInfoSummary,
   SystemInfoTabCatalogEntry,
   SystemInfoTabKey,
@@ -589,6 +590,8 @@ export interface LovelyHawkApi {
     planHandle: string,
   ): Promise<SystemInfoRowReceipt>;
   cancelSystemInfoRowAction(bindingHandle: string, planHandle: string): Promise<void>;
+  /** Put back what a verified row removal moved out; the handle is spent once. */
+  undoSystemInfoRowAction(bindingHandle: string, undoHandle: string): Promise<SystemInfoRowUndo>;
   planSystemInfoFirewallBlock(
     bindingHandle: string,
     address: string,

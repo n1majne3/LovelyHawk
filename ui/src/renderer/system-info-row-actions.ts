@@ -36,6 +36,10 @@ export interface SystemInfoRowActionState {
   error: string | null;
   /** `account.password` collects the new password before a plan exists. */
   needsPassword: boolean;
+  /** One-shot undo on a verified removal: busy, what the target said, or why it refused. */
+  undoBusy: boolean;
+  undoResult: string | null;
+  undoError: string | null;
 }
 
 interface MenuEvent {
@@ -216,11 +220,12 @@ export function useSystemInfoRowActions(
       setState({
         subject, rowId, action, inspection: null, plan: null, receipt: null,
         busy: false, error: null, needsPassword: true,
+        undoBusy: false, undoResult: null, undoError: null,
       });
       return;
     }
     inFlight.current = true;
-    setState({ subject, rowId, action, inspection: null, plan: null, receipt: null, busy: true, error: null, needsPassword: false });
+    setState({ subject, rowId, action, inspection: null, plan: null, receipt: null, busy: true, error: null, needsPassword: false, undoBusy: false, undoResult: null, undoError: null });
     try {
       if (action.kind === "inspect") {
         const inspection = await api.inspectSystemInfoRow(
@@ -315,5 +320,27 @@ export function useSystemInfoRowActions(
     }
   }, [api, bindingHandle]);
 
-  return { menu, state, openMenu, dismissMenu, choose, submitPassword, confirm, close };
+  const undo = useCallback(async () => {
+    const current = state;
+    const undoHandle = current?.receipt?.undoHandle ?? null;
+    if (current === null || undoHandle === null || bindingHandle === null || inFlight.current) return;
+    inFlight.current = true;
+    setState((previous) => previous === null ? null
+      : { ...previous, undoBusy: true, undoError: null });
+    try {
+      const result = await api.undoSystemInfoRowAction(bindingHandle, undoHandle);
+      if (typeof result.undone !== "boolean") {
+        throw new Error("目标机返回的撤销结果无法识别。");
+      }
+      setState((previous) => previous === null ? null
+        : { ...previous, undoBusy: false, undoResult: result.detail, undoError: null });
+    } catch (error) {
+      setState((previous) => previous === null ? null
+        : { ...previous, undoBusy: false, undoError: rowActionFailureText(error) });
+    } finally {
+      inFlight.current = false;
+    }
+  }, [api, bindingHandle, state]);
+
+  return { menu, state, openMenu, dismissMenu, choose, submitPassword, confirm, undo, close };
 }

@@ -757,6 +757,7 @@ export function SystemInfoPage({ connection, api, writeClipboard, openFile, onOp
           onSubmitPassword={(password) => void rowActions.submitPassword(password)}
           onCopyOutput={(text) => void copyText(text, "已复制输出。")}
           onClose={rowActions.close}
+          onUndo={() => void rowActions.undo()}
           onOpenWorkbench={onOpenWorkbench}
         />
       ) : null}

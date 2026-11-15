@@ -10,6 +10,8 @@ export interface SystemInfoRowActionDialogProps {
   onSubmitPassword: (password: string) => void;
   onCopyOutput: (text: string) => void;
   onClose: () => void;
+  /** Puts back what a verified removal moved out; the offer is spent once. */
+  onUndo?: (() => void) | undefined;
   /** Opens the command workbench so the operator can run package verification. */
   onOpenWorkbench?: (() => void) | undefined;
 }
@@ -32,6 +34,7 @@ export function SystemInfoRowActionDialog({
   onSubmitPassword,
   onCopyOutput,
   onClose,
+  onUndo,
   onOpenWorkbench,
 }: SystemInfoRowActionDialogProps) {
   useModalScrim();
@@ -212,6 +215,31 @@ export function SystemInfoRowActionDialog({
                 )}
               </dl>
             </div>
+            {receipt.undoHandle !== null && state.undoResult === null ? (
+              <div className="system-info-action-panel">
+                <p className="system-info-action-summary">
+                  移出的文件在目标机上留有备份，限时内可放回原位置；过期或撤销后不能再放回。
+                </p>
+                {state.undoError !== null ? (
+                  <div className="system-info-detail-state error" role="alert">{state.undoError}</div>
+                ) : null}
+                <button
+                  type="button"
+                  disabled={state.undoBusy || onUndo === undefined}
+                  data-testid="system-info-row-action-undo"
+                  onClick={() => { onUndo?.(); }}
+                >
+                  {state.undoBusy ? "正在放回…" : "把移走的文件放回去"}
+                </button>
+              </div>
+            ) : null}
+            {state.undoResult !== null ? (
+              <div className="system-info-action-panel" data-testid="system-info-row-undo-result">
+                <dl>
+                  <div><dt>放回结果</dt><dd>{state.undoResult}</dd></div>
+                </dl>
+              </div>
+            ) : null}
             <footer>
               <button type="button" className="is-primary" onClick={onClose}>关闭</button>
             </footer>

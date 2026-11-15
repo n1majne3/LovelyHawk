@@ -179,6 +179,7 @@ import {
   type SystemInfoRowInspection,
   type SystemInfoRowPlan,
   type SystemInfoRowReceipt,
+  type SystemInfoRowUndo,
   type SystemInfoSummary,
   type SystemInfoTabCatalogEntry,
   type SystemInfoTabKey,
@@ -384,6 +385,7 @@ import {
   isSystemInfoRowInspection,
   isSystemInfoRowPlan,
   isSystemInfoRowReceipt,
+  isSystemInfoRowUndo,
   isSystemInfoSummary,
   isSystemInfoTable,
   isContainerTerminalOpened,
@@ -463,6 +465,7 @@ export const SYSTEM_INFO_RPC_METHODS = Object.freeze({
   rowConfirm: "system-info.row.action.confirm",
   rowExecute: "system-info.row.action.execute",
   rowCancel: "system-info.row.action.cancel",
+  rowUndo: "system-info.row.action.undo",
   firewall: "system-info.firewall",
 } as const);
 
@@ -1214,6 +1217,20 @@ export class BackendClient {
       throw new Error("The system-information row cancellation is invalid.");
     }
     await this.#request(SYSTEM_INFO_RPC_METHODS.rowCancel, { bindingHandle, planHandle });
+  }
+
+  async undoSystemInfoRowAction(bindingHandle: string, undoHandle: string): Promise<SystemInfoRowUndo> {
+    if (!isSshOpaqueHandle(bindingHandle) || !isSystemInfoOpaqueHandle(undoHandle)) {
+      throw new Error("The system-information row undo request is invalid.");
+    }
+    const value = await this.#request(SYSTEM_INFO_RPC_METHODS.rowUndo, {
+      bindingHandle,
+      undoHandle,
+    }, SYSTEM_INFO_ROW_EXECUTE_TIMEOUT_MS);
+    if (!isSystemInfoRowUndo(value)) {
+      throw new Error("The backend returned an invalid system-information row undo result.");
+    }
+    return value;
   }
 
   async getBaselineCatalog(): Promise<BaselineCatalog> {

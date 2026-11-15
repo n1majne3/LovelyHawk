@@ -197,6 +197,15 @@ export interface SystemInfoRowReceipt {
    * affordances.
    */
   nextStep: "verify-account-tool" | null;
+  /** A stored way back for actions that moved files out; the page hands it
+   * back verbatim and can never mint one. */
+  undoHandle: string | null;
+}
+
+/** The answer to one undo: what the target said after the pieces went back. */
+export interface SystemInfoRowUndo {
+  undone: boolean;
+  detail: string;
 }
 
 export type SystemInfoFirewallDirection = "inbound" | "outbound" | "both";
@@ -621,7 +630,7 @@ export function isSystemInfoRowReceipt(value: unknown): value is SystemInfoRowRe
   return (
     isRecord(value) &&
     exact(value, [
-      "planHandle", "tab", "rowId", "action", "label", "subject", "verified", "detail", "restored", "nextStep",
+      "planHandle", "tab", "rowId", "action", "label", "subject", "verified", "detail", "restored", "nextStep", "undoHandle",
     ]) &&
     isSystemInfoOpaqueHandle(value.planHandle) &&
     isSystemInfoTabKey(value.tab) &&
@@ -632,6 +641,16 @@ export function isSystemInfoRowReceipt(value: unknown): value is SystemInfoRowRe
     typeof value.verified === "boolean" &&
     utf8(value.detail, MAX_ROW_PLAN_TEXT_BYTES, true) &&
     typeof value.restored === "boolean" &&
-    (value.nextStep === null || value.nextStep === "verify-account-tool")
+    (value.nextStep === null || value.nextStep === "verify-account-tool") &&
+    (value.undoHandle === null || isSystemInfoOpaqueHandle(value.undoHandle))
+  );
+}
+
+export function isSystemInfoRowUndo(value: unknown): value is SystemInfoRowUndo {
+  return (
+    isRecord(value) &&
+    exact(value, ["undone", "detail"]) &&
+    typeof value.undone === "boolean" &&
+    utf8(value.detail, MAX_ROW_PLAN_TEXT_BYTES, true)
   );
 }
