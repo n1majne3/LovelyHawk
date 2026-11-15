@@ -997,6 +997,81 @@ lh_finish
 "#
 );
 
+const CMD_MIDDLEWARE_LIGHTTPD: &str = bounded_observation!(r#"printf '# Lighttpd 进程、生效配置与只读风险检查；配置以 lighttpd -p 的展开结果为准。
+'
+lh_conf=''
+for lh_p in /proc/[0-9]*/cmdline; do
+  tr '\000' ' ' < "$lh_p" 2>/dev/null | grep -q 'lighttpd' || continue
+  lh_a=$(tr '\000' '\n' < "$lh_p" 2>/dev/null)
+  echo "$lh_a" | head -n 1 | grep -q 'lighttpd' || continue
+  lh_f=$(echo "$lh_a" | awk 'prev=="-f"{print $1; exit} {prev=$0}')
+  [ -n "$lh_conf" ] || [ -z "$lh_f" ] || lh_conf=$lh_f
+done
+for lh_p in /proc/[0-9]*/cmdline; do
+  tr '\000' ' ' < "$lh_p" 2>/dev/null | grep -q 'lighttpd' || continue
+  lh_a=$(tr '\000' '\n' < "$lh_p" 2>/dev/null)
+  echo "$lh_a" | head -n 1 | grep -q 'lighttpd' || continue
+  lh_pid=${lh_p#/proc/}; lh_pid=${lh_pid%/cmdline}
+  lh_f=$(echo "$lh_a" | awk 'prev=="-f"{print $1; exit} {prev=$0}')
+  echo "进程：lighttpd pid ${lh_pid}（配置 ${lh_f:-未带 -f}）"
+done | head -n 20
+if [ -z "$lh_conf" ] && [ -f /etc/lighttpd/lighttpd.conf ]; then lh_conf=/etc/lighttpd/lighttpd.conf; echo '# 未见运行中的 lighttpd 进程，按默认路径 /etc/lighttpd/lighttpd.conf 检查'; fi
+if [ -z "$lh_conf" ]; then echo '# 未发现 lighttpd 进程或默认配置，按未安装/未部署处理。'; exit 0; fi
+if ! command -v lighttpd >/dev/null 2>&1; then printf '# lighttpd 命令不可用，仅按配置文件 %s 原文检查\n' "$lh_conf"; lh_eff=$(cat "$lh_conf" 2>/dev/null); else
+  echo "=== lighttpd -tt -f $lh_conf（语法自检） ==="; lighttpd -tt -f "$lh_conf" 2>&1 | head -n 40
+  lh_eff=$(lighttpd -p -f "$lh_conf" 2>/dev/null | head -n 4000)
+  echo "=== lighttpd -p -f $lh_conf（生效配置，前 300 行，检查按前 4000 行） ==="; printf '%s
+' "$lh_eff" | head -n 300
+fi
+lh_has() { printf '%s
+' "$lh_eff" | grep -qi "$1"; }
+if lh_has 'mod_cgi'; then
+  lh_cgi=$(printf '%s
+' "$lh_eff" | grep -i 'cgi.assign' -A4 | head -n 20)
+  if [ -z "$lh_cgi" ]; then echo '关注：加载了 mod_cgi 但未见 cgi.assign，需人工确认 CGI 是否实际启用'; else
+    printf '%s
+' "$lh_cgi" | grep -Eq '""[[:space:]]*(=>|,)|\.(sh|py|pl|cgi)("|/|[[:space:]]*=>)' && echo '关注：cgi.assign 为 .sh/.py/.pl/.cgi 映射了解释器或空串处理器（CGI 可直接执行脚本）：'"$(printf '%s' "$lh_cgi" | tr '\n' ';' | head -c 400)"
+  fi
+fi
+lh_has 'dir-listing' && printf '%s
+' "$lh_eff" | grep -Eiq '(dir-listing.activate|server.dir-listing)[[:space:]]*=[[:space:]]*"?(enable|on|true)' && echo '关注：目录列表已开启（dir-listing），任何无索引文件的目录都会暴露文件清单'
+printf '%s
+' "$lh_eff" | grep -q 'server.username' || echo '关注：配置中没有 server.username，lighttpd 可能以启动用户（常为 root）运行 worker'
+printf '%s
+' "$lh_eff" | grep -i 'server.username' | grep -Eq '"?(root|"0")' && echo '关注：server.username 配置为 root，worker 以最高权限运行'
+lh_root=$(printf '%s
+' "$lh_eff" | grep -i 'server.document-root' | head -n 1 | sed 's/.*=[> ]*//; s/^"//; s/"[[:space:]]*,*[[:space:]]*$//')
+printf '%s
+' "$lh_eff" | grep -i 'alias.url' -A4 | grep -i '=>' | while read -r lh_line; do
+  lh_t=$(echo "$lh_line" | sed 's/.*=>[[:space:]]*//; s/^"//; s/"[[:space:]]*,*[[:space:]]*$//')
+  case "$lh_t" in
+    /*) if [ -z "$lh_root" ]; then echo "关注：alias.url 存在别名 $lh_t，缺少 server.document-root 无法判断是否越界"; else case "$lh_t" in "$lh_root"|"$lh_root"/*) ;; *) echo "关注：alias.url 指向站点根目录之外：$lh_t（根 $lh_root）";; esac; fi ;;
+    *) ;;
+  esac
+done | head -n 20
+lh_has 'mod_proxy' && echo '关注：加载了 mod_proxy，后端转发目标需人工核对（可能被改成后门回连）：'"$(printf '%s
+' "$lh_eff" | grep -i 'proxy.server' | head -n 5 | tr '\n' ';' | head -c 300)"
+printf '%s
+' "$lh_eff" | grep -q 'url.access-deny' || echo '关注：配置中没有 url.access-deny，敏感后缀（.conf/.bak/.sql 等）可被直接下载'
+if ! lh_has 'mod_auth' && ! printf '%s
+' "$lh_eff" | grep -q 'auth.require'; then
+  echo '关注：未发现认证配置，是否需要认证取决于业务（管理或诊断端点通常需要）'
+fi
+lh_dirs=$(printf '%s
+' "$lh_eff" | grep -i 'cgi.assign' -A3 | grep -oE '/[A-Za-z0-9._/-]+' | sort -u; [ -n "$lh_root" ] && echo "$lh_root")
+lh_seen=0
+for lh_d in /usr/lib/cgi-bin /var/www/cgi-bin $lh_dirs; do
+  [ -d "$lh_d" ] 2>/dev/null || continue
+  find "$lh_d" -maxdepth 3 -type f \( -name '*.sh' -o -name '*.py' -o -name '*.pl' -o -name '*.cgi' -o -name '*.lua' \) 2>/dev/null
+done | sort -u | head -n 200 | while read -r lh_s; do
+  echo "CGI：$lh_s"
+  grep -nE 'system[[:space:]]*\(|popen[[:space:]]*\(|os\.system|subprocess.*shell=True|eval[[:space:]]*[( ]|`[^`]+`|\$(QUERY_STRING|1)([^A-Za-z0-9_]|$)' "$lh_s" 2>/dev/null | head -n 10 | while IFS=: read -r lh_ln lh_txt; do
+    echo "关注：$lh_s:$lh_ln 可能存在命令拼接，需人工核对：$(echo "$lh_txt" | head -c 200)"
+  done
+done
+lh_finish
+"#);
+
 const CMD_NETWORK_OUTBOUND_PERIODIC: &str = bounded_observation!(
     r#"printf '# 每 0.5 秒读取一次内核 TCP表（ESTABLISHED 与 SYN_SENT、非回环远端），约 30 秒；一条连接按 本地端口+远端+inode 计数。
 '
@@ -3193,6 +3268,15 @@ static CATALOG: &[CommandDefinition] = &[
     .with_timeout(60)
     .flagging(command_findings::collection_finding),
     portable!(
+        "middleware-lighttpd",
+        System,
+        "Lighttpd 配置与风险",
+        "定位运行中的 lighttpd 进程及其 -f 配置（缺省按 /etc/lighttpd/lighttpd.conf），跑语法自检并展开生效配置（限 300 行），随后只读检查：CGI 映射、目录列表、运行用户、越界别名、反向代理、访问拒绝与认证缺口；再列出 CGI 目录与站点根下的脚本（限 200 个）并标记可疑命令拼接。线索需人工核对，不等于后门结论。",
+        CMD_MIDDLEWARE_LIGHTTPD
+    )
+    .self_checked()
+    .flagging(command_findings::collection_finding),
+    portable!(
         "system-lkm",
         System,
         "LKM rootkit 痕迹",
@@ -4308,6 +4392,42 @@ Permission denied"
         assert_eq!(
             command_findings::finding_lines(output, sampler.abnormal),
             vec![4, 5]
+        );
+    }
+
+    /// The lighttpd entry flags only 关注： leads; process lines, config
+    /// dumps, CGI listings and "not found" notes stay neutral context.
+    #[test]
+    fn lighttpd_entry_marks_attention_lines_only() {
+        let entry = lookup("middleware-lighttpd").unwrap();
+        assert_eq!(entry.entry.category, CommandCategory::System);
+        assert!(!entry.entry.opt_in);
+        assert!(entry.checks_tools);
+        for marker in [
+            "lighttpd -tt -f",
+            "cgi.assign",
+            "dir-listing",
+            "server.username",
+            "alias.url",
+            "mod_proxy",
+            "url.access-deny",
+            "未发现认证配置",
+            "可能存在命令拼接，需人工核对",
+            "未发现 lighttpd 进程或默认配置",
+        ] {
+            assert!(entry.default_command.contains(marker), "{marker}");
+        }
+        let output = "进程：lighttpd pid 412（配置 /etc/lighttpd/lighttpd.conf）
+=== lighttpd -p -f /etc/lighttpd/lighttpd.conf（生效配置，前 300 行） ===
+server.modules += ( \"mod_cgi\" )
+CGI：/var/www/cgi-bin/diag.sh
+关注：目录列表已开启（dir-listing），任何无索引文件的目录都会暴露文件清单
+关注：/var/www/cgi-bin/diag.sh:2 可能存在命令拼接，需人工核对：ping -c1 $QUERY_STRING
+关注：未发现认证配置，是否需要认证取决于业务（管理或诊断端点通常需要）
+# 已检查对象 0；关注线索 3；读取缺口 0。线索不等于入侵结论。";
+        assert_eq!(
+            command_findings::finding_lines(output, entry.abnormal),
+            vec![4, 5, 6]
         );
     }
 

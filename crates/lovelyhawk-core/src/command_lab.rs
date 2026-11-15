@@ -33,6 +33,19 @@ const SETUP: &[(&str, &str)] = &[(
 
 const CASES: &[Case] = &[
     Case {
+        id: "middleware-lighttpd",
+        fixture: "export DEBIAN_FRONTEND=noninteractive; apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq lighttpd >/dev/null 2>&1; mkdir -p /var/www/cgi-bin /etc/lighttpd/conf-enabled; printf '#!/bin/sh\nping -c1 $QUERY_STRING\n' > /var/www/cgi-bin/diag.sh; chmod +x /var/www/cgi-bin/diag.sh; for p in /proc/[0-9]*/comm; do case \"$(cat $p 2>/dev/null)\" in lighttpd*) ;; *) continue;; esac; pid=${p#/proc/}; kill -9 ${pid%/comm} 2>/dev/null; done; printf 'server.modules += ( \"mod_cgi\", \"mod_alias\" )
+cgi.assign = ( \".sh\" => \"\" )
+alias.url = ( \"/cgi-bin/\" => \"/var/www/cgi-bin/\" )
+dir-listing.activate = \"enable\"
+' > /etc/lighttpd/conf-enabled/60-lhlab.conf; cp \"$(command -v tail)\" /tmp/lighttpd; /tmp/lighttpd -f /etc/lighttpd/lighttpd.conf </dev/null >/dev/null 2>&1 & sleep 1",
+        expect: &["cgi.assign", "目录列表", "diag.sh"],
+        expect_pkg: &[],
+        quiet: &[],
+        quiet_skip: &[],
+    },
+
+    Case {
         id: "process-exe-path",
         fixture: "mkdir -p /tmp/lhbin; cp \"$(command -v sh)\" /tmp/lhbin/sh 2>/dev/null || cp /bin/busybox /tmp/lhbin/sh; chmod +x /tmp/lhbin/sh; (/tmp/lhbin/sh -c 'sleep 120 & wait' </dev/null >/dev/null 2>&1 &); sleep 1",
         expect: &["/tmp/lhbin/sh"],
