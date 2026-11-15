@@ -1,5 +1,38 @@
 # LovelyHawk 长期产品与验证进度
 
+## 2026-11-15 经纬杯团队赛题目对照
+
+材料：团队赛“人工智能综合防御赛”三台节点（交通 OA：Spring Boot + MySQL + Supervisor；交通视频监控：Lighttpd + SQLite + Modbus/TCP 网关，SSH 只有无 sudo 的 ops；智运 AI 平台：FastAPI + RAG + Agent 工具 + LKM）与 12 道安全实操题。题目约束与 day5 一致：不改 root 口令与公钥、不改业务端口、不用防火墙阻断业务、配置中的后门必须删除而不是注释、不得删除或重建业务数据与审计记录。材料不入库。以下为对照现有代码的结论，未在题目环境实测（NOT_RUN）。
+
+### 已覆盖
+
+内核模块检测（`/sys/module` 差集、kallsyms）、crontab/profile/init.d 行级删除、UID 0 账户、systemd 服务停止/禁用/屏蔽、封禁 IP、Modbus 端口监听可见、Java 热更新（含 `BOOT-INF/classes`）、Web 日志 gz 读取。
+
+### 缺口与计划
+
+| 编号 | 能力 | 题目依据 | 现状 |
+| --- | --- | --- | --- |
+| P0-1 | 按条删除 authorized_keys 公钥，保留 root 判定公钥 | 智运 AI 持久化清理 | SSH 公钥行只读（`system_info_action_api.rs` `ssh-key` 仅查看） |
+| P0-2 | 卸载可见内核模块；`/etc/modprobe.d/*.conf` 行级删除 | 智运 AI 内核模块清除（day5 同类） | `rmmod` 待决策；放行清单缺 modprobe.d |
+| P0-3 | 移除恶意 systemd unit（隔离 unit 文件、`daemon-reload`、复核、撤销） | “必须删除，禁用不给分” | 只有停止/禁用/屏蔽，core 无 `daemon-reload` |
+| P0-4 | 外连周期采样（短连接、SYN_SENT、进程归属、`/proc` 与 `ss` 差异） | 每 3 秒外联溯源真实控制端 IP | 连接表只有单次快照；周期判定只有离线 HTTP 与进程周期 |
+| P1-5 | SQLite 只读查看（远端 `sqlite3` 或 `python3` 只读模式） | 视频平台 `cam.db` 会话、账号、设备凭据 | 无 |
+| P1-6 | MySQL 按库/表权限查看与 REVOKE/GRANT 计划、`SHOW GRANTS` 复核 | OA 业务账号最小权限 | 只读 `mysql.user` 全局标志 |
+| P1-7 | Supervisor 程序列表、重启与 HTTP 健康复核；按原命令行重启识别 supervisord 托管 | OA 热部署 `supervisorctl restart oa` | 只有目录条目 `cat` 配置 |
+| P1-8 | Java 运行包整包替换（哈希绑定、备份、恢复） | OA `mvn package` 后替换 `oa.jar` | 只能替换单个 class |
+| P1-9 | Lighttpd 发现与只读配置风险 | 视频平台未授权访问、CGI 诊断接口 | 中间件不含 lighttpd |
+| P2 | 远端文件/目录与备份比对；AI 应用资产与投毒、明文密钥扫描；JSON 结构化写入 | 智运 AI 工具登记、知识库、记忆、提示词、调试开关 | 无比对；JSON 只读可视化 |
+| P3 | 源码风险线索（MyBatis `${}`、SpEL、JWT 未验签、CGI `system()` 拼接） | OA 越权/令牌/表达式注入，视频诊断命令注入 | 无 |
+| 离线 | Modbus/TCP 解析与写操作标注；TLS keylog/RSA/SM2 解密；Web 日志参数外带规则 | 工控 1、密码 1/2、AI 1 | `pcap_offline.rs` 只做 HTTP 与少量木马特征 |
+
+同批加入的两项体验改进：命令工作台结果直接显示实际运行的命令（原先藏在第四个标签里）；实时抓包结束后可导出为 pcap（原先只有另起一次的“抓包并保存”）。
+
+等保报告找错、Excel 口令、SMB 文件、AI2/AI3 组合优化与自定义 C2 协议不属于产品范围。
+
+### 实施进度（2026-11-15 起）
+
+- 本日范围：P0 与 P1 全部、两项体验改进；P2、P3 与离线分析项保留在本表待后续批次。
+
 ## 2026-11-13 day5 运维 writeup 对照与进程活动监视规划
 
 材料：`day5运维wp.pdf`（公网 Linux 主机被入侵后的加固与后门清理，8 个检查点；题目约束：不改 root 口令与公钥、不改 SSH/Web 端口、不用防火墙拦 SSH/Web、部分 Web 在 Docker 中、**配置文件里的持久化命令必须删除而不是注释**）。材料不入库。以下状态均为对照现有代码的结论，未在该题环境实测（NOT_RUN）。
