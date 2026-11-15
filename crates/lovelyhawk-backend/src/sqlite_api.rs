@@ -493,14 +493,13 @@ impl SqliteApi {
             expires_at: Instant::now() + PLAN_TTL,
         };
         let mut plans = self.plans.lock().map_err(|_| SqliteApiError::Opaque)?;
-        if plans.len() >= MAX_PLANS {
-            if let Some(oldest) = plans
+        if plans.len() >= MAX_PLANS
+            && let Some(oldest) = plans
                 .iter()
                 .min_by_key(|(_, plan)| plan.expires_at)
                 .map(|(handle, _)| handle.clone())
-            {
-                plans.remove(&oldest);
-            }
+        {
+            plans.remove(&oldest);
         }
         plans.insert(plan_id, stored);
         Ok(response)

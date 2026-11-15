@@ -446,7 +446,7 @@ fn bounded_text(text: &str) -> String {
 }
 
 fn hex_to_name(hex: &str) -> Option<String> {
-    if hex.len() % 2 != 0 || hex.len() > 2048 {
+    if !hex.len().is_multiple_of(2) || hex.len() > 2048 {
         return None;
     }
     let bytes: Option<Vec<u8>> = (0..hex.len() / 2)
@@ -583,15 +583,15 @@ pub fn parse_view_output(
                 });
             }
             "TCOUNT" => {
-                if let Some((hex, value)) = payload.split_once('=') {
-                    if let Some(name) = hex_to_name(hex) {
-                        let count = if value == "?" {
-                            None
-                        } else {
-                            value.parse::<u64>().ok()
-                        };
-                        counts.push((name, count));
-                    }
+                if let Some((hex, value)) = payload.split_once('=')
+                    && let Some(name) = hex_to_name(hex)
+                {
+                    let count = if value == "?" {
+                        None
+                    } else {
+                        value.parse::<u64>().ok()
+                    };
+                    counts.push((name, count));
                 }
             }
             "COL" => {
@@ -1402,12 +1402,10 @@ pub fn parse_delete_probe_output(
                 }
             }
             "MISSING" => {
-                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(payload) {
-                    if let Some(rid) =
-                        parsed.get("rowid").and_then(serde_json::Value::as_i64)
-                    {
-                        missing.push(rid);
-                    }
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(payload)
+                    && let Some(rid) = parsed.get("rowid").and_then(serde_json::Value::as_i64)
+                {
+                    missing.push(rid);
                 }
             }
             _ => {}
@@ -1455,22 +1453,22 @@ pub fn parse_delete_result_output(output: &str) -> SqliteDeleteStage {
                     other => SqliteDeleteStage::Failed(other.to_owned()),
                 };
             }
-        } else if tag == "LH-DONE" {
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(payload) {
-                let count = parsed
-                    .get("count")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0) as u32;
-                stage = match parsed
-                    .get("code")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default()
-                {
-                    "deleted" => SqliteDeleteStage::Deleted(count),
-                    "restored" => SqliteDeleteStage::Restored(count),
-                    other => SqliteDeleteStage::Failed(other.to_owned()),
-                };
-            }
+        } else if tag == "LH-DONE"
+            && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(payload)
+        {
+            let count = parsed
+                .get("count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as u32;
+            stage = match parsed
+                .get("code")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+            {
+                "deleted" => SqliteDeleteStage::Deleted(count),
+                "restored" => SqliteDeleteStage::Restored(count),
+                other => SqliteDeleteStage::Failed(other.to_owned()),
+            };
         }
     }
     stage

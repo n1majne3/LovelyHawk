@@ -67,6 +67,10 @@ const SCROLL_LISTS: Record<string, string> = {
   ".wir-setup-view": ".wir-setup-view > *",
   // Module chrome stays readable; the process module explicitly grows into the remaining space.
   ".wir-workspace": ".wir-workspace > *",
+  // The SQLite table list beside the grid, and the plan/receipt panel which
+  // scrolls when a row preview runs long.
+  ".sqlite-view-tables": ".sqlite-view-tables > *",
+  ".sqlite-view-mutation": ".sqlite-view-mutation > *",
 };
 
 function rule(css: string, selector: string): string {

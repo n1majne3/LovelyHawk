@@ -281,7 +281,7 @@ describe("sftp browser standalone contract", () => {
     expect(isSftpOperationUndoResult({ ...undone, path: "/etc/passwd" })).toBe(false);
   });
 
-  it("keeps the public surface at exactly twenty-eight finite methods", () => {
+  it("keeps the public surface at exactly thirty-four finite methods", () => {
     const source = readFileSync(new URL("./sftp-browser-contract.ts", import.meta.url), "utf8");
     const api = source.split("export interface SftpBrowserApi")[1]!.split("\n}")[0]!;
     expect([...api.matchAll(/^\s{2}([A-Za-z0-9]+)\(/gmu)].map((match) => match[1])).toEqual([
@@ -289,6 +289,9 @@ describe("sftp browser standalone contract", () => {
       "downloadSftpDirectory",
       "planSftpOperation", "confirmSftpOperation", "executeSftpOperation",
       "cancelSftpOperation", "undoSftpOperation",
+      "sqliteInspectSftp", "sqliteRowsSftp",
+      "sqliteDeletePlanSftp", "sqliteDeleteExecuteSftp", "sqliteDeleteUndoSftp",
+      "copySelection",
       "prepareSftpDirectoryUpload", "runSftpDirectoryUpload", "discardSftpDirectoryUpload",
       "cancelSftpTransfer",
       "queueSftpDownload", "queueSftpUpload", "pollSftpQueue", "cancelSftpQueue",

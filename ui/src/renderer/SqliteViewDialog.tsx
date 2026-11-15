@@ -201,7 +201,7 @@ export function SqliteViewDialog({ api, source, subject, copyText, onClose }: Sq
         </p>
         {inspect?.immutable === true || grid?.result.immutable === true ? (
           <p className="sqlite-view-note is-warning" data-testid="sqlite-immutable-note">
-            以不可变方式读取，可能看不到尚未合并到主文件的写入。
+            以只读快照方式读取，可能看不到尚未合并到主文件的写入。
           </p>
         ) : null}
 
@@ -299,7 +299,7 @@ export function SqliteViewDialog({ api, source, subject, copyText, onClose }: Sq
                     <p className="sqlite-view-note">删除行需要目标上有 python3；当前只读查看不受影响。</p>
                   ) : null}
                   {grid !== null && grid.result.immutable ? (
-                    <p className="sqlite-view-note">不可变读取下不提供删除行。</p>
+                    <p className="sqlite-view-note">只读快照下不提供删除行。</p>
                   ) : null}
                   {grid !== null && grid.result.engine === "python3" && rowidIndex < 0 ? (
                     <p className="sqlite-view-note">这个表没有可用的 rowid，不支持按行删除。</p>

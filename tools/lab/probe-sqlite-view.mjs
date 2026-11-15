@@ -319,6 +319,13 @@ try {
   check("the backup exists next to the database",
     onHostText("ls /srv/cam/.lovelyres-backups/ 2>/dev/null | grep -c 'cam.db'").trim() !== "0");
 
+  await waitFor(terminal,
+    `(() => {
+      const button = [...document.querySelectorAll('[data-testid="sqlite-delete-receipt"] button')]
+        .find((entry) => entry.textContent.includes('撤销删除'));
+      return Boolean(button) && !button.disabled;
+    })()`,
+    "the enabled undo button", 90);
   check("the undo restores the row", await terminal.evaluate(`(() => {
     const button = [...document.querySelectorAll('[data-testid="sqlite-delete-receipt"] button')]
       .find((entry) => entry.textContent.includes('撤销删除'));
