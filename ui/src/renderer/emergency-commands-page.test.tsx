@@ -677,7 +677,7 @@ describe("EmergencyCommandsPage", () => {
     expect(page).not.toContain(".emergency-path-");
   });
 
-  it("offers the escaped raw output and the executed command as their own tabs", () => {
+  it("offers the escaped raw output as its own tab and keeps the executed command visible up front", () => {
     const verbatim = {
       ...result,
       command: "docker exec -i c1 sh -c 'id\\r'",
@@ -687,9 +687,31 @@ describe("EmergencyCommandsPage", () => {
     };
     const html = renderToStaticMarkup(<EmergencyCommandResultView result={verbatim}
       writeClipboard={async () => undefined} />);
-    for (const label of ["全部输出", "关注与缺口", "原始输出", "执行的命令"]) {
+    for (const label of ["全部输出", "关注与缺口", "原始输出"]) {
       expect(html).toContain(`>${label}</button>`);
     }
+    expect(html).not.toContain(">执行的命令</button>");
+    // No click needed: the block names itself and carries the full command,
+    // folded to a few lines rather than hidden behind a tab.
+    expect(html).toContain("实际运行的命令");
+    expect(html).toContain("docker exec -i c1 sh -c");
+    expect(html).toContain("这是在目标上实际执行的完整命令");
+    expect(html).toContain('aria-expanded="false"');
+    expect(html).toContain(">展开</button>");
+    expect(html).toContain("is-collapsed");
+    const expanded = renderToStaticMarkup(<EmergencyCommandVerbatim
+      text={verbatim.command} collapsible defaultExpanded
+      writeClipboard={async () => undefined}
+      note="这是在目标上实际执行的完整命令（含容器包装和工具检查前置）"
+      truncatedNote="命令超过 128 KiB，只显示前 128 KiB" />);
+    expect(expanded).toContain('aria-expanded="true"');
+    expect(expanded).toContain(">收起</button>");
+    expect(expanded).not.toContain("is-collapsed");
+    // The always-visible copy keeps the clipboard ceiling.
+    const hugeCommand = renderToStaticMarkup(<EmergencyCommandResultView
+      result={{ ...verbatim, command: "x".repeat(128 * 1_024 + 1) }}
+      writeClipboard={async () => undefined} />);
+    expect(hugeCommand).toContain("内容超过 128 KiB，无法复制");
     // The tab content itself: what the target sent stays text — markup
     // escapes and ANSI draws as \x1b.
     const command = renderToStaticMarkup(<EmergencyCommandVerbatim

@@ -836,7 +836,7 @@ export function EmergencyCommandGroupView({ run, commands, onStop, onPathMenu, o
   );
 }
 
-type ResultViewTab = "all" | "findings" | "raw" | "command";
+type ResultViewTab = "all" | "findings" | "raw";
 
 /** The clipboard bridge refuses anything over this, so longer text hides the button instead. */
 const CLIPBOARD_LIMIT_BYTES = 128 * 1_024;
@@ -903,13 +903,18 @@ export function EmergencyCommandResultView({ result, elapsedMs = null, onPathMen
       {result.findingLines.length > 0 && result.findingReason !== null &&
         <p className="emergency-command-reason">{result.findingReason}</p>}
       {result.truncated && <p className="emergency-command-warning" role="status">输出已按行数或大小上限截断。</p>}
+      <section className="emergency-command-actual" aria-label="实际运行的命令">
+        <h3 className="emergency-command-actual-title">实际运行的命令</h3>
+        <EmergencyCommandVerbatim text={result.command} writeClipboard={writeClipboard} collapsible
+          note="这是在目标上实际执行的完整命令（含容器包装和工具检查前置）"
+          truncated={result.commandTruncated} truncatedNote="命令超过 128 KiB，只显示前 128 KiB" />
+      </section>
       <div className="emergency-command-result-tools">
         <div className="view-tabs view-tabs-underline" role="group" aria-label="结果显示范围">
           <button type="button" aria-pressed={tab === "all"} onClick={() => setTab("all")}>全部输出</button>
           <button type="button" aria-pressed={tab === "findings"} disabled={!hasFindings}
             onClick={() => setTab("findings")}>关注与缺口</button>
           <button type="button" aria-pressed={tab === "raw"} onClick={() => setTab("raw")}>原始输出</button>
-          <button type="button" aria-pressed={tab === "command"} onClick={() => setTab("command")}>执行的命令</button>
         </div>
         <span>{tab === "findings" ? "保留原始行号，完整上下文见全部输出" :
           tab === "all" ? "标记用于辅助核查，不代表入侵结论" : null}</span>
@@ -917,9 +922,6 @@ export function EmergencyCommandResultView({ result, elapsedMs = null, onPathMen
       {tab === "raw" ? <EmergencyCommandVerbatim text={result.rawOutput} writeClipboard={writeClipboard}
         note="目标返回的标准输出，标准错误附在其后（不是按时间交错）；不可见控制字符显示为 \xNN，非 UTF-8 字节显示为 �"
         truncated={result.rawOutputTruncated} truncatedNote="原始输出超过 1 MiB，只显示前 1 MiB" /> :
-        tab === "command" ? <EmergencyCommandVerbatim text={result.command} writeClipboard={writeClipboard}
-          note="这是在目标上实际执行的完整命令（含容器包装和工具检查前置）"
-          truncated={result.commandTruncated} truncatedNote="命令超过 128 KiB，只显示前 128 KiB" /> :
         result.output.length === 0 ? <EmergencyCommandEmpty title="命令没有输出"
           detail="没有可显示的内容；请结合执行状态、权限和工具情况判断，不能据此确认没有风险。" compact /> :
           <EmergencyCommandOutput output={result.output} findingLines={result.findingLines}
@@ -995,27 +997,33 @@ export function EmergencyCommandOutput({ output, findingLines = [], paths = [], 
  * The 复制 button needs the clipboard bridge and is refused once the text is
  * longer than the bridge accepts.
  */
-export function EmergencyCommandVerbatim({ text, note, truncated = false, truncatedNote, writeClipboard }: {
+export function EmergencyCommandVerbatim({ text, note, truncated = false, truncatedNote, writeClipboard, collapsible = false, defaultExpanded = false }: {
   text: string;
   note: string;
   truncated?: boolean;
   truncatedNote: string;
   writeClipboard?: ((text: string) => Promise<void>) | undefined;
+  /** Fold the console to a few lines until the operator expands it. */
+  collapsible?: boolean;
+  defaultExpanded?: boolean;
 }) {
   const [copied, setCopied] = useState<null | "ok" | "error">(null);
+  const [expanded, setExpanded] = useState(defaultExpanded);
   const tooLong = new TextEncoder().encode(text).byteLength > CLIPBOARD_LIMIT_BYTES;
   return (
     <div className="emergency-command-verbatim">
       <div className="emergency-command-verbatim-tools">
         <p>{note}</p>
         {truncated && <p className="emergency-command-warning" role="status">{truncatedNote}</p>}
+        {collapsible && <button type="button" aria-expanded={expanded}
+          onClick={() => setExpanded((value) => !value)}>{expanded ? "收起" : "展开"}</button>}
         {writeClipboard !== undefined && <button type="button" disabled={tooLong}
           title={tooLong ? "内容超过 128 KiB，无法复制" : undefined}
           onClick={() => void writeClipboard(text).then(() => setCopied("ok"), () => setCopied("error"))}>复制</button>}
         {copied === "ok" && <span role="status">已复制</span>}
         {copied === "error" && <span role="alert">复制失败</span>}
       </div>
-      <div className="emergency-command-output emergency-command-verbatim-scroll">
+      <div className={`emergency-command-output emergency-command-verbatim-scroll${collapsible && !expanded ? " is-collapsed" : ""}`}>
         <pre>{text}</pre>
       </div>
     </div>

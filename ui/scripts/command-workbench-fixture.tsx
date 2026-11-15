@@ -47,7 +47,8 @@ export function mount() {
         resultKind: captured.empty ? "empty" : observed?.status === 0 ? "success" : "non-zero", exitCode: observed?.status ?? (captured.empty ? 0 : 1),
         output, observedLineCount: lines.length, displayedLineCount: lines.length,
         findingLines: lines.flatMap((line, index) => line.startsWith("关注：") ? [index] : []), findingReason: captured.empty ? null : "标记的是检查线索，需核对来源与用途，不能据此直接删除或结束进程。",
-        truncated: false, paths: [] };
+        truncated: false, command: `fixture wrapper for ${command}`, commandTruncated: false,
+        rawOutput: output, rawOutputTruncated: false, paths: [] };
       if (captured.delay) await new Promise<void>(resolve => pending.push(resolve));
       if (captured.fail) throw new Error("fixture read failed");
       return result;
