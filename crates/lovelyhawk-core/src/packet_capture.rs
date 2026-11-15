@@ -1396,9 +1396,9 @@ command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1 || {{ echo 'capt
 pcap_runner='sudo -n tcpdump'; fi; \
 pcap_fifo={fifo}; rm -f -- \"$pcap_fifo\" 2>/dev/null; mkfifo \"$pcap_fifo\" || {{ echo 'mkfifo unavailable' >&2; exit 1; }}; \
 $pcap_runner -nn -U -i {interface}{count_arg} -w -{filter_arg} 2>&1 >\"$pcap_fifo\" & pcap_pid=$!; \
-tee {remote} <\"$pcap_fifo\" | tcpdump -nn -l -tttt -r - 2>&1 & pcap_reader=$!; \
+( trap '' HUP INT TERM; tee {remote} <\"$pcap_fifo\" | tcpdump -nn -l -tttt -r - 2>&1 ) & pcap_reader=$!; \
 ( trap 'kill \"$pcap_sleep\" 2>/dev/null; exit 0' TERM; sleep {duration} & pcap_sleep=$!; wait \"$pcap_sleep\" && kill -TERM \"$pcap_pid\" 2>/dev/null ) & pcap_timer=$!; \
-trap 'kill -TERM \"$pcap_pid\" \"$pcap_timer\" 2>/dev/null; rm -f -- \"$pcap_fifo\"; exit 129' HUP INT TERM; \
+trap 'kill -TERM \"$pcap_pid\" \"$pcap_timer\" 2>/dev/null; wait \"$pcap_pid\" 2>/dev/null; wait \"$pcap_reader\" 2>/dev/null; rm -f -- \"$pcap_fifo\"; exit 129' HUP INT TERM; \
 wait \"$pcap_pid\"; pcap_rc=$?; kill -TERM \"$pcap_timer\" 2>/dev/null; wait \"$pcap_reader\" 2>/dev/null; rm -f -- \"$pcap_fifo\"; exit \"$pcap_rc\"",
         duration = request.duration_seconds,
         interface = shq(&request.interface),
@@ -1769,15 +1769,18 @@ mod tests {
         assert!(command.contains("-nn -U -i 'eth0' -c 500 -w - 'tcp port 443; id' 2>&1 >\"$pcap_fifo\""));
         assert!(command.contains(&format!("pcap_fifo='{fifo_path}'")));
         assert!(command.contains("& pcap_pid=$!;"));
-        // Reader: tee writes the managed file, tcpdump decodes it line by line.
+        // Reader: tee writes the managed file, tcpdump decodes it line by
+        // line. The pair ignores the hangup so the stop path drains the fifo
+        // instead of losing the trailing bytes and lines.
         assert!(command.contains(&format!(
-            "tee '{remote_path}' <\"$pcap_fifo\" | tcpdump -nn -l -tttt -r - 2>&1 & pcap_reader=$!;"
+            "( trap '' HUP INT TERM; tee '{remote_path}' <\"$pcap_fifo\" | tcpdump -nn -l -tttt -r - 2>&1 ) & pcap_reader=$!;"
         )));
-        // Same timer, same trap on the writer, fifo removed both ways out.
+        // Same timer; the trap stops the writer, waits out the reader so the
+        // last packets land, and removes the fifo last on every way out.
         assert!(command.contains("sleep 15 & pcap_sleep=$!;"));
         assert!(command.contains("wait \"$pcap_sleep\" && kill -TERM \"$pcap_pid\""));
         assert!(command.contains(
-            "trap 'kill -TERM \"$pcap_pid\" \"$pcap_timer\" 2>/dev/null; rm -f -- \"$pcap_fifo\"; exit 129' HUP INT TERM;"
+            "trap 'kill -TERM \"$pcap_pid\" \"$pcap_timer\" 2>/dev/null; wait \"$pcap_pid\" 2>/dev/null; wait \"$pcap_reader\" 2>/dev/null; rm -f -- \"$pcap_fifo\"; exit 129' HUP INT TERM;"
         ));
         assert!(command.ends_with(
             "wait \"$pcap_pid\"; pcap_rc=$?; kill -TERM \"$pcap_timer\" 2>/dev/null; wait \"$pcap_reader\" 2>/dev/null; rm -f -- \"$pcap_fifo\"; exit \"$pcap_rc\""

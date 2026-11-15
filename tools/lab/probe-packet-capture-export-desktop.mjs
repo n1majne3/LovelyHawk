@@ -67,6 +67,24 @@ const status = () => evaluate("document.querySelector('.packet-capture-status')?
 const managedFiles = () => onHost("ls /tmp/lovelyres-pcap-* 2>/dev/null | wc -l");
 const navigate = (title) => evaluate(`[...document.querySelectorAll('.nav-item')].find((item) => item.textContent.includes(${JSON.stringify(title)}))?.click(), true`);
 
+// Counts records in a pcap without tcpdump: 24-byte global header, then
+// 16-byte record headers each carrying the captured length at offset 8.
+function pcapPacketCount(file) {
+  const bytes = fs.readFileSync(file);
+  if (bytes.length < 24) return -1;
+  const magic = bytes.readUInt32LE(0);
+  const little = magic === 0xa1b2c3d4 || magic === 0xa1b23c4d;
+  if (!little && magic !== 0xd4c3b2a1 && magic !== 0x4d3cb2a1) return -1;
+  let offset = 24, count = 0;
+  while (offset + 16 <= bytes.length) {
+    const included = little ? bytes.readUInt32LE(offset + 8) : bytes.readUInt32BE(offset + 8);
+    if (offset + 16 + included > bytes.length) break;
+    offset += 16 + included;
+    count += 1;
+  }
+  return count;
+}
+
 async function runCaptureExport(label) {
   await uiWait("[...document.querySelectorAll('.packet-capture-interface-list button')].some((b) => b.textContent.includes('eth0'))", `${label}: interfaces`);
   await clickInterface();
@@ -85,6 +103,8 @@ async function runCaptureExport(label) {
   await sleep(4_000);
   check(`${label}: stop ends the capture`, await clickButton("停止抓包", ".packet-capture-actions button"));
   await until(async () => (await status()).includes("已停止"), `${label}: capture stopped`);
+  const shown = Number(await evaluate("document.querySelectorAll('.packet-capture-table button[role=\"row\"]').length"));
+  check(`${label}: decoded packet lines were shown`, shown > 0, `${shown} packets`);
   check(`${label}: raw file waits on the target`, managedFiles() === "1");
   check(`${label}: export and discard are offered`,
     await evaluate("[...document.querySelectorAll('.packet-capture-raw-actions button')].map((b) => b.textContent.trim()).join(',') === '导出为 pcap…,丢弃原始包'"));
@@ -105,6 +125,13 @@ async function runCaptureExport(label) {
   const localSha = fs.existsSync(pcapFile)
     ? createHash("sha256").update(fs.readFileSync(pcapFile)).digest("hex") : "";
   check(`${label}: shown SHA-256 is the local capture.pcap's`, shownSha.length === 64 && localSha === shownSha, `${shownSha} vs ${localSha}`);
+  const records = fs.existsSync(pcapFile) ? pcapPacketCount(pcapFile) : -1;
+  check(`${label}: exported pcap covers the shown packets`, records >= shown && shown > 0,
+    `${records} records vs ${shown} shown`);
+  const manifestFile = path.join(exportDir, folderName, "manifest.json");
+  const manifest = fs.existsSync(manifestFile) ? JSON.parse(fs.readFileSync(manifestFile, "utf8")) : {};
+  check(`${label}: manifest records the same hash and the live origin`,
+    manifest.capture?.target_sha256 === localSha && manifest.capture?.live_capture === true);
   await app.session.shot(`${label}-exported.png`);
   return { shownSha, folderName };
 }
