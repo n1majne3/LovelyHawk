@@ -17,6 +17,8 @@ export type JavaHotUpdateRequest =
   /** A JAR the scan did not list, typed by the operator; only read, like a listed one. */
   | { action: "inspect-path"; bindingHandle: string; snapshotHandle: string; path: string }
   | { action: "plan"; bindingHandle: string; snapshotHandle: string; jarHandle: string; entry: string; stagedHandle: string }
+  /** Replace the whole JAR with a `.jar` already on the target, typed by the operator. */
+  | { action: "plan-replace"; bindingHandle: string; snapshotHandle: string; jarHandle: string; sourcePath: string }
   | { action: "history"; bindingHandle: string }
   | { action: "plan-restore"; bindingHandle: string; recordId: string }
   | { action: "confirm" | "execute" | "cancel"; bindingHandle: string; planHandle: string }
@@ -73,7 +75,7 @@ export interface JavaJar {
 export interface JavaPlan {
   kind: "plan";
   planHandle: string;
-  operation: "update" | "restore";
+  operation: "update" | "replace" | "restore";
   summary: string;
   jarPath: string;
   entry: string;
@@ -86,7 +88,7 @@ export interface JavaPlan {
 export interface JavaReceipt {
   kind: "receipt";
   planHandle: string;
-  operation: "update" | "restore";
+  operation: "update" | "replace" | "restore";
   verified: boolean;
   recordId: string | null;
   jarPath: string;
@@ -99,6 +101,8 @@ export interface JavaRecord {
   recordId: string;
   jarPath: string;
   entry: string;
+  /** `jar` is a whole-JAR replacement; `entry` is then a placeholder, not a real class. */
+  kind: "class" | "jar";
   state: "applied" | "restored";
   beforeJarSha256: string;
   appliedJarSha256: string;
@@ -197,6 +201,7 @@ const REQUEST_FIELDS: Record<JavaHotUpdateRequest["action"], readonly string[]> 
   inspect: ["snapshotHandle", "jarHandle"],
   "inspect-path": ["snapshotHandle", "path"],
   plan: ["snapshotHandle", "jarHandle", "entry", "stagedHandle"],
+  "plan-replace": ["snapshotHandle", "jarHandle", "sourcePath"],
   history: [],
   "plan-restore": ["recordId"],
   confirm: ["planHandle"],
@@ -210,7 +215,7 @@ export function isJavaHotUpdateRequest(value: unknown): value is JavaHotUpdateRe
   const extra = REQUEST_FIELDS[value.action as JavaHotUpdateRequest["action"]];
   return keys(value, ["action", "bindingHandle", ...extra]) && isJavaHandle(value.bindingHandle) &&
     extra.every((name) => name === "entry" ? isJavaClassEntry(value[name])
-      : name === "path" ? isTypedJarPath(value[name]) : isJavaHandle(value[name]));
+      : name === "path" || name === "sourcePath" ? isTypedJarPath(value[name]) : isJavaHandle(value[name]));
 }
 
 function process(value: unknown): value is JavaProcess {
@@ -253,23 +258,25 @@ function jar(value: JsonRecord): value is JsonRecord & JavaJar {
 
 function plan(value: JsonRecord): value is JsonRecord & JavaPlan {
   return keys(value, ["kind", "planHandle", "operation", "summary", "jarPath", "entry", "classSha256", "restoreDescription", "confirmed", "expiresInSeconds"]) &&
-    isJavaHandle(value.planHandle) && (value.operation === "update" || value.operation === "restore") &&
-    text(value.summary, 2_048) && jarPath(value.jarPath) && isJavaClassEntry(value.entry) && sha(value.classSha256) &&
+    isJavaHandle(value.planHandle) && (value.operation === "update" || value.operation === "replace" || value.operation === "restore") &&
+    text(value.summary, 2_048) && jarPath(value.jarPath) &&
+    (value.operation === "replace" ? text(value.entry, 1_024) : isJavaClassEntry(value.entry)) && sha(value.classSha256) &&
     (value.restoreDescription === null || text(value.restoreDescription, 2_048)) && typeof value.confirmed === "boolean" &&
     integer(value.expiresInSeconds, 0, 3_600);
 }
 
 function receipt(value: JsonRecord): value is JsonRecord & JavaReceipt {
   return keys(value, ["kind", "planHandle", "operation", "verified", "recordId", "jarPath", "entry", "jarSha256", "detail"]) &&
-    isJavaHandle(value.planHandle) && (value.operation === "update" || value.operation === "restore") &&
+    isJavaHandle(value.planHandle) && (value.operation === "update" || value.operation === "replace" || value.operation === "restore") &&
     typeof value.verified === "boolean" && (value.recordId === null || isJavaHandle(value.recordId)) &&
-    jarPath(value.jarPath) && isJavaClassEntry(value.entry) && (value.jarSha256 === null || sha(value.jarSha256)) &&
+    jarPath(value.jarPath) && text(value.entry, 1_024) && (value.jarSha256 === null || sha(value.jarSha256)) &&
     text(value.detail, 2_048) && (value.verified ? value.recordId !== null && value.jarSha256 !== null : true);
 }
 
 function javaRecord(value: unknown): value is JavaRecord {
-  return record(value) && keys(value, ["recordId", "jarPath", "entry", "state", "beforeJarSha256", "appliedJarSha256", "classSha256", "createdAt", "updatedAt"]) &&
-    isJavaHandle(value.recordId) && jarPath(value.jarPath) && isJavaClassEntry(value.entry) &&
+  return record(value) && keys(value, ["recordId", "jarPath", "entry", "kind", "state", "beforeJarSha256", "appliedJarSha256", "classSha256", "createdAt", "updatedAt"]) &&
+    isJavaHandle(value.recordId) && jarPath(value.jarPath) && (value.kind === "class" || value.kind === "jar") &&
+    (value.kind === "jar" ? text(value.entry, 1_024) : isJavaClassEntry(value.entry)) &&
     (value.state === "applied" || value.state === "restored") && sha(value.beforeJarSha256) && sha(value.appliedJarSha256) &&
     sha(value.classSha256) && text(value.createdAt, 64) && text(value.updatedAt, 64);
 }
@@ -296,6 +303,7 @@ export function matchesJavaHotUpdateResponse(request: JavaHotUpdateRequest, valu
     case "inspect": return value.kind === "jar" && value.jarHandle === request.jarHandle;
     case "inspect-path": return value.kind === "jar" && value.path === request.path;
     case "plan": return value.kind === "plan" && value.operation === "update" && !value.confirmed && value.entry === request.entry;
+    case "plan-replace": return value.kind === "plan" && value.operation === "replace" && !value.confirmed;
     case "plan-restore": return value.kind === "plan" && value.operation === "restore" && !value.confirmed;
     case "confirm": return value.kind === "plan" && value.confirmed && value.planHandle === request.planHandle;
     case "execute": return value.kind === "receipt" && value.planHandle === request.planHandle;

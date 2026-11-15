@@ -52,6 +52,7 @@ export function JavaHotUpdatePage({ bindingHandle, api }: JavaHotUpdatePageProps
   // Shows only the JARs of one process; null shows every process's.
   const [jarProcess, setJarProcess] = useState<number | null>(null);
   const [typedPath, setTypedPath] = useState("");
+  const [replaceSource, setReplaceSource] = useState("");
   const [typedError, setTypedError] = useState<string | null>(null);
   const [filter, setFilter] = useState("");
   const [entry, setEntry] = useState<string | null>(null);
@@ -214,6 +215,20 @@ export function JavaHotUpdatePage({ bindingHandle, api }: JavaHotUpdatePageProps
     }, "没能生成替换计划。");
   }
 
+  function makeReplacePlan() {
+    if (scan === null || jar === null || !isTypedJarPath(replaceSource)) return;
+    const request = {
+      snapshotHandle: scan.snapshotHandle,
+      jarHandle: jar.jarHandle,
+      sourcePath: replaceSource,
+    };
+    void guarded("plan", async (binding) => {
+      const plan = await send<JavaPlan>({ action: "plan-replace", bindingHandle: binding, ...request });
+      if (plan === null) return;
+      setDialog({ plan, receipt: null, running: false, error: null });
+    }, "没能生成整体替换计划。");
+  }
+
   function planRestore(record: JavaRecord) {
     void guarded("plan", async (binding) => {
       const plan = await send<JavaPlan>({ action: "plan-restore", bindingHandle: binding, recordId: record.recordId });
@@ -255,7 +270,7 @@ export function JavaHotUpdatePage({ bindingHandle, api }: JavaHotUpdatePageProps
     if (receipt === null && bindingHandle !== null) {
       // Declined: the plan is dropped so it can never run later.
       void send({ action: "cancel", bindingHandle, planHandle: plan.planHandle }).catch(() => undefined);
-      setNotice(plan.operation === "update" ? "已取消，JAR 没有被改动。" : "已取消恢复，JAR 保持现状。");
+      setNotice(plan.operation === "update" || plan.operation === "replace" ? "已取消，JAR 没有被改动。" : "已取消恢复，JAR 保持现状。");
       return;
     }
     // After a change the JAR is opened again so its hash on screen is the current one.
@@ -446,6 +461,15 @@ export function JavaHotUpdatePage({ bindingHandle, api }: JavaHotUpdatePageProps
                 <button type="button" className="is-primary" data-testid="java-plan" disabled={busy !== null || entry === null || staged === null}
                   onClick={makePlan}>{busy === "plan" ? "正在读取 JAR 现状…" : "生成替换计划"}</button>
               </div>
+              <div className="java-actions">
+                <label htmlFor="java-replace-source">整体替换为目标上的 JAR（绝对路径）</label>
+                <input id="java-replace-source" data-testid="java-replace-source" type="text" value={replaceSource}
+                  placeholder="/opt/app/oa-new.jar" spellCheck={false} autoComplete="off"
+                  onChange={(event) => setReplaceSource(event.target.value)} disabled={busy !== null} />
+                <button type="button" data-testid="java-replace-plan" disabled={busy !== null || !isTypedJarPath(replaceSource)}
+                  onClick={makeReplacePlan}>生成整体替换计划</button>
+              </div>
+              <p className="java-note">整体替换把整个 JAR 换成上面这个文件：执行前会核对两边 SHA-256 不同才继续，备份原 JAR 后原子换入，并保持原属主与权限；JVM 重启后才生效。</p>
             </section>
           )}
         </>
@@ -460,9 +484,9 @@ export function JavaHotUpdatePage({ bindingHandle, api }: JavaHotUpdatePageProps
             {history.records.map((record) => (
               <li key={record.recordId} data-record-id={record.recordId}>
                 <div>
-                  <strong>{record.entry}</strong>
+                  <strong>{record.kind === "jar" ? "（整个 JAR）" : record.entry}</strong>
                   <span className={record.state === "applied" ? "java-state is-applied" : "java-state is-restored"}>
-                    {record.state === "applied" ? "已替换" : "已恢复原 JAR"}</span>
+                    {record.state === "applied" ? (record.kind === "jar" ? "已整体替换" : "已替换") : "已恢复原 JAR"}</span>
                 </div>
                 <p>{record.jarPath}</p>
                 <small>替换于 {timeLabel(record.createdAt)}{record.updatedAt !== record.createdAt ? ` · 更新于 ${timeLabel(record.updatedAt)}` : ""}</small>
@@ -496,7 +520,7 @@ export function JavaPlanDialog({ state, onConfirm, onClose }: {
   const cancelRef = useRef<HTMLButtonElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
   const { plan, receipt, running, error } = state;
-  const update = plan.operation === "update";
+  const update = plan.operation === "update" || plan.operation === "replace";
   useEffect(() => {
     (receipt === null ? cancelRef.current : closeRef.current)?.focus();
   }, [receipt]);

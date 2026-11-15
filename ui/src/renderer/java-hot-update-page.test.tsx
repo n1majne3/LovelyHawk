@@ -84,13 +84,15 @@ describe("Java hot update page", () => {
   it("never takes a command or a local file from the page, and a typed JAR path only for reading", () => {
     const source = readFileSync(new URL("./JavaHotUpdatePage.tsx", import.meta.url), "utf8");
     expect(source).not.toMatch(/\b(?:localPath|jarPath|command|path)\s*:/u);
-    // Two inputs filter what the scan and the opened JAR listed; the third is a JAR path to read.
-    expect(source.match(/<input/gu)).toHaveLength(3);
+    // Two inputs filter what the scan and the opened JAR listed; the third is a JAR path to read, the fourth a JAR path to replace from.
+    expect(source.match(/<input/gu)).toHaveLength(4);
     expect(source).toContain('<input type="search" value={jarFilter}');
     expect(source).toContain('<input type="search" value={filter}');
     expect(source).toContain('<input type="text" value={typedPath}');
     expect(source).toContain('{ action: "inspect-path", bindingHandle: binding, snapshotHandle, path }');
     expect(source).toContain("if (scan === null || !isTypedJarPath(typedPath)) return;");
+    expect(source).toContain("if (scan === null || jar === null || !isTypedJarPath(replaceSource)) return;");
+    expect(source).toContain('{ action: "plan-replace", bindingHandle: binding, ...request }');
     expect(source.match(/action: "inspect-path"/gu)).toHaveLength(1);
     expect(source).toContain("onClick={() => openJar(offer.jarHandle)}");
     expect(source).toContain("api.stageJavaClass(binding)");

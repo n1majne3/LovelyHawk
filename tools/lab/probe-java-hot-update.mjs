@@ -15,7 +15,8 @@
 //
 //   node tools/lab/probe-java-hot-update.mjs
 
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
+import net from "node:net";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -38,6 +39,7 @@ let failures = 0;
 let containerId = null;
 let imageId = null;
 let app = null;
+let forwarder = null;
 fs.mkdirSync(evidence, { recursive: true });
 
 function check(label, ok, detail = null) {
@@ -45,13 +47,13 @@ function check(label, ok, detail = null) {
   if (!ok) failures += 1;
   console.log(`${ok ? "PASS" : "FAIL"} ${label}${ok || detail === null ? "" : ` — ${JSON.stringify(detail).slice(0, 300)}`}`);
 }
-const wsl = (...args) => execFileSync("wsl.exe", ["-d", "Ubuntu", "-u", "root", "--", ...args],
-  { encoding: "utf8", windowsHide: true, timeout: 120_000, maxBuffer: 4 * 1024 * 1024 }).trim();
-const docker = (...args) => wsl("docker", ...args);
+const podman = (...args) => execFileSync("podman.exe", args,
+  { encoding: "utf8", windowsHide: true, timeout: 300_000, maxBuffer: 4 * 1024 * 1024 }).trim();
+const docker = podman;
 /** The container must still be the one this run made, with the limits it was made with. */
 function owned() {
   const target = JSON.parse(docker("inspect", containerId))[0];
-  if (target.Id !== containerId || target.Image !== imageId || target.Name !== `/${name}` ||
+  if (target.Id !== containerId || target.Image !== imageId || target.Name.replace(/^\//u, "") !== name ||
     target.Config.Labels?.["lovelyres-test-run"] !== runId || target.HostConfig.Privileged ||
     target.HostConfig.Memory !== 512 * 1024 * 1024 || target.HostConfig.PidsLimit !== 256) {
     throw new Error("The Java fixture's identity or limits changed");
@@ -61,7 +63,7 @@ function owned() {
 const onHost = (script) => { owned(); return docker("exec", containerId, "sh", "-c", script); };
 function script(input) {
   owned();
-  return execFileSync("wsl.exe", ["-d", "Ubuntu", "-u", "root", "--", "docker", "exec", "-i", containerId, "sh", "-se"],
+  return execFileSync("podman.exe", ["exec", "-i", containerId, "sh", "-se"],
     { input, encoding: "utf8", windowsHide: true, timeout: 120_000 }).trim();
 }
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -92,12 +94,27 @@ const setInput = (selector, value) => `(() => {
 try {
   // 1. The fixture.
   imageId = docker("image", "inspect", "lovelyres-svc:tomcat", "--format", "{{.Id}}");
-  const host = wsl("hostname", "-I").split(/\s+/u).find((ip) => /^172\.(1[6-9]|2\d|3[01])\.\d+\.\d+$/u.test(ip));
-  if (!host) throw new Error("Missing private WSL address");
+  const host = "127.0.0.1";
   containerId = docker("run", "-d", "--name", name, "--label", `lovelyres-test-run=${runId}`, "--memory", "512m",
-    "--cpus", "1", "--pids-limit", "256", "-p", `${host}::22`, imageId);
+    "--cpus", "1", "--pids-limit", "256", imageId);
   owned();
-  const sshPort = Number(owned().NetworkSettings.Ports["22/tcp"][0].HostPort);
+  // Published ports stay inside the podman machine; an SSH tunnel through it
+  // brings the container's sshd to a Windows loopback port for the sidecar.
+  const forwardTarget = owned().NetworkSettings.IPAddress + ":22";
+  const machine = JSON.parse(execFileSync("podman.exe", ["machine", "inspect"], { encoding: "utf8", windowsHide: true }))[0];
+  const findKey = (node, key) => {
+    if (!node || typeof node !== "object") return undefined;
+    if (node[key] !== undefined) return node[key];
+    for (const value of Object.values(node)) { const found = findKey(value, key); if (found !== undefined) return found; }
+    return undefined;
+  };
+  const sshPort = await new Promise(resolve => {
+    const server = net.createServer().listen(0, "127.0.0.1", () => { const port = server.address().port; server.close(() => resolve(port)); });
+  });
+  forwarder = spawn("ssh", ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=NUL", "-i", findKey(machine, "IdentityPath"), "-p", String(findKey(machine, "Port")), "-N",
+    "-L", `127.0.0.1:${sshPort}:${forwardTarget}`, "root@127.0.0.1"], { windowsHide: true, stdio: "ignore" });
+  await sleep(1500);
+  if (forwarder.exitCode !== null) throw new Error("podman machine SSH port forward failed");
   for (const version of ["v1", "v2"]) {
     script(`mkdir -p ${root}/${version}/src/lh/probe ${root}/${version}/out
 cat > ${root}/${version}/src/lh/probe/Probe.java <<'EOF'
@@ -130,7 +147,7 @@ nohup java -cp '${root}/lib/*' lh.probe.Probe > ${root}/wild.log 2>&1 &
   const originalJar = jarSha();
   const v1Class = classShaInJar();
   // The replacement, copied out to this machine as the operator would have it.
-  const v2Bytes = execFileSync("wsl.exe", ["-d", "Ubuntu", "-u", "root", "--", "docker", "exec", containerId, "cat",
+  const v2Bytes = execFileSync("podman.exe", ["exec", containerId, "cat",
     `${root}/v2/out/${entry}`], { windowsHide: true, maxBuffer: 1024 * 1024 });
   const localClass = path.join(evidence, "replacement", "Probe.class");
   fs.mkdirSync(path.dirname(localClass), { recursive: true });
@@ -186,8 +203,8 @@ su ops -s /bin/sh -c 'cd /home/ops/app && nohup ${javaBinary} -cp /home/ops/app/
     await uiWait("document.querySelector('[data-testid=\"java-scan\"]') !== null", "the Java page");
   }
   await openAs("root");
-  check("the page opens on a read-only scan and says it does not restart anything",
-    await evaluate("document.querySelector('.java-hot-update-page')?.textContent.includes('不会重启进程') === true && document.querySelector('.placeholder-page') === null"));
+  check("the page opens on a read-only scan and says the JVM keeps running the old classes",
+    await evaluate("document.querySelector('.java-hot-update-page')?.textContent.includes('需重启后生效') === true && document.querySelector('.placeholder-page') === null"));
 
   // 3. Scan and open the JAR.
   await evaluate("document.querySelector('[data-testid=\"java-scan\"]').click(), true");
@@ -254,7 +271,10 @@ su ops -s /bin/sh -c 'cd /home/ops/app && nohup ${javaBinary} -cp /home/ops/app/
   check("making the plan changed nothing on the host", jarSha() === originalJar);
   await page.shot("java-plan.png");
   await evaluate("document.querySelector('[data-testid=\"java-plan-cancel\"]').click(), true");
-  await uiWait("document.querySelector('.java-notice')?.textContent === '已取消，JAR 没有被改动。'", "the declined plan");
+  // Info notices go to the notification center, not the page body.
+  await evaluate("document.querySelector('[data-testid=\"open-notifications\"]').click(), true");
+  await uiWait("[...document.querySelectorAll('.notification-card p')].some((item) => item.textContent === '已取消，JAR 没有被改动。')", "the declined plan notice");
+  await evaluate("document.querySelector('[aria-label=关闭通知中心]').click(), true");
   check("declining the plan leaves the JAR exactly as it was", jarSha() === originalJar && classShaInJar() === v1Class);
 
   // 5. Replace.
@@ -281,7 +301,8 @@ su ops -s /bin/sh -c 'cd /home/ops/app && nohup ${javaBinary} -cp /home/ops/app/
 
   // 6. Restore from the record.
   await uiWait("[...document.querySelectorAll('.java-records li')].some((item) => item.textContent.includes('已替换'))", "the record");
-  await evaluate("[...document.querySelectorAll('.java-records button')].find((button) => button.textContent.trim() === '恢复原 JAR').click(), true");
+  await uiWait("[...document.querySelectorAll('.java-records button')].some((button) => button.textContent.trim() === '恢复原 JAR' && !button.disabled)", "the enabled restore button", 120_000);
+  await evaluate("[...document.querySelectorAll('.java-records button')].find((button) => button.textContent.trim() === '恢复原 JAR' && !button.disabled).click(), true");
   await uiWait("document.querySelector('[data-testid=\"java-plan-execute\"]')?.textContent.trim() === '确认恢复'", "the restore plan", 120_000);
   await evaluate("document.querySelector('[data-testid=\"java-plan-execute\"]').click(), true");
   await uiWait("document.querySelector('[data-testid=\"java-receipt\"]') !== null", "the restore receipt", 300_000);
@@ -293,6 +314,37 @@ su ops -s /bin/sh -c 'cd /home/ops/app && nohup ${javaBinary} -cp /home/ops/app/
   check("the record now says the original JAR is back and offers no second restore",
     await evaluate("(() => { const items = [...document.querySelectorAll('.java-records li')]; return items.length === 1 && !items[0].querySelector('button'); })()"));
   await page.shot("java-restored.png");
+
+  // 6b. Whole-JAR replacement: the source is a JAR already on the target,
+  //    typed as an absolute path; the record then restores it like any update.
+  await uiWait("document.querySelector('[data-testid=\"java-replace-source\"]') !== null", "the replace input");
+  await evaluate(setInput('[data-testid="java-replace-source"]', `${root}/spare/spare.jar`));
+  await evaluate("document.querySelector('[data-testid=\"java-replace-plan\"]').click(), true");
+  await uiWait("document.querySelector('[data-testid=\"java-plan-execute\"]') !== null", "the replace plan", 120_000);
+  const replacePlan = await evaluate("document.querySelector('[data-testid=\"java-plan-dialog\"]').textContent");
+  check("the whole-JAR plan names the jar, the source and the way back",
+    replacePlan.includes(jarPath) && replacePlan.includes("整体替换") && replacePlan.includes(spareSha) && replacePlan.includes("备份"), replacePlan.slice(0, 300));
+  await page.shot("java-replace-plan.png");
+  await evaluate("document.querySelector('[data-testid=\"java-plan-execute\"]').click(), true");
+  await uiWait("document.querySelector('[data-testid=\"java-receipt\"]') !== null", "the replace receipt", 300_000);
+  const replaceReceipt = await evaluate("document.querySelector('[data-testid=\"java-receipt\"]').textContent");
+  check("the whole JAR was replaced byte for byte with the typed source",
+    jarSha() === spareSha && classShaInJar() === v2Class && replaceReceipt.includes("已替换"), { sha: jarSha() });
+  check("the replaced JAR keeps its original owner and mode", jarOwnerMode() === "4242:4243 640", jarOwnerMode());
+  check("the replace receipt says the JVM still uses the old classes until restart",
+    replaceReceipt.includes("重启") && replaceReceipt.includes("旧类"), replaceReceipt.slice(0, 240));
+  await page.shot("java-replace-receipt.png");
+  await evaluate(`[...document.querySelectorAll('[data-testid="java-plan-dialog"] footer button')].find((b) => b.textContent.trim() === '关闭').click(), true`);
+  await uiWait("[...document.querySelectorAll('.java-records li')].some((item) => item.textContent.includes('已整体替换'))", "the whole-jar record");
+  await uiWait("[...document.querySelectorAll('.java-records button')].some((button) => button.textContent.trim() === '恢复原 JAR' && !button.disabled)", "the enabled restore button", 120_000);
+  await evaluate("[...document.querySelectorAll('.java-records button')].find((button) => button.textContent.trim() === '恢复原 JAR' && !button.disabled).click(), true");
+  await uiWait("document.querySelector('[data-testid=\"java-plan-execute\"]')?.textContent.trim() === '确认恢复'", "the whole-jar restore plan", 120_000);
+  await evaluate("document.querySelector('[data-testid=\"java-plan-execute\"]').click(), true");
+  await uiWait("document.querySelector('[data-testid=\"java-receipt\"]') !== null", "the whole-jar restore receipt", 300_000);
+  check("restoring the whole-JAR record puts back the original bytes",
+    jarSha() === originalJar && classShaInJar() === v1Class && jarOwnerMode() === "4242:4243 640", jarSha());
+  await evaluate(`[...document.querySelectorAll('[data-testid="java-plan-dialog"] footer button')].find((b) => b.textContent.trim() === '关闭').click(), true`);
+  await page.shot("java-replace-restored.png");
 
   // 7. The JDK here is on no SSH login's PATH; jar was found beside the running
   //    JVM's own java. Once another account could write that JDK, it is not used.
@@ -417,11 +469,24 @@ su ops -s /bin/sh -c 'cd /home/ops/app && nohup ${javaBinary} -cp /home/ops/app/
   const spare = `${root}/spare/spare.jar`;
   const spareBefore = fileSha(spare);
   await openJar(spare);
-  await uiWait("document.querySelector('.java-hot-update-page > .java-error') !== null || document.querySelector('[data-testid=\"java-plan-dialog\"]') !== null", "the refused plan", 120_000);
+  // With no dialog open a refusal is published to the notification center;
+  // poll both, opening the center to read the card text.
+  await until(async () => {
+    if (await evaluate("document.querySelector('[data-testid=\"java-plan-dialog\"]') !== null")) return true;
+    await evaluate("document.querySelector('[data-testid=\"open-notifications\"]').click(), true");
+    const seen = await evaluate("[...document.querySelectorAll('.notification-card p')].some((item) => item.textContent.includes('主目录'))");
+    await evaluate("document.querySelector('[aria-label=关闭通知中心]')?.click(), true");
+    return seen;
+  }, "the refused plan", 120_000);
   const homeless = await evaluate(`(() => ({
     error: document.querySelector('.java-hot-update-page > .java-error')?.textContent ?? '',
     dialog: document.querySelector('[data-testid="java-plan-dialog"]') !== null,
   }))()`);
+  if (!homeless.dialog && !homeless.error) {
+    await evaluate("document.querySelector('[data-testid=\"open-notifications\"]').click(), true");
+    homeless.error = (await evaluate("[...document.querySelectorAll('.notification-card p')].map((item) => item.textContent).join(' | ')")) ?? '';
+    await evaluate("document.querySelector('[aria-label=关闭通知中心]')?.click(), true");
+  }
   check("an account whose home is / gets no plan and is told why; the JAR is untouched",
     !homeless.dialog && homeless.error.includes("没有自己的主目录") && fileSha(spare) === spareBefore &&
       onHost("ls -A /.lovelyhawk-java-updates 2>/dev/null | wc -l") === "0",
@@ -437,6 +502,7 @@ su ops -s /bin/sh -c 'cd /home/ops/app && nohup ${javaBinary} -cp /home/ops/app/
   if (containerId !== null) {
     try {
       owned();
+      try { forwarder?.kill(); } catch {}
       docker("rm", "-f", containerId);
       check("the run's own container was removed", !docker("ps", "-a", "--filter", `label=lovelyres-test-run=${runId}`, "--format", "{{.ID}}"));
     } catch (error) {

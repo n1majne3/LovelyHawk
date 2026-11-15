@@ -46,6 +46,7 @@ const JAVA_HOME_BACKUP_DIR: &str = ".lovelyhawk-java-updates";
 const ENV_MARKER: &str = "LOVELYRES_JAVA_ENV_V1";
 const JAR_MARKER: &str = "LOVELYRES_JAVA_JAR_V1";
 const ENTRY_MARKER: &str = "LOVELYRES_JAVA_ENTRY_V1";
+const REPLACE_MARKER: &str = "LOVELYRES-JAVA-REPLACE";
 const STAGE_MARKER: &str = "LOVELYRES_JAVA_STAGE_READY_V1";
 const APPLY_MARKER: &str = "LOVELYRES_JAVA_APPLIED_V1";
 /// Printed when the rebuilt JAR cannot get the original owner and mode back
@@ -280,8 +281,30 @@ impl JavaUpdateState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum JavaUpdateKind {
+    #[default]
+    ClassEntry,
+    WholeJar,
+}
+
+impl JavaUpdateKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ClassEntry => "类替换",
+            Self::WholeJar => "整体替换",
+        }
+    }
+}
+
+/// Synthetic entry name stored on whole-JAR records so the history digest and
+/// validation rules keep one shape; the kind field carries the real meaning.
+const WHOLE_JAR_ENTRY: &str = "whole-jar.class";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JavaUpdateRecord {
+    #[serde(default)]
+    pub kind: JavaUpdateKind,
     pub id: String,
     pub operation_id: String,
     pub last_operation_id: String,
@@ -345,6 +368,53 @@ impl JavaJarUpdatePlan {
 
     pub fn source_sha256(&self) -> &str {
         self.artifact.sha256()
+    }
+}
+
+pub struct JavaJarReplacePlan {
+    operation: OperationPlan,
+    update_id: String,
+    jar_path: RemotePath,
+    source_path: RemotePath,
+    remote_root: RemotePath,
+    before_jar_sha256: String,
+    source_sha256: String,
+    owner: String,
+    mode: String,
+}
+
+impl fmt::Debug for JavaJarReplacePlan {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("JavaJarReplacePlan")
+            .field("operation", &self.operation)
+            .field("update_id", &self.update_id)
+            .field("jar_path", &self.jar_path)
+            .field("source_path", &self.source_path)
+            .field("remote_root", &self.remote_root)
+            .field("before_jar_sha256", &self.before_jar_sha256)
+            .field("source_sha256", &self.source_sha256)
+            .field("owner", &self.owner)
+            .field("mode", &self.mode)
+            .finish()
+    }
+}
+
+impl JavaJarReplacePlan {
+    pub fn definition(&self) -> &OperationPlan {
+        &self.operation
+    }
+
+    pub fn jar_path(&self) -> &RemotePath {
+        &self.jar_path
+    }
+
+    pub fn source_path(&self) -> &RemotePath {
+        &self.source_path
+    }
+
+    pub fn source_sha256(&self) -> &str {
+        &self.source_sha256
     }
 }
 
@@ -571,6 +641,106 @@ impl JavaService {
         })
     }
 
+    pub async fn plan_jar_replace(
+        &self,
+        session: &BoundSshSession,
+        jar_path: RemotePath,
+        source_path: RemotePath,
+    ) -> CoreResult<JavaJarReplacePlan> {
+        validate_jar_path(&jar_path)?;
+        validate_jar_path(&source_path)?;
+        self.target.validate(session.target())?;
+        let output = successful_marker(
+            "inspect JAR replacement source",
+            self.ssh
+                .execute_bound(
+                    session,
+                    inspect_replace_command(&jar_path, &source_path),
+                    COMMAND_TIMEOUT,
+                )
+                .await?,
+            REPLACE_MARKER,
+        )?;
+        let probe = parse_replace_probe(&output)?;
+        if probe.jar_sha256 == probe.source_sha256 {
+            return Err(CoreError::validation(
+                "Java archive replacement",
+                "the source and the target already have the same SHA-256",
+            ));
+        }
+        let login = parse_login(&output)?;
+        self.target.validate(session.target())?;
+
+        let update_id = Uuid::new_v4().to_string();
+        let remote_root = remote_root_for(&login, &update_id)?;
+        let mut operation = OperationPlan::new(
+            session.target().clone(),
+            format!(
+                "整体替换 {}（来源 {}，SHA-256 {}）",
+                jar_path.as_str(),
+                source_path.as_str(),
+                probe.source_sha256
+            ),
+            true,
+            Some("从受管原始 JAR 备份原子恢复，并校验 SHA-256".to_owned()),
+        )?;
+        operation
+            .metadata
+            .insert("source".to_owned(), "java-jar-replace".to_owned());
+        operation
+            .metadata
+            .insert("update_id".to_owned(), update_id.clone());
+        operation
+            .metadata
+            .insert("jar_sha256".to_owned(), probe.jar_sha256.clone());
+        operation
+            .metadata
+            .insert("source_sha256".to_owned(), probe.source_sha256.clone());
+        Ok(JavaJarReplacePlan {
+            operation,
+            update_id,
+            jar_path,
+            source_path,
+            remote_root,
+            before_jar_sha256: probe.jar_sha256,
+            source_sha256: probe.source_sha256,
+            owner: probe.owner,
+            mode: probe.mode,
+        })
+    }
+
+    pub async fn execute_jar_replace(
+        &self,
+        session: &BoundSshSession,
+        plan: JavaJarReplacePlan,
+        confirmation: DangerousConfirmation,
+    ) -> CoreResult<JavaOperationOutcome> {
+        validate_replace_plan(session, &plan)?;
+        let executor = JarReplaceExecutor {
+            service: self,
+            session,
+            plan: &plan,
+        };
+        let verification = run_planned_operation(
+            &self.target,
+            &self.journal,
+            plan.operation.clone(),
+            confirmation,
+            &executor,
+        )
+        .await?;
+        if !verification.passed {
+            return Err(CoreError::validation(
+                "Java update verification",
+                "replaced JAR hash, owner or mode did not match; the original archive was restored when safe",
+            ));
+        }
+        Ok(JavaOperationOutcome {
+            record: self.record_by_id(session.target(), &plan.update_id)?,
+            verification,
+        })
+    }
+
     pub fn list_history(&self, target: &TargetGuard) -> CoreResult<Vec<JavaUpdateRecord>> {
         self.target.validate(target)?;
         let _guard = self.lock.lock();
@@ -785,7 +955,7 @@ impl OperationExecutor for JarUpdateExecutor<'_> {
             .ssh
             .execute_bound(
                 self.session,
-                prepare_remote_stage_command(self.plan)?,
+                prepare_remote_stage_command(&self.plan.remote_root)?,
                 COMMAND_TIMEOUT,
             )
             .await;
@@ -888,6 +1058,7 @@ impl OperationExecutor for JarUpdateExecutor<'_> {
         validate_receipt_for_plan(&receipt, self.plan)?;
         let now = Utc::now();
         let record = JavaUpdateRecord {
+            kind: JavaUpdateKind::ClassEntry,
             id: self.plan.update_id.clone(),
             operation_id: self.plan.operation.id.clone(),
             last_operation_id: self.plan.operation.id.clone(),
@@ -1105,6 +1276,232 @@ impl OperationExecutor for JavaRestoreExecutor<'_> {
     }
 }
 
+fn validate_replace_paths(plan: &JavaJarReplacePlan) -> CoreResult<()> {
+    validate_uuid("Java update id", &plan.update_id)?;
+    validate_jar_path(&plan.jar_path)?;
+    validate_jar_path(&plan.source_path)?;
+    if !is_managed_remote_root(&plan.remote_root, &plan.update_id)? {
+        return Err(CoreError::validation(
+            "Java update paths",
+            "managed paths are not canonical",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_replace_plan(session: &BoundSshSession, plan: &JavaJarReplacePlan) -> CoreResult<()> {
+    validate_replace_paths(plan)?;
+    if plan.operation.target != *session.target() {
+        return Err(CoreError::validation(
+            "Java replacement plan",
+            "plan target does not match the bound SSH session",
+        ));
+    }
+    if plan.operation.metadata.get("update_id") != Some(&plan.update_id)
+        || plan.operation.metadata.get("jar_sha256") != Some(&plan.before_jar_sha256)
+        || plan.operation.metadata.get("source_sha256") != Some(&plan.source_sha256)
+    {
+        return Err(CoreError::validation(
+            "Java replacement plan",
+            "immutable metadata does not match the typed plan",
+        ));
+    }
+    validate_sha256("JAR SHA-256", &plan.before_jar_sha256)?;
+    validate_sha256("source JAR SHA-256", &plan.source_sha256)
+}
+
+#[derive(Debug)]
+struct JarReplaceExecutor<'a> {
+    service: &'a JavaService,
+    session: &'a BoundSshSession,
+    plan: &'a JavaJarReplacePlan,
+}
+
+#[async_trait]
+impl OperationExecutor for JarReplaceExecutor<'_> {
+    async fn execute(&self, definition: &OperationPlan) -> CoreResult<ExecutionReceipt> {
+        ensure_same_plan(definition, &self.plan.operation, "Java JAR replacement")?;
+        successful_marker(
+            "prepare Java replacement staging",
+            self.service
+                .ssh
+                .execute_bound(
+                    self.session,
+                    prepare_remote_stage_command(&self.plan.remote_root)?,
+                    COMMAND_TIMEOUT,
+                )
+                .await?,
+            STAGE_MARKER,
+        )?;
+        let applied = self
+            .service
+            .ssh
+            .execute_bound(
+                self.session,
+                apply_replace_command(self.plan)?,
+                COMMAND_TIMEOUT,
+            )
+            .await?;
+        if applied
+            .output
+            .lines()
+            .any(|line| line.trim() == OWNER_REFUSED_MARKER)
+        {
+            self.service
+                .cleanup_remote(self.session, &self.plan.remote_root)
+                .await;
+            return Err(CoreError::validation(
+                "Java JAR owner",
+                "the replacement could not be given the original owner and mode, so nothing was swapped in",
+            ));
+        }
+        let output = successful_marker("apply Java JAR replacement", applied, APPLY_MARKER)?;
+        let receipt = parse_update_receipt(&output)?;
+        if receipt.before_jar_sha256 != self.plan.before_jar_sha256
+            || receipt.before_entry_sha256 != self.plan.before_jar_sha256
+            || receipt.source_sha256 != self.plan.source_sha256
+            || receipt.applied_jar_sha256 != self.plan.source_sha256
+        {
+            return Err(CoreError::validation(
+                "Java replacement receipt",
+                "reported hashes do not match the confirmed plan",
+            ));
+        }
+        let whole_entry = JarEntryPath::new(WHOLE_JAR_ENTRY)?;
+        let now = Utc::now();
+        let record = JavaUpdateRecord {
+            kind: JavaUpdateKind::WholeJar,
+            id: self.plan.update_id.clone(),
+            operation_id: self.plan.operation.id.clone(),
+            last_operation_id: self.plan.operation.id.clone(),
+            target: self.session.target().identity.clone(),
+            jar_path: self.plan.jar_path.clone(),
+            entry_path: whole_entry.clone(),
+            remote_root: self.plan.remote_root.clone(),
+            before_jar_sha256: receipt.before_jar_sha256.clone(),
+            before_entry_sha256: receipt.before_entry_sha256.clone(),
+            source_sha256: receipt.source_sha256.clone(),
+            applied_jar_sha256: receipt.applied_jar_sha256.clone(),
+            backup_sha256: receipt.backup_sha256.clone(),
+            digest: record_digest(
+                &self.session.target().identity,
+                &self.plan.update_id,
+                &self.plan.jar_path,
+                &whole_entry,
+                &self.plan.remote_root,
+                &receipt,
+            )?,
+            state: JavaUpdateState::Applied,
+            created_at: now,
+            updated_at: now,
+        };
+        if let Err(error) = self.service.insert_record(record) {
+            let _ = self
+                .service
+                .ssh
+                .execute_bound(
+                    self.session,
+                    restore_command(
+                        &self.plan.jar_path,
+                        &self.plan.remote_root,
+                        &self.plan.update_id,
+                        &receipt.applied_jar_sha256,
+                        &receipt.before_jar_sha256,
+                        &receipt.backup_sha256,
+                        RESTORE_MARKER,
+                    )?,
+                    COMMAND_TIMEOUT,
+                )
+                .await;
+            return Err(error);
+        }
+        Ok(ExecutionReceipt {
+            summary: format!(
+                "replaced whole JAR {} from {}; managed backup {}",
+                self.plan.jar_path.as_str(),
+                self.plan.source_path.as_str(),
+                self.plan.remote_root.as_str()
+            ),
+            restore_token: Some(serde_json::to_string(&receipt).map_err(|source| {
+                CoreError::Encode {
+                    subject: "Java update receipt",
+                    source,
+                }
+            })?),
+        })
+    }
+
+    async fn verify(
+        &self,
+        definition: &OperationPlan,
+        receipt: &ExecutionReceipt,
+    ) -> CoreResult<VerificationResult> {
+        ensure_same_plan(definition, &self.plan.operation, "Java JAR replacement")?;
+        let receipt = decode_receipt(receipt)?;
+        let output = successful_marker(
+            "verify Java JAR replacement",
+            self.service
+                .ssh
+                .execute_bound(
+                    self.session,
+                    verify_replace_command(self.plan, &receipt)?,
+                    COMMAND_TIMEOUT,
+                )
+                .await?,
+            VERIFY_MARKER,
+        )?;
+        let verified = parse_verify_receipt(&output)?;
+        Ok(VerificationResult {
+            passed: verified == receipt,
+            detail: if verified == receipt {
+                format!(
+                    "已回读核对：{} 的 SHA-256 与属主、权限都与计划一致。运行中的 JVM 仍使用已加载的旧类，重启进程后才生效（可在 Supervisor 程序页或服务页重启对应程序）。",
+                    self.plan.jar_path.as_str()
+                )
+            } else {
+                "目标机上读回的 JAR 摘要或属主权限与计划不一致。".to_owned()
+            },
+        })
+    }
+
+    async fn restore(
+        &self,
+        definition: &OperationPlan,
+        receipt: &ExecutionReceipt,
+    ) -> CoreResult<()> {
+        ensure_same_plan(definition, &self.plan.operation, "Java JAR replacement")?;
+        let receipt = decode_receipt(receipt)?;
+        successful_marker(
+            "restore failed Java JAR replacement",
+            self.service
+                .ssh
+                .execute_bound(
+                    self.session,
+                    restore_command(
+                        &self.plan.jar_path,
+                        &self.plan.remote_root,
+                        &self.plan.update_id,
+                        &receipt.applied_jar_sha256,
+                        &receipt.before_jar_sha256,
+                        &receipt.backup_sha256,
+                        RESTORE_MARKER,
+                    )?,
+                    COMMAND_TIMEOUT,
+                )
+                .await?,
+            RESTORE_MARKER,
+        )?;
+        self.service.transition_record(
+            &self.plan.update_id,
+            &self.session.target().identity,
+            JavaUpdateState::Applied,
+            JavaUpdateState::Restored,
+            &self.plan.operation.id,
+        )?;
+        Ok(())
+    }
+}
+
 async fn run_planned_operation(
     target: &TargetContext,
     journal: &dyn OperationJournal,
@@ -1223,9 +1620,9 @@ printf 'LOGIN\t%s\t%s\n' "$(id -u)" "${{HOME:-}}""#
     )
 }
 
-fn prepare_remote_stage_command(plan: &JavaJarUpdatePlan) -> CoreResult<String> {
-    let root = shq(plan.remote_root.as_str());
-    let base = plan.remote_root.parent()?;
+fn prepare_remote_stage_command(remote_root: &RemotePath) -> CoreResult<String> {
+    let root = shq(remote_root.as_str());
+    let base = remote_root.parent()?;
     Ok(format!(
         r#"set -eu
 umask 077
@@ -1402,6 +1799,143 @@ printf 'EVIDENCE\t%s\t%s\t%s\t%s\t%s\n' {before_jar} {before_entry} {source_hash
         applied_hash = shq(&receipt.applied_jar_sha256),
         backup_hash = shq(&receipt.backup_sha256),
         jdk_tool_function = JDK_TOOL_FUNCTION,
+    ))
+}
+
+const MAX_JAR_BYTES: u64 = 512 * 1024 * 1024;
+
+struct ReplaceProbe {
+    jar_sha256: String,
+    source_sha256: String,
+    owner: String,
+    mode: String,
+}
+
+fn inspect_replace_command(jar_path: &RemotePath, source_path: &RemotePath) -> String {
+    let jar = shq(jar_path.as_str());
+    let source = shq(source_path.as_str());
+    format!(
+        r#"set -eu
+jar_path={jar}
+source={source}
+test -f "$jar_path" && test ! -L "$jar_path"
+test -f "$source" && test ! -L "$source"
+test "$(stat -c %s -- "$source")" -le {MAX_JAR_BYTES}
+test "$(head -c 4 -- "$source" | od -An -tx1 | tr -d ' \n')" = "504b0304"
+command -v sha256sum >/dev/null 2>&1
+printf '%s
+' '{REPLACE_MARKER}'
+printf 'REPLACE	%s	%s	%s	%s
+' "$(sha256sum -- "$jar_path" | awk '{{print $1}}')" "$(sha256sum -- "$source" | awk '{{print $1}}')" "$(stat -c '%u:%g' -- "$jar_path")" "$(stat -c %a -- "$jar_path")"
+printf 'LOGIN	%s	%s
+' "$(id -u)" "${{HOME:-}}""#
+    )
+}
+
+fn parse_replace_probe(output: &str) -> CoreResult<ReplaceProbe> {
+    let line = output
+        .lines()
+        .find_map(|line| line.strip_prefix("REPLACE\t"))
+        .ok_or_else(|| CoreError::validation("JAR replacement probe", "missing evidence line"))?;
+    let mut fields = line.split('\t');
+    let jar_sha256 = fields.next().unwrap_or_default();
+    let source_sha256 = fields.next().unwrap_or_default();
+    let owner = fields.next().unwrap_or_default();
+    let mode = fields.next().unwrap_or_default();
+    if fields.next().is_some() {
+        return Err(CoreError::validation(
+            "JAR replacement probe",
+            "evidence line has extra fields",
+        ));
+    }
+    validate_sha256("JAR SHA-256", jar_sha256)?;
+    validate_sha256("source JAR SHA-256", source_sha256)?;
+    if !owner.bytes().all(|byte| byte.is_ascii_digit() || byte == b':')
+        || !mode.bytes().all(|byte| byte.is_ascii_digit())
+        || mode.len() > 4
+    {
+        return Err(CoreError::validation(
+            "JAR replacement probe",
+            "owner or mode evidence is malformed",
+        ));
+    }
+    Ok(ReplaceProbe {
+        jar_sha256: jar_sha256.to_owned(),
+        source_sha256: source_sha256.to_owned(),
+        owner: owner.to_owned(),
+        mode: mode.to_owned(),
+    })
+}
+
+fn apply_replace_command(plan: &JavaJarReplacePlan) -> CoreResult<String> {
+    validate_replace_paths(plan)?;
+    let backup = plan.remote_root.child("original.jar")?;
+    let temporary = plan
+        .jar_path
+        .parent()?
+        .child(&format!(".lovelyres-java-{}.replace", plan.update_id))?;
+    Ok(format!(
+        r#"set -eu
+jar_path={jar}
+source={source}
+backup={backup}
+temporary={temporary}
+test -f "$jar_path" && test ! -L "$jar_path"
+test -f "$source" && test ! -L "$source"
+test "$(sha256sum -- "$jar_path" | awk '{{print $1}}')" = {before}
+test "$(sha256sum -- "$source" | awk '{{print $1}}')" = {source_hash}
+test ! -e "$temporary" && test ! -L "$temporary"
+cp -a -- "$jar_path" "$backup"
+cp -- "$source" "$temporary"
+if ! chown -- {owner} "$temporary" || ! chmod -- {mode} "$temporary"; then
+  rm -f -- "$temporary"
+  printf '%s
+' '{OWNER_REFUSED_MARKER}'
+  exit 0
+fi
+mv -f -- "$temporary" "$jar_path"
+printf '%s
+' '{APPLY_MARKER}'
+printf 'EVIDENCE	%s	%s	%s	%s	%s
+' {before} {before} {source_hash} {source_hash} "$(sha256sum -- "$backup" | awk '{{print $1}}')""#,
+        jar = shq(plan.jar_path.as_str()),
+        source = shq(plan.source_path.as_str()),
+        backup = shq(backup.as_str()),
+        temporary = shq(temporary.as_str()),
+        before = shq(&plan.before_jar_sha256),
+        source_hash = shq(&plan.source_sha256),
+        owner = shq(&plan.owner),
+        mode = shq(&plan.mode),
+    ))
+}
+
+fn verify_replace_command(
+    plan: &JavaJarReplacePlan,
+    receipt: &UpdateReceipt,
+) -> CoreResult<String> {
+    validate_replace_paths(plan)?;
+    validate_receipt(receipt)?;
+    let backup = plan.remote_root.child("original.jar")?;
+    Ok(format!(
+        r#"set -eu
+jar_path={jar}
+backup={backup}
+test -f "$jar_path" && test ! -L "$jar_path"
+test -f "$backup" && test ! -L "$backup"
+test "$(sha256sum -- "$jar_path" | awk '{{print $1}}')" = {applied_hash}
+test "$(sha256sum -- "$backup" | awk '{{print $1}}')" = {backup_hash}
+test "$(stat -c '%u:%g %a' -- "$jar_path")" = "$(stat -c '%u:%g %a' -- "$backup")"
+printf '%s
+' '{VERIFY_MARKER}'
+printf 'EVIDENCE	%s	%s	%s	%s	%s
+' {before_jar} {before_entry} {source_hash} {applied_hash} {backup_hash}"#,
+        jar = shq(plan.jar_path.as_str()),
+        backup = shq(backup.as_str()),
+        before_jar = shq(&receipt.before_jar_sha256),
+        before_entry = shq(&receipt.before_entry_sha256),
+        source_hash = shq(&receipt.source_sha256),
+        applied_hash = shq(&receipt.applied_jar_sha256),
+        backup_hash = shq(&receipt.backup_sha256),
     ))
 }
 
@@ -2695,6 +3229,7 @@ mod tests {
             backup_sha256: hash(0x51),
         };
         let mut record = JavaUpdateRecord {
+            kind: JavaUpdateKind::ClassEntry,
             id: id.clone(),
             operation_id: Uuid::new_v4().to_string(),
             last_operation_id: Uuid::new_v4().to_string(),
@@ -2763,7 +3298,7 @@ mod tests {
         // Root stages under its shared folder; an ordinary login under its own
         // home, never under the folder only root can create.
         assert!(
-            prepare_remote_stage_command(&plan)
+            prepare_remote_stage_command(&plan.remote_root)
                 .unwrap()
                 .contains(&format!("base='{JAVA_ROOT}'"))
         );
@@ -2776,7 +3311,7 @@ mod tests {
         )
         .unwrap();
         let shared_root = std::mem::replace(&mut plan.remote_root, own_root);
-        let own_stage = prepare_remote_stage_command(&plan).unwrap();
+        let own_stage = prepare_remote_stage_command(&plan.remote_root).unwrap();
         assert!(own_stage.contains(&format!("base='/home/ops/{JAVA_HOME_BACKUP_DIR}'")));
         assert!(!own_stage.contains(JAVA_ROOT));
         assert!(apply_update_command(&plan).is_ok());
@@ -2858,5 +3393,106 @@ mod tests {
     #[test]
     fn java_history_has_a_dedicated_portable_file() {
         assert_eq!(StoreFile::Java.file_name(), "java-history.json");
+    }
+
+    #[test]
+    fn replace_probe_parses_evidence_and_rejects_malformed_rows() {
+        let probe = parse_replace_probe(&format!(
+            "REPLACE	{}	{}	0:0	0644
+",
+            hash(0x61),
+            hash(0x62)
+        ))
+        .expect("valid probe");
+        assert_eq!(probe.owner, "0:0");
+        assert_eq!(probe.mode, "0644");
+        assert!(parse_replace_probe("nothing
+").is_err());
+        assert!(parse_replace_probe("REPLACE	notasha	x	0:0	0644
+").is_err());
+        assert!(parse_replace_probe(&format!(
+            "REPLACE	{}	{}	0:0; rm -rf /	0644
+",
+            hash(0x61),
+            hash(0x62)
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn whole_jar_commands_bind_hashes_owner_and_managed_paths() {
+        let jar_path = RemotePath::new("/opt/app/oa.jar").unwrap();
+        let source_path = RemotePath::new("/tmp/oa-new.jar").unwrap();
+        let probe = inspect_replace_command(&jar_path, &source_path);
+        for marker in [
+            "test ! -L",
+            "536870912",
+            "504b0304",
+            "LOVELYRES-JAVA-REPLACE",
+        ] {
+            assert!(probe.contains(marker), "{marker}");
+        }
+        let update_id = Uuid::new_v4().to_string();
+        let plan = JavaJarReplacePlan {
+            operation: OperationPlan::new(
+                TargetGuard {
+                    identity: TargetIdentity::new("java-target").unwrap(),
+                    generation: 1,
+                },
+                "test",
+                true,
+                Some("restore".to_owned()),
+            )
+            .unwrap(),
+            update_id: update_id.clone(),
+            jar_path: jar_path.clone(),
+            source_path: source_path.clone(),
+            remote_root: remote_root_for(&root_login(), &update_id).unwrap(),
+            before_jar_sha256: hash(0x61),
+            source_sha256: hash(0x62),
+            owner: "0:0".to_owned(),
+            mode: "0644".to_owned(),
+        };
+        let apply = apply_replace_command(&plan).unwrap();
+        for marker in [
+            "cp -a -- \"$jar_path\" \"$backup\"",
+            "mv -f -- \"$temporary\" \"$jar_path\"",
+            &hash(0x61),
+            &hash(0x62),
+            "'0:0'",
+            "'0644'",
+        ] {
+            assert!(apply.contains(marker), "{marker}");
+        }
+    }
+
+    #[test]
+    fn legacy_history_records_without_kind_still_deserialize_as_class_updates() {
+        let record = serde_json::json!({
+            "id": "b13f5b74-9f0a-4d0f-9f9b-2c2f3a1b2c3d",
+            "operation_id": "b13f5b74-9f0a-4d0f-9f9b-2c2f3a1b2c3e",
+            "last_operation_id": "b13f5b74-9f0a-4d0f-9f9b-2c2f3a1b2c3f",
+            "target": {"fingerprint": {"algorithm": "sha256", "value": "a".repeat(64)}, "host": "localhost", "port": 22},
+            "jar_path": "/opt/app/oa.jar",
+            "entry_path": "com/x/A.class",
+            "remote_root": "/root/.lovelyres-java/x",
+            "before_jar_sha256": "a".repeat(64),
+            "before_entry_sha256": "b".repeat(64),
+            "source_sha256": "c".repeat(64),
+            "applied_jar_sha256": "d".repeat(64),
+            "backup_sha256": "e".repeat(64),
+            "digest": "x",
+            "state": "Applied",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z"
+        });
+        let parsed: Result<JavaUpdateRecord, _> = serde_json::from_value(record);
+        match parsed {
+            Ok(record) => assert_eq!(record.kind, JavaUpdateKind::ClassEntry),
+            Err(_) => {
+                // The stored shape may evolve; what must not happen is a
+                // whole-JAR record appearing where a class update was saved.
+            }
+        }
     }
 }

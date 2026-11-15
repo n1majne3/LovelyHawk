@@ -20,7 +20,8 @@ use std::{
 use lovelyhawk_core::{
     BackendServices, CoreError,
     java::{
-        JarEntryPath, JavaJarUpdatePlan, JavaRestorePlan, JavaTool, JavaUpdateRecord,
+        JarEntryPath, JavaJarReplacePlan, JavaJarUpdatePlan, JavaRestorePlan, JavaTool,
+        JavaUpdateKind, JavaUpdateRecord,
         JavaUpdateState, StagedClassArtifact,
     },
     operations::DangerousConfirmation,
@@ -82,6 +83,14 @@ pub(crate) enum JavaHotUpdateRequest {
         jar_handle: String,
         entry: String,
         staged_handle: String,
+    },
+    /// Replace the whole JAR with a file already on the target. The source
+    /// path is typed by the operator; core re-checks it is a real `.jar`.
+    PlanReplace {
+        binding_handle: String,
+        snapshot_handle: String,
+        jar_handle: String,
+        source_path: String,
     },
     History {
         binding_handle: String,
@@ -194,6 +203,7 @@ struct Staged {
 enum PlanKind {
     Update(Box<JavaJarUpdatePlan>),
     Restore(Box<JavaRestorePlan>),
+    Replace(Box<JavaJarReplacePlan>),
 }
 
 struct StoredPlan {
@@ -371,6 +381,7 @@ pub(crate) struct JavaRecordDto {
     record_id: String,
     jar_path: String,
     entry: String,
+    kind: &'static str,
     state: &'static str,
     before_jar_sha256: String,
     applied_jar_sha256: String,
@@ -445,6 +456,20 @@ impl JavaHotUpdateApi {
                 .inspect_path(&binding_handle, &snapshot_handle, &path)
                 .await
                 .map(JavaHotUpdateResponse::Jar),
+            JavaHotUpdateRequest::PlanReplace {
+                binding_handle,
+                snapshot_handle,
+                jar_handle,
+                source_path,
+            } => self
+                .plan_replace(
+                    &binding_handle,
+                    &snapshot_handle,
+                    &jar_handle,
+                    &source_path,
+                )
+                .await
+                .map(JavaHotUpdateResponse::Plan),
             JavaHotUpdateRequest::Plan {
                 binding_handle,
                 snapshot_handle,
@@ -832,6 +857,73 @@ impl JavaHotUpdateApi {
         self.store_plan(scope, PlanKind::Update(Box::new(plan)), dto)
     }
 
+    async fn plan_replace(
+        &self,
+        binding_handle: &str,
+        snapshot_handle: &str,
+        jar_handle: &str,
+        source_path: &str,
+    ) -> Result<JavaPlanDto, JavaHotUpdateError> {
+        validate_handle(snapshot_handle)?;
+        validate_handle(jar_handle)?;
+        let source_path =
+            RemotePath::new(source_path).map_err(|_| JavaHotUpdateError::Invalid)?;
+        let (session, scope) = self.capture_binding(binding_handle)?;
+        let jar_path = {
+            let now = Instant::now();
+            let mut registry = self.lock_registry()?;
+            registry.prune(now);
+            let mine = registry
+                .plans
+                .values()
+                .filter(|plan| plan.scope.binding_handle == scope.binding_handle)
+                .count();
+            if mine >= MAX_PLANS {
+                return Err(JavaHotUpdateError::Capacity);
+            }
+            let snapshot = registry.snapshot(&scope, snapshot_handle)?;
+            // Replacing the file wholesale does not need the `jar` tool,
+            // only the inspected path itself.
+            snapshot
+                .jars
+                .get(jar_handle)
+                .cloned()
+                .ok_or(JavaHotUpdateError::Stale)?
+        };
+        let plan = timeout(
+            PLAN_DEADLINE,
+            self.services
+                .java()
+                .plan_jar_replace(&session, jar_path, source_path),
+        )
+        .await
+        .map_err(|_| JavaHotUpdateError::Deadline)?
+        .map_err(|error| match error {
+            CoreError::Validation {
+                subject: "Java backup folder",
+                ..
+            } => JavaHotUpdateError::NoBackupFolder,
+            _ => JavaHotUpdateError::Core,
+        })?;
+        self.validate_binding(&scope)?;
+        let dto = JavaPlanDto {
+            plan_handle: Uuid::new_v4().to_string(),
+            operation: "replace",
+            summary: bounded(&plan.definition().summary),
+            jar_path: plan.jar_path().as_str().to_owned(),
+            entry: "（整个 JAR）".to_owned(),
+            class_sha256: plan.source_sha256().to_owned(),
+            restore_description: plan
+                .definition()
+                .restore_description
+                .as_deref()
+                .map(bounded),
+            confirmed: false,
+            expires_in_seconds: PLAN_TTL.as_secs(),
+        };
+        self.store_plan(scope, PlanKind::Replace(Box::new(plan)), dto)
+    }
+
     fn history(&self, binding_handle: &str) -> Result<JavaHistoryDto, JavaHotUpdateError> {
         let (session, scope) = self.capture_binding(binding_handle)?;
         let records = self
@@ -971,6 +1063,14 @@ impl JavaHotUpdateApi {
                 )
                 .await
             }
+            PlanKind::Replace(plan) => {
+                let confirmation = DangerousConfirmation::approve(plan.definition());
+                timeout(
+                    EXECUTE_DEADLINE,
+                    java.execute_jar_replace(&session, *plan, confirmation),
+                )
+                .await
+            }
             PlanKind::Restore(plan) => {
                 let confirmation = DangerousConfirmation::approve(plan.definition());
                 timeout(
@@ -1016,7 +1116,7 @@ impl JavaHotUpdateApi {
                 jar_path: dto.jar_path,
                 entry: dto.entry,
                 jar_sha256: None,
-                detail: if operation == "update" {
+                detail: if operation == "update" || operation == "replace" {
                     "替换没有完成或没有通过核对。条件安全时已放回原 JAR；请重新打开这个 JAR 核对当前内容。"
                 } else {
                     "恢复没有完成或没有通过核对。请重新打开这个 JAR 核对当前内容，再决定下一步。"
@@ -1111,6 +1211,10 @@ fn record_dto(record: JavaUpdateRecord) -> JavaRecordDto {
         record_id: record.id,
         jar_path: record.jar_path.as_str().to_owned(),
         entry: record.entry_path.as_str().to_owned(),
+        kind: match record.kind {
+            JavaUpdateKind::ClassEntry => "class",
+            JavaUpdateKind::WholeJar => "jar",
+        },
         state: match record.state {
             JavaUpdateState::Applied => "applied",
             JavaUpdateState::Restored => "restored",
