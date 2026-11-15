@@ -26,7 +26,7 @@ fn public_live_surface_has_no_interface_name_command_path_or_evidence_input() {
     assert!(!input.contains("capture_id"));
     assert!(!source.contains("capture_evidence_remote("));
     assert!(!source.contains("capture_evidence_to_path("));
-    assert!(!source.contains("cleanup_remote("));
+    assert!(source.contains(".cleanup_remote(&binding, &record.remote_path)"));
     assert!(source.contains(".start_live("));
     assert!(source.contains("request_stop()"));
     assert!(source.contains(".stop()"));
@@ -47,7 +47,7 @@ fn close_and_filter_boundaries_are_revocable_typed_and_non_generic() {
         .unwrap();
     assert!(start.contains("let request = PcapCaptureRequest"));
     assert!(start.contains("request.validate()?"));
-    assert!(start.contains(".start_live(&binding, request)"));
+    assert!(start.contains(".start_live(&binding, request.clone())"));
     for forbidden in ["shell_escape", "shq(", "CommandRunner", ".execute_bound("] {
         assert!(!start.contains(forbidden));
     }
