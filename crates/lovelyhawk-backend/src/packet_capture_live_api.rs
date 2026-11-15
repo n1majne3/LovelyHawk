@@ -70,6 +70,10 @@ pub(crate) struct PacketCaptureLiveApi {
     interfaces: Mutex<InterfaceRegistry>,
     captures: Mutex<CaptureRegistry>,
     finished: Mutex<HashMap<String, FinishedCapture>>,
+    /// Handles of captures whose file was exported or thrown away, so asking
+    /// for them again says that — not the generic "stale" a handle that
+    /// never existed gets. Bounded: only the newest 64 matter.
+    consumed: Mutex<VecDeque<String>>,
     operations: Arc<Mutex<OperationState>>,
 }
 
@@ -101,6 +105,7 @@ impl PacketCaptureLiveApi {
             interfaces: Mutex::new(InterfaceRegistry::default()),
             captures: Mutex::new(CaptureRegistry::default()),
             finished: Mutex::new(HashMap::new()),
+            consumed: Mutex::new(VecDeque::new()),
             operations: Arc::new(Mutex::new(OperationState::default())),
         }
     }
@@ -471,6 +476,7 @@ impl PacketCaptureLiveApi {
             .ok()
             .and_then(|mut records| records.remove(capture_handle))
             .ok_or(PacketCaptureLiveApiError::CaptureUnavailable)?;
+        self.remember_consumed(capture_handle);
         if record.scope != scope || record.binding != binding {
             let _ = self
                 .finished
@@ -508,9 +514,17 @@ impl PacketCaptureLiveApi {
             .finished
             .lock()
             .map_err(|_| PacketCaptureLiveApiError::RegistryUnavailable)?;
-        let record = records
-            .get(capture_handle)
-            .ok_or(PacketCaptureLiveApiError::CaptureUnavailable)?;
+        let record = records.get(capture_handle).ok_or_else(|| {
+            if self
+                .consumed
+                .lock()
+                .is_ok_and(|consumed| consumed.iter().any(|handle| handle == capture_handle))
+            {
+                PacketCaptureLiveApiError::Consumed
+            } else {
+                PacketCaptureLiveApiError::CaptureUnavailable
+            }
+        })?;
         let (binding, scope) = self.capture_binding(binding_handle)?;
         if record.scope != scope || record.binding != binding {
             return Err(PacketCaptureLiveApiError::BindingUnavailable);
@@ -528,6 +542,17 @@ impl PacketCaptureLiveApi {
     pub(crate) fn consume_export(&self, capture_handle: &str) {
         if let Ok(mut records) = self.finished.lock() {
             records.remove(capture_handle);
+        }
+        self.remember_consumed(capture_handle);
+    }
+
+    fn remember_consumed(&self, capture_handle: &str) {
+        if let Ok(mut consumed) = self.consumed.lock() {
+            consumed.retain(|handle| handle != capture_handle);
+            consumed.push_back(capture_handle.to_owned());
+            while consumed.len() > 64 {
+                consumed.pop_front();
+            }
         }
     }
 
@@ -1898,6 +1923,8 @@ pub(crate) enum PacketCaptureLiveApiError {
     InvalidCursor,
     InterfaceUnavailable,
     CaptureUnavailable,
+    /// The capture's file was already exported or thrown away.
+    Consumed,
     StillRunning,
     CaptureAlreadyActive,
     RegistryCapacity,
@@ -1918,6 +1945,7 @@ impl fmt::Debug for PacketCaptureLiveApiError {
             Self::InvalidCursor => "InvalidCursor",
             Self::InterfaceUnavailable => "InterfaceUnavailable",
             Self::CaptureUnavailable => "CaptureUnavailable",
+            Self::Consumed => "Consumed",
             Self::StillRunning => "StillRunning",
             Self::CaptureAlreadyActive => "CaptureAlreadyActive",
             Self::RegistryCapacity => "RegistryCapacity",
@@ -1947,6 +1975,7 @@ impl fmt::Display for PacketCaptureLiveApiError {
             Self::OutputLimit => "the packet capture output exceeded its safety limit",
             Self::ProtocolViolation => "the packet capture stream is invalid",
             Self::StillRunning => "the live capture is still running",
+            Self::Consumed => "the live capture was already exported or discarded",
             Self::TimedOut => "the packet capture operation timed out",
         })
     }

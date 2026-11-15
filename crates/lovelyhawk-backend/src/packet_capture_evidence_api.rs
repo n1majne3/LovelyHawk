@@ -190,6 +190,8 @@ pub(crate) enum PacketCaptureEvidenceError {
     Stale,
     /// The live capture whose file was asked for is still running.
     NotFinished,
+    /// The capture's file was already exported or thrown away.
+    Consumed,
     Busy,
     Capacity,
     CaseCapacity,
@@ -393,6 +395,7 @@ impl PacketCaptureEvidenceApi {
                 PacketCaptureLiveApiError::StillRunning => {
                     PacketCaptureEvidenceError::NotFinished
                 }
+                PacketCaptureLiveApiError::Consumed => PacketCaptureEvidenceError::Consumed,
                 _ => PacketCaptureEvidenceError::Stale,
             })?;
         self.open_job(JobOpening {

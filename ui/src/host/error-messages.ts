@@ -195,6 +195,7 @@ export const BACKEND_ERROR_MESSAGES: Readonly<Record<string, string>> = Object.f
   "packet-capture-timeout": "抓包操作超出时限。",
   "packet-capture-too-many": "同时运行的抓包太多。",
   "packet-capture-still-running": "抓包还在进行，等它结束或先停止后才能导出。",
+  "packet-capture-evidence-consumed": "这份抓包已经导出或丢弃，没有可导出的原始包。",
   "packet-capture-unavailable": "这次抓包已结束或已过期。",
   "process-watch-already-running": "这台主机上已经有一个进程监视在运行。",
   "process-watch-binding-unavailable": "目标连接已断开或已切换，进程监视没有开始。",

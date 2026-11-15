@@ -167,7 +167,7 @@ fn probe_command(unit: &str) -> String {
          if [ -n \"$fp\" ]; then \
          if [ -L \"$fp\" ]; then echo 'FILE|symlink'; elif [ -f \"$fp\" ]; then echo 'FILE|regular'; elif [ -e \"$fp\" ]; then echo 'FILE|other'; else echo 'FILE|missing'; fi; \
          sha256sum -- \"$fp\" 2>/dev/null | awk '{{print \"SHA|\" $1}}'; \
-         stat -c 'OWNER|%u:%g' -- \"$fp\" 2>/dev/null || echo 'OWNER|unreadable'; \
+         stat -c 'OWNER|%U|%u' -- \"$fp\" 2>/dev/null || echo 'OWNER|unreadable'; \
          stat -c 'MODE|%a' -- \"$fp\" 2>/dev/null || echo 'MODE|unreadable'; \
          {{ command -v dpkg >/dev/null 2>&1 && dpkg -S -- \"$fp\" >/dev/null 2>&1; }} && echo 'PKG|yes' || \
          {{ command -v rpm >/dev/null 2>&1 && rpm -qf -- \"$fp\" >/dev/null 2>&1; }} && echo 'PKG|yes' || echo 'PKG|no'; \
@@ -181,6 +181,32 @@ fn probe_command(unit: &str) -> String {
          pid=\"$(systemctl show --no-pager -p MainPID --value -- \"$u\" 2>/dev/null)\"; \
          if [ -n \"$pid\" ] && [ \"$pid\" != \"0\" ]; then printf 'START|%s\n' \"$(awk '{{print $22}}' \"/proc/$pid/stat\" 2>/dev/null)\"; fi"
     )
+}
+
+/// `stat %U` prints the name or UNKNOWN when the uid has no entry; the plan
+/// shows whichever identity it could read.
+fn owner_label(owner: &str) -> String {
+    let mut parts = owner.split('|');
+    let name = parts.next().unwrap_or_default().trim();
+    let uid = parts.next().unwrap_or_default().trim();
+    if name.is_empty() || name == "UNKNOWN" {
+        format!("uid {uid}")
+    } else {
+        name.to_owned()
+    }
+}
+
+/// `systemctl show` renders ExecStart as a struct; the operator needs the
+/// command it would run, not the bookkeeping fields around it.
+fn exec_start_command(show_value: &str) -> String {
+    let field = |key: &str| -> Option<String> {
+        let start = show_value.find(key)? + key.len();
+        let rest = &show_value[start..];
+        let end = rest.find(" ;").unwrap_or(rest.len());
+        Some(rest[..end].trim().trim_end_matches('}').trim().to_owned())
+    };
+    let command = field("argv[]=").or_else(|| field("path=")).unwrap_or_else(|| show_value.to_owned());
+    command.chars().take(200).collect()
 }
 
 fn parse_probe(output: &str) -> UnitProbe {
@@ -387,14 +413,12 @@ impl SystemInfoService {
             .get("MainPID")
             .and_then(|value| value.parse().ok())
             .filter(|pid| *pid != 0);
-        let exec_start = show
-            .get("ExecStart")
-            .map(|value| value.chars().take(200).collect());
+        let exec_start = show.get("ExecStart").map(|value| exec_start_command(value));
         let snapshot = UnitSnapshot {
             unit: request.unit.clone(),
             fragment_path,
             fragment_sha256: probe.sha256.unwrap_or_default(),
-            owner: probe.owner.unwrap_or_default(),
+            owner: owner_label(&probe.owner.unwrap_or_default()),
             mode: probe.mode.unwrap_or_default(),
             dropins,
             links,
@@ -444,11 +468,11 @@ impl SystemInfoService {
         let mut operation = OperationPlan::new(
             session.target().clone(),
             format!(
-                "移除 systemd 单元 {}：把单元文件 {}（{}{}，{}）移入备份目录（不是注释或禁用，文件整体移出单元搜索路径），随后让 systemd 重读单元表。{}{}{}{}{}文件备份在 {}/<计划编号>/ 下，10 分钟内可从回执撤销。",
+                "移除 systemd 单元 {}：把单元文件 {}（属主 {}，权限 {}，{}）移入备份目录（不是注释或禁用，文件整体移出单元搜索路径），随后让 systemd 重读单元表。{}{}{}{}{}文件备份在 {}/<计划编号>/ 下，10 分钟内可从回执撤销。",
                 snapshot.unit,
                 snapshot.fragment_path,
                 snapshot.owner,
-                snapshot.mode,
+                format!("{:0>4}", snapshot.mode),
                 snapshot.unit_file_state,
                 running_note,
                 dropins_note,
@@ -714,7 +738,7 @@ impl UnitRemovalExecutor<'_> {
             unit: self.plan.snapshot.unit.clone(),
             fragment_path: show.get("FragmentPath").cloned().unwrap_or_default(),
             fragment_sha256: probe.sha256.unwrap_or_default(),
-            owner: probe.owner.unwrap_or_default(),
+            owner: owner_label(&probe.owner.unwrap_or_default()),
             mode: probe.mode.unwrap_or_default(),
             dropins: probe.dropins.unwrap_or_default(),
             links: probe.links.unwrap_or_default(),
@@ -732,9 +756,7 @@ impl UnitRemovalExecutor<'_> {
                 .get("TriggeredBy")
                 .map(|value| value.split_whitespace().map(str::to_owned).collect())
                 .unwrap_or_default(),
-            exec_start: show
-                .get("ExecStart")
-                .map(|value| value.chars().take(200).collect()),
+            exec_start: show.get("ExecStart").map(|value| exec_start_command(value)),
         })
     }
 }
@@ -939,7 +961,7 @@ mod tests {
     fn probe_output() -> String {
         format!(
             "UID|0\nSUDO|no\nSYSTEMCTL|yes\n{show}\
-             FILE|regular\nSHA|abc123\nOWNER|0:0\nMODE|644\nPKG|no\n\
+             FILE|regular\nSHA|abc123\nOWNER|root|0\nMODE|644\nPKG|no\n\
              DROPIN|/etc/systemd/system/lh-beacon.service.d/override.conf|def456\n\
              LINK|/etc/systemd/system/multi-user.target.wants/lh-beacon.service|/etc/systemd/system/lh-beacon.service\n\
              LINKSEND|end\nSTART|987654\n",
@@ -1004,7 +1026,7 @@ mod tests {
         );
         assert_eq!(probe.file_kind.as_deref(), Some("regular"));
         assert_eq!(probe.sha256.as_deref(), Some("abc123"));
-        assert_eq!(probe.owner.as_deref(), Some("0:0"));
+        assert_eq!(probe.owner.as_deref(), Some("root|0"));
         assert_eq!(probe.mode.as_deref(), Some("644"));
         assert_eq!(probe.package_owned, Some(false));
         assert_eq!(
@@ -1068,6 +1090,19 @@ mod tests {
     }
 
     #[test]
+    fn the_plan_shows_a_named_owner_and_the_plain_command_line() {
+        let probe = parse_probe(&probe_output());
+        assert_eq!(owner_label(probe.owner.as_deref().unwrap()), "root");
+        assert_eq!(owner_label("UNKNOWN|65534"), "uid 65534");
+        let exec = probe
+            .show
+            .as_ref()
+            .and_then(|show| show.get("ExecStart"))
+            .map(|value| exec_start_command(value));
+        assert_eq!(exec.as_deref(), Some("/usr/bin/sleep 3600"));
+    }
+
+    #[test]
     fn probe_without_links_end_keeps_links_unknown() {
         // Output that stops before the link scan finished must read as
         // unknown, never as "no links": planning on a truncated list would
@@ -1100,7 +1135,7 @@ mod tests {
             unit: "lh-beacon.service".to_owned(),
             fragment_path: "/etc/systemd/system/lh-beacon.service".to_owned(),
             fragment_sha256: "a".repeat(64),
-            owner: "0:0".to_owned(),
+            owner: "root".to_owned(),
             mode: "644".to_owned(),
             dropins: vec![DropIn {
                 path: "/etc/systemd/system/lh-beacon.service.d/override.conf".to_owned(),

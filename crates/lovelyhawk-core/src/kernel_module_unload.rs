@@ -67,10 +67,13 @@ struct ModuleProbe {
 }
 
 /// The /proc/modules line, split: `name size refcount deps state address`.
+/// The refcount is `Option` because kernels built without module unload put
+/// `-` there — that is a refusal of its own, not a zero.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProcModulesLine {
     size: String,
-    refcount: u32,
+    refcount: Option<u32>,
+    deps: String,
     state: String,
     address: String,
 }
@@ -130,13 +133,33 @@ fn probe_command(module: &str) -> String {
          elif command -v busybox >/dev/null 2>&1 && busybox --list 2>/dev/null | grep -qx rmmod; then echo 'RMMOD|busybox'; \
          else echo 'RMMOD|none'; fi; \
          if [ -r /proc/sys/kernel/modules_disabled ]; then printf 'MDIS|%s\n' \"$(cat /proc/sys/kernel/modules_disabled)\"; else echo 'MDIS|missing'; fi; \
-         awk -v m=\"$n\" '$1==m{{print \"MOD|\"$2\"|\"$3\"|\"$5\"|\"$6; found=1}} END{{if(!found) print \"MOD|absent\"}}' /proc/modules 2>/dev/null || echo 'MOD|unreadable'; \
+         awk -v m=\"$n\" '$1==m{{print \"MOD|\"$2\"|\"$3\"|\"$4\"|\"$5\"|\"$6; found=1}} END{{if(!found) print \"MOD|absent\"}}' /proc/modules 2>/dev/null || echo 'MOD|unreadable'; \
          if [ -d \"/sys/module/$n\" ]; then echo 'SYSMOD|present'; \
          if [ -r \"/sys/module/$n/refcnt\" ]; then printf 'REFCNT|%s\n' \"$(cat \"/sys/module/$n/refcnt\")\"; else echo 'REFCNT|unreadable'; fi; \
          if [ -d \"/sys/module/$n/holders\" ]; then printf 'HOLDERS|%s\n' \"$(ls \"/sys/module/$n/holders\" 2>/dev/null | tr '\\n' ' ')\"; else echo 'HOLDERS|unreadable'; fi; \
          if [ -r \"/sys/module/$n/taint\" ]; then printf 'TAINT|%s\n' \"$(tr ' ' ',' < \"/sys/module/$n/taint\")\"; else echo 'TAINT|unreadable'; fi; \
          else echo 'SYSMOD|absent'; fi"
     )
+}
+
+/// The /proc/modules answers that veto an unload before any tool runs: a
+/// `[permanent]` dep means the module has no exit path at all, and a refcount
+/// that is not a number means the kernel cannot unload (or the field could not
+/// be read) — either way not a zero.
+fn unload_veto(line: &ProcModulesLine) -> Option<CoreError> {
+    if line.deps.contains("[permanent]") {
+        return Some(CoreError::validation(
+            KERNEL_MODULE_IN_USE_REFUSAL,
+            "模块没有卸载入口，只能重启后不再加载",
+        ));
+    }
+    if line.refcount.is_none() {
+        return Some(CoreError::validation(
+            KERNEL_MODULE_PROBE_REFUSAL,
+            "内核不支持卸载模块或无法读取引用计数",
+        ));
+    }
+    None
 }
 
 fn parse_probe(output: &str) -> ModuleProbe {
@@ -161,17 +184,19 @@ fn parse_probe(output: &str) -> ModuleProbe {
                 });
             }
             Some("MOD") => {
-                // MOD|size|refcount|state|address, MOD|absent, or MOD|unreadable.
+                // MOD|size|refcount|deps|state|address, MOD|absent, or
+                // MOD|unreadable.
                 let rest: Vec<&str> = line.split('|').skip(1).collect();
                 match rest.first().map(|v| v.trim()) {
                     Some("absent") => probe.line_absent = true,
                     Some("unreadable") => probe.line_unreadable = true,
-                    _ if rest.len() >= 4 => {
+                    _ if rest.len() >= 5 => {
                         probe.line = Some(ProcModulesLine {
                             size: rest[0].trim().to_owned(),
-                            refcount: rest[1].trim().parse().unwrap_or(0),
-                            state: rest[2].trim().to_owned(),
-                            address: rest[3].trim().to_owned(),
+                            refcount: rest[1].trim().parse().ok(),
+                            deps: rest[2].trim().to_owned(),
+                            state: rest[3].trim().to_owned(),
+                            address: rest[4].trim().to_owned(),
                         });
                     }
                     _ => probe.line_unreadable = true,
@@ -283,10 +308,14 @@ impl SystemInfoService {
         }
         let holders = probe.holders.unwrap_or_default();
         let sys_refcnt = probe.sys_refcnt.flatten();
-        if line.refcount != 0 {
+        if let Some(veto) = unload_veto(&line) {
+            return Err(veto);
+        }
+        let refcount = line.refcount.unwrap_or_default();
+        if refcount != 0 {
             return Err(CoreError::validation(
                 KERNEL_MODULE_IN_USE_REFUSAL,
-                format!("模块仍在被引用（/proc/modules 引用计数 {}），卸载会失败", line.refcount),
+                format!("模块仍在被引用（/proc/modules 引用计数 {}），卸载会失败", refcount),
             ));
         }
         if line.state != "Live" {
@@ -315,7 +344,7 @@ impl SystemInfoService {
             name: request.module.clone(),
             size: line.size,
             address: line.address,
-            refcount: line.refcount,
+            refcount,
             state: line.state,
             taint: taint.clone(),
             holders,
@@ -433,7 +462,11 @@ impl KernelModuleUnloadExecutor<'_> {
                 .as_ref()
                 .map(|line| line.address.clone())
                 .unwrap_or_default(),
-            refcount: probe.line.as_ref().map(|line| line.refcount).unwrap_or(0),
+            refcount: probe
+                .line
+                .as_ref()
+                .and_then(|line| line.refcount)
+                .unwrap_or(u32::MAX),
             state: probe
                 .line
                 .as_ref()
@@ -559,7 +592,7 @@ mod tests {
     fn probe_output(extra: &str) -> String {
         format!(
             "UID|0\nSUDO|no\nRMMOD|rmmod\nMDIS|0\n\
-             MOD|16384|0|Live|0xffffffffc0000000\n\
+             MOD|16384|0|-|Live|0xffffffffc0000000\n\
              SYSMOD|present\nREFCNT|0\nHOLDERS|\nTAINT|\n{extra}"
         )
     }
@@ -572,7 +605,8 @@ mod tests {
         assert_eq!(probe.tool, Some(UnloadTool::Rmmod));
         assert_eq!(probe.modules_disabled, Some(false));
         assert_eq!(line.size, "16384");
-        assert_eq!(line.refcount, 0);
+        assert_eq!(line.refcount, Some(0));
+        assert_eq!(line.deps, "-");
         assert_eq!(line.state, "Live");
         assert_eq!(line.address, "0xffffffffc0000000");
         assert_eq!(probe.sys_module_present, Some(true));
@@ -609,13 +643,37 @@ mod tests {
     fn probe_collects_holders_and_taint() {
         let probe = parse_probe(
             "UID|1000\nSUDO|yes\nRMMOD|busybox\nMDIS|0\n\
-             MOD|32768|2|Live|0xffffffffc0010000\n\
+             MOD|32768|2|dep_a,dep_b,|Live|0xffffffffc0010000\n\
              SYSMOD|present\nREFCNT|2\nHOLDERS|dep_a dep_b\nTAINT|O,E\n",
         );
         assert!(!probe.is_root && probe.sudo);
         assert_eq!(probe.tool, Some(UnloadTool::Busybox));
         assert_eq!(probe.holders, Some(vec!["dep_a".to_owned(), "dep_b".to_owned()]));
         assert_eq!(probe.taint.as_deref(), Some("O,E"));
+    }
+
+    #[test]
+    fn a_permanent_module_and_a_missing_refcount_each_refuse_their_own_way() {
+        let permanent = parse_probe(
+            "UID|0\nSUDO|no\nRMMOD|rmmod\nMDIS|0\n\
+             MOD|16384|-|[permanent],|Live|0xffffffffc0000000\n\
+             SYSMOD|present\nREFCNT|0\nHOLDERS|\nTAINT|\n",
+        );
+        let line = permanent.line.expect("permanent module line parsed");
+        assert_eq!(line.deps, "[permanent],");
+        assert_eq!(line.refcount, None);
+        let veto = unload_veto(&line).expect("permanent module refused");
+        assert!(format!("{veto:?}").contains(KERNEL_MODULE_IN_USE_REFUSAL));
+
+        let no_refcount = parse_probe(
+            "UID|0\nSUDO|no\nRMMOD|rmmod\nMDIS|0\n\
+             MOD|16384|-|-|Live|0xffffffffc0000000\n\
+             SYSMOD|present\nREFCNT|0\nHOLDERS|\nTAINT|\n",
+        );
+        let line = no_refcount.line.expect("dashed refcount line parsed");
+        let veto = unload_veto(&line).expect("unreadable refcount refused");
+        assert!(format!("{veto:?}").contains(KERNEL_MODULE_PROBE_REFUSAL));
+        assert!(veto.to_string().contains("无法读取引用计数"));
     }
 
     #[test]

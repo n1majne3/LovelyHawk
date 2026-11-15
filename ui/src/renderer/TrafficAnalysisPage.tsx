@@ -102,17 +102,19 @@ export function TrafficAnalysisPage({ api, evidenceJobHandle = null, onEvidenceC
 
   useEffect(() => {
     if (evidenceJobHandle === null || evidenceJobHandle === "") return;
+    // Consuming clears the prop and re-renders the parent, which re-runs this
+    // effect; the begun analysis must not be cancelled by that, so the work
+    // below is not gated on a cleanup flag — unmount safety comes from
+    // mountedRef inside poll.
     onEvidenceConsumed?.();
-    let cancelled = false;
     void (async () => {
       try {
         await api.pcapOffline({ action: "begin-evidence", jobHandle: evidenceJobHandle });
-        if (!cancelled) startPolling();
+        startPolling();
       } catch (error) {
-        if (!cancelled) setNotice(error instanceof Error ? error.message : "无法分析这份抓包证据。");
+        setNotice(error instanceof Error ? error.message : "无法分析这份抓包证据。");
       }
     })();
-    return () => { cancelled = true; };
   }, [evidenceJobHandle, api, onEvidenceConsumed, startPolling]);
 
   const onImport = async () => {

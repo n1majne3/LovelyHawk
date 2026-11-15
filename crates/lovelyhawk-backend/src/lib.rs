@@ -6689,6 +6689,10 @@ fn packet_capture_evidence_failure(error: PacketCaptureEvidenceError) -> RpcFail
             "packet-capture-evidence-not-finished",
             "抓包还在进行，请等它结束后或先停止再导出。",
         ),
+        PacketCaptureEvidenceError::Consumed => (
+            "packet-capture-evidence-consumed",
+            "这份抓包已经导出或丢弃，没有可导出的原始包。",
+        ),
         PacketCaptureEvidenceError::Stale => (
             "packet-capture-evidence-stale",
             "连接或网卡列表已失效，请重新读取网卡后再抓包留证。",
@@ -7484,6 +7488,12 @@ fn packet_capture_live_failure(error: PacketCaptureLiveApiError) -> RpcFailure {
             operation: "validate live packet capture state",
             code: "packet-capture-still-running",
             public_message: "The live packet capture is still running.",
+            source: None,
+        },
+        PacketCaptureLiveApiError::Consumed => RpcFailure {
+            operation: "validate live packet capture state",
+            code: "packet-capture-evidence-consumed",
+            public_message: "The live packet capture was already exported or discarded.",
             source: None,
         },
         PacketCaptureLiveApiError::CaptureUnavailable => RpcFailure {
