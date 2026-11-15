@@ -81,6 +81,7 @@ export const BACKEND_ERROR_MESSAGES: Readonly<Record<string, string>> = Object.f
   "system-info-account-session": "这是当前 SSH 连接登录用的账户，这里不提供删除。",
   "system-info-account-root": "root 账户不在这里删除。",
   "system-info-account-state": "这个账户已经是这个状态了。",
+  "system-info-ssh-key-last-root": "这是 root 授权公钥里最后一把可用的，删掉会切断 root 密钥登录，已拒绝。",
   "system-info-account-password-privilege": "修改账户口令需要 root 或免密码 sudo，这次没有改动。",
   "system-info-account-password-tools": "目标机缺少可用的改口令工具（chpasswd -e 或 usermod），这次没有改动。",
   "system-info-account-password-field": "这个账户没有可安全改写的本地口令记录，这次没有改动。",
