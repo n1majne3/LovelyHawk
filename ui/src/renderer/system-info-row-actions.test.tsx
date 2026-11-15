@@ -102,7 +102,7 @@ function inspection(overrides: Partial<SystemInfoRowInspection> = {}): SystemInf
 
 describe("system-info row action contract", () => {
   it("accepts only two- or three-segment kebab-case action keys", () => {
-    for (const key of ["process.open-files", "process.signal.kill", "ssh-key.fingerprint", "a.b"]) {
+    for (const key of ["process.open-files", "process.signal.kill", "ssh-key.fingerprint", "ssh-key.delete", "a.b"]) {
       expect(isSystemInfoRowActionKey(key)).toBe(true);
     }
     for (const key of [
@@ -222,6 +222,50 @@ describe("system-info row menu", () => {
     expect(empty).toContain("没有可用的操作");
   });
 
+  it("offers deleting an authorized-key row as a dangerous change", () => {
+    const sshRow: SystemInfoRow = {
+      id: "row-0",
+      cells: ["root", "ssh-rsa", "AAAAB3NzaC1yc2E", "ops@laptop", "/root/.ssh/authorized_keys"],
+      risk: "normal",
+      detail: true,
+    };
+    const markup = renderToStaticMarkup(
+      <SystemInfoRowMenu
+        position={{ x: 10, y: 10 }}
+        row={sshRow}
+        cell={null}
+        actions={actions({
+          tab: "ssh-keys",
+          rowId: "row-0",
+          subject: "root ssh-rsa",
+          groups: [
+            {
+              key: "inspect",
+              label: "排查",
+              actions: [
+                { key: "ssh-key.fingerprint", label: "密钥指纹", kind: "inspect", dangerous: false },
+              ],
+            },
+            {
+              key: "change",
+              label: "处置",
+              actions: [
+                { key: "ssh-key.delete", label: "删除此公钥", kind: "change", dangerous: true },
+              ],
+            },
+          ],
+        })}
+        error={null}
+        onLocal={() => undefined}
+        onAction={() => undefined}
+        onDismiss={() => undefined}
+      />,
+    );
+    expect(markup).toContain("删除此公钥");
+    expect(markup).toContain("处置");
+    expect(markup).toContain('class="is-dangerous"');
+  });
+
   it("explains a refusal in the operator's terms", () => {
     // A refusal is not always "the row moved on": the target may lack the
     // tool the change needs. The message covers both and says where the
@@ -251,6 +295,9 @@ describe("system-info row menu", () => {
     expect(same).toContain("已经是这个状态");
     expect(new Set([own, root, same]).size).toBe(3);
     for (const text of [own, root, same]) expect(text).not.toContain("应用日志");
+    const lastKey = rowActionFailureText(new Error("x (system-info-ssh-key-last-root)"));
+    expect(lastKey).toContain("仅剩的可用公钥");
+    expect(lastKey).toContain("没有执行");
     expect(rowActionFailureText(new Error("Used. (system-info-plan-unavailable)"))).toContain("失效");
     expect(rowActionFailureText(new Error("Slow. (system-info-timeout)"))).toContain("回应");
     expect(rowActionFailureText(new Error("目标机返回的结果无法识别。"))).toBe("目标机返回的结果无法识别。");

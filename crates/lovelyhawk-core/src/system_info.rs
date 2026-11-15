@@ -13,6 +13,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose::STANDARD, engine::general_purpose::STANDARD_NO_PAD};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -2414,6 +2415,7 @@ pub enum ArtifactMutationAction {
     DeleteCronFile,
     CommentShellLine,
     DeleteShellLine,
+    DeleteSshKey,
     RemoveSuidBits,
     QuarantineSuidFile,
     AddManagedModuleBlacklist,
@@ -2426,6 +2428,7 @@ impl ArtifactMutationAction {
             Self::DeleteCronFile => "删除独立 Cron 文件",
             Self::CommentShellLine => "注释此行",
             Self::DeleteShellLine => "删除此行",
+            Self::DeleteSshKey => "删除此公钥",
             Self::RemoveSuidBits => "移除 SUID/SGID 位",
             Self::QuarantineSuidFile => "权限隔离（000）",
             Self::AddManagedModuleBlacklist => "阻止模块自动加载",
@@ -2437,6 +2440,7 @@ impl ArtifactMutationAction {
         match self {
             Self::DeleteCronFile => SystemInfoTab::Cron,
             Self::CommentShellLine | Self::DeleteShellLine => SystemInfoTab::ShellConfigs,
+            Self::DeleteSshKey => SystemInfoTab::SshKeys,
             Self::RemoveSuidBits | Self::QuarantineSuidFile => SystemInfoTab::SuidFiles,
             Self::AddManagedModuleBlacklist | Self::RemoveManagedModuleBlacklist => {
                 SystemInfoTab::KernelModules
@@ -2467,6 +2471,13 @@ enum ArtifactMutationIdentity {
         module: String,
         path: RemotePath,
     },
+    SshKey {
+        row_id: String,
+        path: RemotePath,
+        username: String,
+        key_type: String,
+        key_content: String,
+    },
 }
 
 impl ArtifactMutationIdentity {
@@ -2475,7 +2486,8 @@ impl ArtifactMutationIdentity {
             Self::CronFile { row_id, .. }
             | Self::ShellLine { row_id, .. }
             | Self::SuidFile { row_id, .. }
-            | Self::KernelModulePolicy { row_id, .. } => row_id,
+            | Self::KernelModulePolicy { row_id, .. }
+            | Self::SshKey { row_id, .. } => row_id,
         }
     }
 
@@ -2484,7 +2496,8 @@ impl ArtifactMutationIdentity {
             Self::CronFile { path, .. }
             | Self::ShellLine { path, .. }
             | Self::SuidFile { path, .. }
-            | Self::KernelModulePolicy { path, .. } => path,
+            | Self::KernelModulePolicy { path, .. }
+            | Self::SshKey { path, .. } => path,
         }
     }
 }
@@ -2582,6 +2595,9 @@ pub const USER_ACCOUNT_ROOT_REFUSAL: &str = "user account root";
 pub const USER_ACCOUNT_SESSION_REFUSAL: &str = "user account session";
 /// Locking an account that is already locked, or unlocking one that is not.
 pub const USER_ACCOUNT_STATE_REFUSAL: &str = "user account state";
+/// Removing the last usable key in `/root/.ssh/authorized_keys`: root's key
+/// login and any platform check that reads it would be left with nothing.
+pub const SSH_KEY_LAST_ROOT_REFUSAL: &str = "ssh key last root";
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -3432,6 +3448,24 @@ impl SystemInfoTable {
                     displayed_mode,
                 }
             }
+            ArtifactMutationAction::DeleteSshKey => {
+                let username = validated_username(cell(0, "SSH key owner")?)?;
+                let key_type = cell(1, "SSH key type")?;
+                let key_content = cell(2, "SSH key content")?;
+                if !is_valid_ssh_key_type(key_type) || !is_valid_ssh_key_content(key_content) {
+                    return Err(invalid_detail_key("SSH public key"));
+                }
+                ArtifactMutationIdentity::SshKey {
+                    row_id: row.id.clone(),
+                    path: RemotePath::new(validated_authorized_keys_path(cell(
+                        4,
+                        "authorized_keys path",
+                    )?)?)?,
+                    username,
+                    key_type: key_type.to_owned(),
+                    key_content: key_content.to_owned(),
+                }
+            }
             ArtifactMutationAction::AddManagedModuleBlacklist
             | ArtifactMutationAction::RemoveManagedModuleBlacklist => {
                 let module = cell(0, "kernel module name")?;
@@ -3944,6 +3978,57 @@ impl SystemInfoService {
                     _ => unreachable!("validated kernel module policy action"),
                 };
                 ArtifactMutationPlanKind::Sftp(Box::new(self.sftp.plan(&bound, mutation)?))
+            }
+            ArtifactMutationIdentity::SshKey {
+                path,
+                username,
+                key_type,
+                key_content,
+                ..
+            } => {
+                let bound = self
+                    .sftp
+                    .bind_session(session.target().clone(), session.session_id())
+                    .await?;
+                let content = self.sftp.read_file(&bound, path).await?;
+                let removal = remove_authorized_key(&content, key_type, key_content, path)?;
+                let fingerprint = ssh_key_fingerprint(key_content)?;
+                let comment_note = if removal.comment.is_empty() {
+                    String::new()
+                } else {
+                    format!("，备注「{}」", removal.comment)
+                };
+                let remaining_note = if removal.remaining == 0 {
+                    "删除后该文件不再有任何可用公钥。".to_owned()
+                } else {
+                    format!("删除后该文件还剩 {} 条可用公钥。", removal.remaining)
+                };
+                let summary = format!(
+                    "删除 {} 第 {} 行账户 {} 的 {} 公钥（OpenSSH 指纹 {}{}），文件中不再保留该行原文。{remaining_note}工具无法判断当前 SSH 会话用的是哪条公钥，确认前请先比对指纹，避免删掉正在使用的登录密钥。写入前先把整份文件备份到同目录的 .lovelyres-backups/，文件若在采集后变化则拒绝写入。",
+                    path.as_str(),
+                    removal.line,
+                    username,
+                    key_type,
+                    fingerprint,
+                    comment_note,
+                );
+                ArtifactMutationPlanKind::Sftp(Box::new(self.sftp.plan_described(
+                    &bound,
+                    SftpMutation::AtomicWriteIfMatch {
+                        path: path.clone(),
+                        expected_sha256: content_sha256(&content),
+                        expected_canonical_path: None,
+                        backup_directory: None,
+                        content: removal.replacement,
+                    },
+                    summary,
+                    Some("从备份把原文件恢复回去".to_owned()),
+                    std::collections::BTreeMap::from([
+                        ("source".to_owned(), "system-info-ssh-key".to_owned()),
+                        ("line".to_owned(), removal.line.to_string()),
+                        ("key-fingerprint".to_owned(), fingerprint),
+                    ]),
+                )?))
             }
         };
         self.target.validate(session.target())?;
@@ -8860,6 +8945,148 @@ fn validated_authorized_keys_path(value: &str) -> CoreResult<String> {
     }
 }
 
+/// One authorized_keys line broken at unquoted whitespace. Inside double
+/// quotes a space is part of the token and a backslash escapes the next byte,
+/// so `command="echo a b"` stays one field the way sshd reads it.
+fn authorized_keys_tokens(line: &[u8]) -> Vec<&[u8]> {
+    let mut tokens = Vec::new();
+    let mut index = 0;
+    while index < line.len() {
+        while index < line.len() && matches!(line[index], b' ' | b'\t') {
+            index += 1;
+        }
+        if index >= line.len() {
+            break;
+        }
+        let start = index;
+        let mut quoted = false;
+        let mut escaped = false;
+        while index < line.len() {
+            let byte = line[index];
+            if escaped {
+                escaped = false;
+            } else if quoted && byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                quoted = !quoted;
+            } else if !quoted && matches!(byte, b' ' | b'\t') {
+                break;
+            }
+            index += 1;
+        }
+        tokens.push(&line[start..index]);
+    }
+    tokens
+}
+
+/// The key a line actually grants: the first token naming a known key type —
+/// anything before it is the options field — the base64 blob after it, and
+/// the remaining comment text. A line without that pair grants nothing.
+fn authorized_key_parts(line: &[u8]) -> Option<(&[u8], &[u8], Vec<u8>)> {
+    let tokens = authorized_keys_tokens(line);
+    let index = tokens.iter().position(|token| {
+        std::str::from_utf8(token).is_ok_and(is_valid_ssh_key_type)
+    })?;
+    let blob = tokens.get(index + 1)?;
+    Some((
+        tokens[index],
+        blob,
+        tokens[index + 2..].join(b" ".as_slice()),
+    ))
+}
+
+struct SshKeyRemoval {
+    replacement: Vec<u8>,
+    line: u32,
+    comment: String,
+    /// Usable key lines left after the removal; the plan dialog shows it.
+    remaining: usize,
+}
+
+/// Finds the one line carrying `key_type`/`key_content` and returns the file
+/// without it. Zero matches means the file moved since the row was collected;
+/// more than one means the same key was planted twice and a line-numbered
+/// delete is the honest tool.
+fn remove_authorized_key(
+    content: &[u8],
+    key_type: &str,
+    key_content: &str,
+    path: &RemotePath,
+) -> CoreResult<SshKeyRemoval> {
+    let mut found: Option<(u32, Vec<u8>)> = None;
+    let mut matches = 0usize;
+    let mut active = 0usize;
+    for (index, raw) in content.split_inclusive(|byte| *byte == b'\n').enumerate() {
+        let body = raw.strip_suffix(b"\n").unwrap_or(raw);
+        let body = body.strip_suffix(b"\r").unwrap_or(body);
+        let Some(start) = body
+            .iter()
+            .position(|byte| !matches!(byte, b' ' | b'\t'))
+        else {
+            continue;
+        };
+        if body[start] == b'#' {
+            continue;
+        }
+        let Some((kind, blob, comment)) = authorized_key_parts(&body[start..]) else {
+            continue;
+        };
+        if !is_valid_ssh_key_content(std::str::from_utf8(blob).unwrap_or("")) {
+            continue;
+        }
+        active += 1;
+        if kind == key_type.as_bytes() && blob == key_content.as_bytes() {
+            matches += 1;
+            found.get_or_insert((
+                u32::try_from(index + 1).unwrap_or(u32::MAX),
+                comment,
+            ));
+        }
+    }
+    if matches == 0 {
+        return Err(CoreError::validation(
+            "ssh key mutation",
+            "the authorized_keys file changed after the inventory row was collected; the selected key is no longer in it",
+        ));
+    }
+    if matches > 1 {
+        return Err(CoreError::validation(
+            "ssh key mutation",
+            "同一公钥在文件中出现多次，请用逐行删除处理",
+        ));
+    }
+    let remaining = active - 1;
+    if path.as_str() == "/root/.ssh/authorized_keys" && remaining == 0 {
+        return Err(CoreError::validation(
+            SSH_KEY_LAST_ROOT_REFUSAL,
+            "removing it would leave /root/.ssh/authorized_keys without any usable public key",
+        ));
+    }
+    let (line, comment) = found.expect("exactly one match recorded");
+    let deletion = crate::line_delete::delete_line_range(content, line, line)?;
+    Ok(SshKeyRemoval {
+        replacement: deletion.replacement,
+        line,
+        comment: bounded_text(&String::from_utf8_lossy(&comment), 200),
+        remaining,
+    })
+}
+
+/// The fingerprint ssh-keygen would print for the collected blob, so the
+/// operator can compare it against a known key before confirming.
+fn ssh_key_fingerprint(key_content: &str) -> CoreResult<String> {
+    let blob = STANDARD.decode(key_content).map_err(|_| {
+        CoreError::validation(
+            "ssh key mutation",
+            "the public key blob is not decodable base64",
+        )
+    })?;
+    Ok(format!(
+        "SHA256:{}",
+        STANDARD_NO_PAD.encode(Sha256::digest(blob))
+    ))
+}
+
 fn file_detail_command(path: &str) -> String {
     let path = shq(path);
     format!(
@@ -12341,6 +12568,240 @@ mod tests {
         assert_eq!(
             delete_shell_line(b"keep\nbad", 2, "bad").unwrap(),
             b"keep\n"
+        );
+    }
+
+    const KEY_A: &str = "AAAAB3NzaC1yc2EAAAADAQABAAABAQDa";
+    const KEY_B: &str = "AAAAB3NzaC1yc2EAAAADAQABAAABAQDb";
+    const KEY_C: &str = "AAAAB3NzaC1yc2EAAAADAQABAAABAQDc";
+
+    fn root_path() -> RemotePath {
+        RemotePath::new("/root/.ssh/authorized_keys").unwrap()
+    }
+
+    #[test]
+    fn ssh_key_delete_matches_through_options_and_preserves_bytes() {
+        // Options carry quoted spaces and escaped quotes; the key type is the
+        // first token that names one, not the first token on the line.
+        let original = format!(
+            "ssh-rsa {KEY_A} first@host\ncommand=\"echo a b\",no-pty ssh-rsa {KEY_B} mid@host\nssh-ed25519 {KEY_C} last@host\n"
+        );
+        let removal =
+            remove_authorized_key(original.as_bytes(), "ssh-rsa", KEY_B, &root_path()).unwrap();
+        assert_eq!(removal.line, 2);
+        assert_eq!(removal.comment, "mid@host");
+        assert_eq!(removal.remaining, 2);
+        assert_eq!(
+            removal.replacement,
+            format!("ssh-rsa {KEY_A} first@host\nssh-ed25519 {KEY_C} last@host\n").as_bytes()
+        );
+
+        // An options field with an escaped quote still parses as one field.
+        let tricky = format!("command=\"a \\\"quoted\\\" b\" ssh-rsa {KEY_B}\n");
+        let user_path = RemotePath::new("/home/alice/.ssh/authorized_keys").unwrap();
+        let removal =
+            remove_authorized_key(tricky.as_bytes(), "ssh-rsa", KEY_B, &user_path).unwrap();
+        assert!(removal.replacement.is_empty());
+    }
+
+    #[test]
+    fn ssh_key_delete_handles_edges_and_refuses_ambiguity() {
+        // CRLF line endings and a missing trailing newline are kept byte-exact.
+        let original = format!("ssh-rsa {KEY_A}\r\nssh-rsa {KEY_B}");
+        let removal =
+            remove_authorized_key(original.as_bytes(), "ssh-rsa", KEY_A, &root_path()).unwrap();
+        assert_eq!(removal.line, 1);
+        assert_eq!(removal.replacement, format!("ssh-rsa {KEY_B}").as_bytes());
+        let removal =
+            remove_authorized_key(original.as_bytes(), "ssh-rsa", KEY_B, &root_path()).unwrap();
+        assert_eq!(removal.line, 2);
+        assert_eq!(
+            removal.replacement,
+            format!("ssh-rsa {KEY_A}\r\n").as_bytes()
+        );
+
+        // Blank lines and comments are never the target and never count.
+        let with_noise = format!("\n# {KEY_B}\nssh-rsa {KEY_B}\n");
+        let user_path = RemotePath::new("/home/alice/.ssh/authorized_keys").unwrap();
+        let removal = remove_authorized_key(
+            with_noise.as_bytes(),
+            "ssh-rsa",
+            KEY_B,
+            &user_path,
+        )
+        .unwrap();
+        assert_eq!(removal.line, 3);
+
+        // Absent means the file moved on since the row was collected.
+        assert!(
+            remove_authorized_key(with_noise.as_bytes(), "ssh-rsa", KEY_A, &root_path()).is_err()
+        );
+        // The same key planted twice is a line-number problem, not a key one.
+        let doubled = format!("ssh-rsa {KEY_B}\noptions ssh-rsa {KEY_B} c\n");
+        let error =
+            remove_authorized_key(doubled.as_bytes(), "ssh-rsa", KEY_B, &root_path()).err().unwrap();
+        assert!(error.to_string().contains("逐行删除"), "{error}");
+    }
+
+    #[test]
+    fn ssh_key_delete_refuses_the_last_root_key_but_not_a_user_key() {
+        let one = format!("ssh-rsa {KEY_A} only@host\n");
+        let error = remove_authorized_key(one.as_bytes(), "ssh-rsa", KEY_A, &root_path())
+            .err().unwrap();
+        let CoreError::Validation { subject, .. } = error else {
+            panic!("expected a validation refusal, got {error}");
+        };
+        assert_eq!(subject, SSH_KEY_LAST_ROOT_REFUSAL);
+
+        // The same one-key file under /home may be emptied; the operator saw
+        // the "no usable keys remain" wording in the plan summary.
+        let user_path = RemotePath::new("/home/alice/.ssh/authorized_keys").unwrap();
+        let removal = remove_authorized_key(one.as_bytes(), "ssh-rsa", KEY_A, &user_path).unwrap();
+        assert_eq!(removal.remaining, 0);
+        assert!(removal.replacement.is_empty());
+
+        // Comments and option-less garbage lines do not save root either.
+        let noise = format!("# ssh-rsa {KEY_A}\nnot-a-key\nssh-rsa {KEY_A}\n");
+        assert!(
+            remove_authorized_key(noise.as_bytes(), "ssh-rsa", KEY_A, &root_path()).is_err()
+        );
+    }
+
+    #[test]
+    fn ssh_key_fingerprint_is_the_openssh_shape() {
+        let expected = format!(
+            "SHA256:{}",
+            STANDARD_NO_PAD.encode(Sha256::digest(STANDARD.decode(KEY_A).unwrap()))
+        );
+        assert_eq!(ssh_key_fingerprint(KEY_A).unwrap(), expected);
+        assert!(ssh_key_fingerprint("not base64!!").is_err());
+    }
+
+    #[test]
+    fn ssh_key_delete_request_reuses_the_inspect_path_validation() {
+        let keys = parse_table(
+            &SystemInfoRequest::new(SystemInfoTab::SshKeys, 8).unwrap(),
+            "root\tssh-rsa\tKEYBLOBKEYBLOBKEYB\tc\t/root/.ssh/authorized_keys\nnot a user\tssh-rsa\tKEYBLOBKEYBLOBKEYB\tc\t/root/.ssh/authorized_keys\nroot\tunknown\tKEYBLOBKEYBLOBKEYB\tc\t/root/.ssh/authorized_keys\nroot\tssh-rsa\tbad blob\tc\t/root/.ssh/authorized_keys\nroot\tssh-rsa\tKEYBLOBKEYBLOBKEYB\tc\t/etc/ssh/authorized_keys",
+        );
+        let request = keys
+            .artifact_mutation_request(&keys.rows[0].id, ArtifactMutationAction::DeleteSshKey)
+            .unwrap();
+        let ArtifactMutationIdentity::SshKey {
+            path,
+            username,
+            key_type,
+            key_content,
+            ..
+        } = &request.identity
+        else {
+            panic!("expected an ssh-key identity");
+        };
+        assert_eq!(path.as_str(), "/root/.ssh/authorized_keys");
+        assert_eq!(username, "root");
+        assert_eq!(key_type, "ssh-rsa");
+        assert_eq!(key_content, "KEYBLOBKEYBLOBKEYB");
+        for index in 1..keys.rows.len() {
+            assert!(
+                keys.artifact_mutation_request(
+                    &keys.rows[index].id,
+                    ArtifactMutationAction::DeleteSshKey,
+                )
+                .is_err(),
+                "row {index}"
+            );
+        }
+        assert_eq!(ArtifactMutationAction::DeleteSshKey.label(), "删除此公钥");
+        assert_eq!(
+            ArtifactMutationAction::DeleteSshKey.tab(),
+            SystemInfoTab::SshKeys
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_key_delete_writes_atomically_and_is_journaled() {
+        let root = TestRoot::new();
+        let (services, session, harness) = bound_services(&root).await;
+        harness.set_sftp_immediate(true);
+        harness.set_sftp_file(
+            "/root/.ssh/authorized_keys",
+            format!("ssh-rsa {KEY_A} a@x\nssh-rsa {KEY_B} b@x\nssh-ed25519 {KEY_C} c@x\n")
+                .into_bytes(),
+        );
+        let keys = parse_table(
+            &SystemInfoRequest::new(SystemInfoTab::SshKeys, 1).unwrap(),
+            &format!("root\tssh-rsa\t{KEY_B}\tb@x\t/root/.ssh/authorized_keys"),
+        );
+        let request = keys
+            .artifact_mutation_request(&keys.rows[0].id, ArtifactMutationAction::DeleteSshKey)
+            .unwrap();
+        let plan = services
+            .system_info()
+            .plan_artifact_mutation(&session, &request)
+            .await
+            .unwrap();
+        let summary = plan.definition().summary.clone();
+        assert!(summary.contains("SHA256:"), "{summary}");
+        assert!(summary.contains("第 2 行"), "{summary}");
+        assert!(summary.contains("还剩 2 条可用公钥"), "{summary}");
+        let confirmation = DangerousConfirmation::approve(plan.definition());
+        let outcome = services
+            .system_info()
+            .execute_artifact_mutation(
+                &session,
+                plan,
+                confirmation,
+                services.operation_journal(),
+            )
+            .await
+            .unwrap();
+        assert!(outcome.verification.passed);
+        let bound = services
+            .sftp()
+            .bind_session(session.target().clone(), session.session_id())
+            .await
+            .unwrap();
+        assert_eq!(
+            services
+                .sftp()
+                .read_file(&bound, &root_path())
+                .await
+                .unwrap(),
+            format!("ssh-rsa {KEY_A} a@x\nssh-ed25519 {KEY_C} c@x\n").into_bytes()
+        );
+        assert_eq!(services.operation_journal().entries().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn ssh_key_delete_of_the_last_root_key_is_refused_before_any_write() {
+        let root = TestRoot::new();
+        let (services, session, harness) = bound_services(&root).await;
+        harness.set_sftp_immediate(true);
+        let only = format!("ssh-rsa {KEY_A} only@x\n").into_bytes();
+        harness.set_sftp_file("/root/.ssh/authorized_keys", only.clone());
+        let keys = parse_table(
+            &SystemInfoRequest::new(SystemInfoTab::SshKeys, 1).unwrap(),
+            &format!("root\tssh-rsa\t{KEY_A}\tonly@x\t/root/.ssh/authorized_keys"),
+        );
+        let request = keys
+            .artifact_mutation_request(&keys.rows[0].id, ArtifactMutationAction::DeleteSshKey)
+            .unwrap();
+        let error = services
+            .system_info()
+            .plan_artifact_mutation(&session, &request)
+            .await
+            .unwrap_err();
+        let CoreError::Validation { subject, .. } = error else {
+            panic!("expected a validation refusal, got {error}");
+        };
+        assert_eq!(subject, SSH_KEY_LAST_ROOT_REFUSAL);
+        let bound = services
+            .sftp()
+            .bind_session(session.target().clone(), session.session_id())
+            .await
+            .unwrap();
+        assert_eq!(
+            services.sftp().read_file(&bound, &root_path()).await.unwrap(),
+            only
         );
     }
 

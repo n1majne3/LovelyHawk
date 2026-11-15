@@ -68,6 +68,8 @@ export function rowActionFailureText(error: unknown): string {
       return "root 账户不在这里删除。要阻止它登录，可以改用锁定。";
     case "system-info-account-state":
       return "这个账户已经是这个状态了（例如已经锁定的账户再锁一次）。刷新一下看看它现在的状态。";
+    case "system-info-ssh-key-last-root":
+      return "这是 root 的 authorized_keys 里仅剩的可用公钥，删掉后 root 将不能再用公钥登录，所以没有执行。要换密钥请先写入一条新公钥，再删除旧的。";
     case "system-info-account-password-privilege":
       return "修改账户口令需要 root 或免密码 sudo。当前账户没有这个权限，这次没有改动。";
     case "system-info-account-password-tools":

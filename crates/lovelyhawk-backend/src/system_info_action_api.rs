@@ -122,6 +122,7 @@ impl RowAction {
                 ArtifactMutationAction::DeleteCronFile => "cron.delete-file",
                 ArtifactMutationAction::CommentShellLine => "shell.comment-line",
                 ArtifactMutationAction::DeleteShellLine => "shell.delete-line",
+                ArtifactMutationAction::DeleteSshKey => "ssh-key.delete",
                 ArtifactMutationAction::RemoveSuidBits => "suid.remove-bits",
                 ArtifactMutationAction::QuarantineSuidFile => "suid.quarantine",
                 ArtifactMutationAction::AddManagedModuleBlacklist => "module.blacklist.add",
@@ -214,9 +215,14 @@ impl RowAction {
                     .map(ArtifactInvestigationAction::SuidFile)
                     .map(Self::ArtifactInspect),
             },
-            "ssh-key" => from_kebab(rest)
-                .map(ArtifactInvestigationAction::SshKey)
-                .map(Self::ArtifactInspect),
+            "ssh-key" => match rest {
+                "delete" => Some(Self::ArtifactMutation(
+                    ArtifactMutationAction::DeleteSshKey,
+                )),
+                _ => from_kebab(rest)
+                    .map(ArtifactInvestigationAction::SshKey)
+                    .map(Self::ArtifactInspect),
+            },
             _ => None,
         }
     }
@@ -417,11 +423,16 @@ impl RowAction {
                     .map(Self::ArtifactMutation),
                 );
             }
-            SystemInfoTab::SshKeys => actions.extend(
-                SshKeyInvestigationAction::ALL
-                    .map(ArtifactInvestigationAction::SshKey)
-                    .map(Self::ArtifactInspect),
-            ),
+            SystemInfoTab::SshKeys => {
+                actions.extend(
+                    SshKeyInvestigationAction::ALL
+                        .map(ArtifactInvestigationAction::SshKey)
+                        .map(Self::ArtifactInspect),
+                );
+                actions.push(Self::ArtifactMutation(
+                    ArtifactMutationAction::DeleteSshKey,
+                ));
+            }
             SystemInfoTab::Firewall
             | SystemInfoTab::Autoruns
             | SystemInfoTab::Rootcheck
@@ -1861,6 +1872,40 @@ mod tests {
             actions_for(&shell, "row-1")
                 .iter()
                 .any(|(_, key, _)| key == "shell.comment-line")
+        );
+
+        // An authorized-key row can be deleted; one whose cells no longer
+        // describe a key cannot.
+        let keys = table(
+            SystemInfoTab::SshKeys,
+            vec![
+                vec![
+                    "root",
+                    "ssh-rsa",
+                    "AAAAB3NzaC1yc2EAAAADAQABAAABAQDa",
+                    "ops@laptop",
+                    "/root/.ssh/authorized_keys",
+                ],
+                vec![
+                    "root",
+                    "ssh-rsa",
+                    "not a blob",
+                    "ops@laptop",
+                    "/root/.ssh/authorized_keys",
+                ],
+            ],
+        );
+        assert!(
+            actions_for(&keys, "row-0")
+                .iter()
+                .any(|(group, key, dangerous)| {
+                    group == "change" && key == "ssh-key.delete" && *dangerous
+                })
+        );
+        assert!(
+            actions_for(&keys, "row-1")
+                .iter()
+                .all(|(_, key, _)| key != "ssh-key.delete")
         );
 
         // Tabs without a row vocabulary offer nothing, and a missing row is

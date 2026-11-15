@@ -5709,7 +5709,8 @@ fn system_info_failure(error: SystemInfoApiError) -> RpcFailure {
         },
         SystemInfoApiError::ActionUnavailable(source) => {
             use lovelyhawk_core::system_info::{
-                USER_ACCOUNT_ROOT_REFUSAL, USER_ACCOUNT_SESSION_REFUSAL, USER_ACCOUNT_STATE_REFUSAL,
+                SSH_KEY_LAST_ROOT_REFUSAL, USER_ACCOUNT_ROOT_REFUSAL,
+                USER_ACCOUNT_SESSION_REFUSAL, USER_ACCOUNT_STATE_REFUSAL,
             };
             // Refusals with a reason the operator can act on get their own
             // code; everything else stays "does not apply", reason in the log.
@@ -5730,6 +5731,14 @@ fn system_info_failure(error: SystemInfoApiError) -> RpcFailure {
                     (
                         "system-info-account-state",
                         "The account is already in that state.",
+                    )
+                }
+                CoreError::Validation { subject, .. }
+                    if *subject == SSH_KEY_LAST_ROOT_REFUSAL =>
+                {
+                    (
+                        "system-info-ssh-key-last-root",
+                        "That is the last usable public key in root's authorized_keys; removing it would strand root key login.",
                     )
                 }
                 CoreError::Validation { subject, .. }
@@ -10655,7 +10664,8 @@ mod tests {
     #[test]
     fn an_account_refusal_says_which_reason_it_was() {
         use lovelyhawk_core::system_info::{
-            USER_ACCOUNT_ROOT_REFUSAL, USER_ACCOUNT_SESSION_REFUSAL, USER_ACCOUNT_STATE_REFUSAL,
+            SSH_KEY_LAST_ROOT_REFUSAL, USER_ACCOUNT_ROOT_REFUSAL,
+            USER_ACCOUNT_SESSION_REFUSAL, USER_ACCOUNT_STATE_REFUSAL,
         };
         let refused = |subject: &'static str| {
             system_info_failure(SystemInfoApiError::ActionUnavailable(
@@ -10669,6 +10679,7 @@ mod tests {
             (USER_ACCOUNT_SESSION_REFUSAL, "system-info-account-session"),
             (USER_ACCOUNT_ROOT_REFUSAL, "system-info-account-root"),
             (USER_ACCOUNT_STATE_REFUSAL, "system-info-account-state"),
+            (SSH_KEY_LAST_ROOT_REFUSAL, "system-info-ssh-key-last-root"),
             ("process identity", "system-info-action-unavailable"),
         ] {
             let failure = refused(subject);
