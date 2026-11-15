@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type {
   MySqlAccountInput,
   MySqlPrivilegeAddInput,
@@ -50,6 +50,13 @@ export function MysqlPrivilegePanel({ profile, account, binding, request, busy, 
   const [receipt, setReceipt] = useState<{ receipt: MySqlPrivilegeReceipt; undoHandle: string | null } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const label = `${account.user}@${account.host}`;
+  const headingRef = useRef<HTMLHeadingElement>(null);
+  const planRef = useRef<HTMLDivElement>(null);
+  const receiptRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => { headingRef.current?.focus(); }, []);
+  useEffect(() => { if (plan !== null) planRef.current?.focus(); }, [plan]);
+  useEffect(() => { if (receipt !== null) receiptRef.current?.focus(); }, [receipt]);
 
   useEffect(() => {
     let alive = true;
@@ -149,7 +156,7 @@ export function MysqlPrivilegePanel({ profile, account, binding, request, busy, 
   const changes = [...revokes.values()].reduce((total, set) => total + set.size, 0) + adds.length;
 
   return <section className="database-result" aria-label={`账号权限:${label}`} data-testid="mysql-privilege-panel">
-    <h3>账号权限：{label}</h3>
+    <h3 ref={headingRef} tabIndex={-1}>账号权限：{label}</h3>
     {review !== null ? <p>{review.product} {review.serverVersion} · 当前连接账号 {review.connecting.user}@{review.connecting.host}</p> : <p>正在读取授权…</p>}
     <p role="note">最小权限以业务矩阵为准；这里只执行勾选出来的收回与新增，不会自动判断哪些权限是多余的。GRANT/REVOKE 立即生效，不需要 FLUSH PRIVILEGES。</p>
     {review === null ? null : <>
@@ -200,7 +207,7 @@ export function MysqlPrivilegePanel({ profile, account, binding, request, busy, 
         <button type="button" onClick={onClose}>关闭</button>
       </div>
     </>}
-    {plan !== null ? <div className="mysql-priv-plan" data-testid="mysql-priv-plan">
+    {plan !== null ? <div className="mysql-priv-plan" data-testid="mysql-priv-plan-view" ref={planRef} tabIndex={-1} role="region" aria-label="执行计划">
       <h4>执行计划（不可修改）</h4>
       <p>{plan.summary}</p>
       <ol>{plan.statements.map((statement, index) => <li key={index}><code>{statement}</code></li>)}</ol>
@@ -210,7 +217,7 @@ export function MysqlPrivilegePanel({ profile, account, binding, request, busy, 
         <button type="button" onClick={() => setPlan(null)}>放弃</button>
       </div>
     </div> : null}
-    {receipt !== null ? <div className="mysql-priv-plan" data-testid="mysql-priv-receipt">
+    {receipt !== null ? <div className="mysql-priv-plan" data-testid="mysql-priv-receipt" ref={receiptRef} tabIndex={-1} role="region" aria-label="执行结果">
       <h4>{receipt.receipt.verified ? "已执行并复核" : "执行结果待人工核对"}</h4>
       <p>{receipt.receipt.detail}</p>
       <div className="database-toolbar">

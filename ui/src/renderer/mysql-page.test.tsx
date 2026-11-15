@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { renderToStaticMarkup } from "react-dom/server";
 import { createElement } from "react";
 import { describe, expect, it, vi } from "vitest";
@@ -231,5 +232,32 @@ describe("dialog step decisions", () => {
   it("names the unverifiable path and every saved-password update in Chinese", () => {
     expect(unverifiableReasonText.path).toBe("该账号的来源限制使当前连接无法复核新口令");
     for (const value of Object.values(savedUpdateText)) expect(value).toMatch(/[一-鿿]/u);
+  });
+});
+
+describe("MysqlPrivilegePanel focus continuity", () => {
+  const source = readFileSync(new URL("./MysqlPrivilegePanel.tsx", import.meta.url), "utf8");
+  const page = readFileSync(new URL("./MysqlPage.tsx", import.meta.url), "utf8");
+
+  it("moves focus into the panel on open and follows the plan and receipt state", () => {
+    expect(source).toContain("useEffect(() => { headingRef.current?.focus(); }, [])");
+    expect(source).toContain("useEffect(() => { if (plan !== null) planRef.current?.focus(); }, [plan])");
+    expect(source).toContain("useEffect(() => { if (receipt !== null) receiptRef.current?.focus(); }, [receipt])");
+    expect(source).toContain('ref={headingRef} tabIndex={-1}');
+    expect(source).toContain('ref={planRef} tabIndex={-1} role="region"');
+    expect(source).toContain('ref={receiptRef} tabIndex={-1} role="region"');
+  });
+
+  it("never auto-focuses the dangerous execute or undo buttons", () => {
+    expect(source).not.toContain("autoFocus");
+    const focusTargets = source.match(/(\w+Ref)\.current\?\.focus\(\)/g) ?? [];
+    expect(focusTargets.length).toBeGreaterThan(0);
+    for (const target of focusTargets) expect(["headingRef", "planRef", "receiptRef"].some(name => target.startsWith(name))).toBe(true);
+  });
+
+  it("returns focus to the account privileges opener when the panel closes", () => {
+    expect(page).toContain("privilegeOpener.current = opener");
+    expect(page).toContain("if (privilegeOpener.current?.isConnected) privilegeOpener.current.focus(); else heading.current?.focus();");
+    expect(page).toContain('onPrivileges?(account: MySqlAccountInput, opener: HTMLElement): void');
   });
 });

@@ -56,6 +56,17 @@ async function waitFor(session, expression, label, attempts = 240) {
   }
   throw new Error(`timed out waiting for ${label}`);
 }
+async function scrollAndSee(session, selector, needed, label) {
+  const result = await session.evaluate(`(() => {
+    const el = document.querySelector(${JSON.stringify(selector)});
+    if (!el) return 'missing';
+    el.scrollIntoView({ block: 'center' });
+    const box = el.getBoundingClientRect();
+    if (!(box.bottom > 0 && box.top < window.innerHeight && box.right > 0 && box.left < window.innerWidth)) return 'offscreen';
+    return ${JSON.stringify(needed)}.every(text => el.textContent.includes(text)) ? true : 'text-missing';
+  })()`);
+  check(label, result === true);
+}
 function owned() {
   const target = JSON.parse(podman("inspect", containerId))[0];
   const strip = v => String(v ?? "").replace(/^sha256:/u, "");
@@ -202,6 +213,8 @@ FLUSH PRIVILEGES;`);
     await waitFor(page, `document.querySelector('[data-testid="mysql-privileges-traffic-127.0.0.1"]') !== null`, "the account-privileges button", 240);
     check("the review lists traffic@127.0.0.1", await clickText(page, `[data-testid="mysql-privileges-traffic-127.0.0.1"]`, "账号权限"));
     await waitFor(page, `document.querySelector('[data-testid="mysql-privilege-panel"] .mysql-priv-row') !== null`, "the privilege rows", 240);
+    check("focus lands inside the privilege panel", await page.evaluate(`document.querySelector('[data-testid="mysql-privilege-panel"]')?.contains(document.activeElement) === true`));
+    await scrollAndSee(page, '[data-testid="mysql-privilege-panel"]', ["账号权限", "traffic@127.0.0.1"], "the privilege panel is in view");
 
     const scopeText = row => page.evaluate(`document.querySelector('[data-testid="mysql-priv-row-${row}"] strong')?.textContent ?? ''`);
     let globalRow = -1, dbRow = -1;
@@ -226,6 +239,7 @@ FLUSH PRIVILEGES;`);
     })()`);
     check("global CREATE and DROP ticked", (await tick(globalRow, ["CREATE", "DROP"])) === 2);
     check("all traffic_oa members ticked", (await tick(dbRow, DATABASE_ALL)) === DATABASE_ALL.length);
+    await scrollAndSee(page, '[data-testid="mysql-privilege-panel"]', ["收回 CREATE", "收回 DROP"], "the ticked rows are in view");
     await page.shot("mysql-priv-ticks.png");
 
     for (const add of MATRIX) {
@@ -245,9 +259,12 @@ FLUSH PRIVILEGES;`);
       })()`);
       check(`added grant ${add.database}.${add.table ?? "*"}`, added === true);
     }
+    await scrollAndSee(page, '[data-testid="mysql-privilege-panel"]', ["新增授权"], "the added grants are in view");
     await page.shot("mysql-priv-adds.png");
     check("生成执行计划 arms", await clickText(page, '[data-testid="mysql-priv-plan"]', "生成执行计划"));
-    await waitFor(page, `document.querySelector('[data-testid="mysql-priv-plan"]')?.textContent?.includes('执行计划') === true`, "the plan", 120);
+    await waitFor(page, `document.querySelector('[data-testid="mysql-priv-plan-view"]')?.textContent?.includes('执行计划') === true`, "the plan", 120);
+    await scrollAndSee(page, '[data-testid="mysql-priv-plan-view"]', ["执行计划", "REVOKE"], "the plan is visible in the viewport");
+    check("focus stays on the plan region", await page.evaluate(`document.querySelector('[data-testid="mysql-priv-plan-view"]')?.contains(document.activeElement) === true`));
     await page.shot("mysql-priv-plan.png");
     const focus = await page.evaluate(`(() => {
       const danger = document.querySelector('[data-testid="mysql-priv-execute"]');
@@ -256,6 +273,8 @@ FLUSH PRIVILEGES;`);
     check("confirm is not pre-focused on the danger button", focus);
     check("确认执行", await clickText(page, '[data-testid="mysql-priv-execute"]', "确认执行"));
     await waitFor(page, `document.querySelector('[data-testid="mysql-priv-receipt"]')?.textContent?.includes('已执行并复核') === true`, "the verified receipt", 240);
+    await scrollAndSee(page, '[data-testid="mysql-priv-receipt"]', ["已执行并复核"], "the receipt is visible in the viewport");
+    check("focus stays on the receipt region", await page.evaluate(`document.querySelector('[data-testid="mysql-priv-receipt"]')?.contains(document.activeElement) === true`));
     await page.shot("mysql-priv-receipt.png");
     const wanted = canon([
       "GRANT USAGE ON *.* TO traffic@127.0.0.1",
@@ -274,6 +293,7 @@ FLUSH PRIVILEGES;`);
     await waitFor(page, `document.querySelector('[data-testid="mysql-priv-undo"]') !== null`, "the undo button", 60);
     check("恢复原授权", await clickText(page, '[data-testid="mysql-priv-undo"]', "恢复原授权"));
     await waitFor(page, `document.querySelector('[data-testid="mysql-priv-receipt"]')?.textContent?.includes('已恢复') === true`, "the undo receipt", 240);
+    await scrollAndSee(page, '[data-testid="mysql-priv-receipt"]', ["已恢复"], "the undo receipt is visible in the viewport");
     await page.shot("mysql-priv-undone.png");
     check("independent SHOW GRANTS matches the original lines",
       JSON.stringify(canon(grantsOf())) === JSON.stringify(original));
