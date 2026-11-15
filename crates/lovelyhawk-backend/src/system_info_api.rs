@@ -743,6 +743,7 @@ pub(crate) const fn tab_key(tab: SystemInfoTab) -> &'static str {
         SystemInfoTab::Docker => "docker",
         SystemInfoTab::Kubernetes => "kubernetes",
         SystemInfoTab::WebApps => "web-apps",
+        SystemInfoTab::Supervisor => "supervisor",
     }
 }
 
@@ -789,14 +790,14 @@ mod tests {
     #[test]
     fn catalog_is_closed_unique_and_complete() {
         let catalog = SystemInfoApi::catalog();
-        assert_eq!(catalog.len(), 25);
+        assert_eq!(catalog.len(), 26);
         assert_eq!(
             catalog
                 .iter()
                 .map(|entry| entry.key)
                 .collect::<HashSet<_>>()
                 .len(),
-            25
+            26
         );
         for entry in catalog {
             assert!(!entry.label.is_empty());

@@ -31,6 +31,7 @@ use lovelyhawk_core::{
     },
     operations::{DangerousConfirmation, OperationPlan, VerificationResult},
     process_restart::ProcessRestartPlan,
+    supervisor::{SupervisorAction, SupervisorPlan},
     system_info::{
         ArtifactInvestigationAction, ArtifactMutationAction, ArtifactMutationPlan,
         BootScriptRuntimePlan, COMMAND_TIMEOUT_MARKER, CronInvestigationAction,
@@ -94,6 +95,9 @@ pub(crate) enum RowAction {
     /// `service.remove-unit` — move a local unit's fragment, drop-ins and
     /// enablement links into a backup tree, with an undo handle.
     ServiceRemoveUnit,
+    /// `supervisor.<action>` — supervisorctl start/stop/restart on a program
+    /// row; a managed runtime change, like the systemd service actions.
+    SupervisorRuntime(SupervisorAction),
 }
 
 impl RowAction {
@@ -130,6 +134,7 @@ impl RowAction {
             },
             Self::KernelModuleUnload => "kernel-module.unload".to_owned(),
             Self::ServiceRemoveUnit => "service.remove-unit".to_owned(),
+            Self::SupervisorRuntime(action) => format!("supervisor.{}", kebab(action)),
             Self::ArtifactMutation(action) => match action {
                 ArtifactMutationAction::DeleteCronFile => "cron.delete-file",
                 ArtifactMutationAction::CommentShellLine => "shell.comment-line",
@@ -157,6 +162,7 @@ impl RowAction {
                 None if rest == "restart" => Some(Self::ProcessRestart),
                 None => from_kebab(rest).map(Self::ProcessInspect),
             },
+            "supervisor" => from_kebab(rest).map(Self::SupervisorRuntime),
             "service" => match rest {
                 "remove-unit" => Some(Self::ServiceRemoveUnit),
                 _ => match rest.strip_prefix("runtime.") {
@@ -263,6 +269,7 @@ impl RowAction {
             Self::ArtifactMutation(action) => action.label(),
             Self::KernelModuleUnload => "卸载模块",
             Self::ServiceRemoveUnit => "移除服务单元",
+            Self::SupervisorRuntime(action) => action.label(),
         }
     }
 
@@ -279,6 +286,7 @@ impl RowAction {
                 | Self::ArtifactMutation(_)
                 | Self::KernelModuleUnload
                 | Self::ServiceRemoveUnit
+                | Self::SupervisorRuntime(_)
         )
     }
 
@@ -293,6 +301,7 @@ impl RowAction {
             | Self::ArtifactMutation(_)
             | Self::KernelModuleUnload
             | Self::ServiceRemoveUnit => true,
+            Self::SupervisorRuntime(action) => matches!(action, SupervisorAction::Stop),
             Self::ServiceRuntime(action) => matches!(
                 action,
                 ServiceRuntimeAction::Stop
@@ -324,7 +333,8 @@ impl RowAction {
             | Self::NetworkDisconnect
             | Self::ArtifactMutation(_)
             | Self::KernelModuleUnload
-            | Self::ServiceRemoveUnit => ("change".to_owned(), "处置"),
+            | Self::ServiceRemoveUnit
+            | Self::SupervisorRuntime(_) => ("change".to_owned(), "处置"),
         }
     }
 
@@ -463,6 +473,9 @@ impl RowAction {
                     ArtifactMutationAction::DeleteSshKey,
                 ));
             }
+            SystemInfoTab::Supervisor => actions.extend(
+                SupervisorAction::ALL.map(Self::SupervisorRuntime),
+            ),
             SystemInfoTab::Firewall
             | SystemInfoTab::Autoruns
             | SystemInfoTab::Rootcheck
@@ -506,6 +519,9 @@ fn applies(table: &SystemInfoTable, row_id: &str, action: RowAction) -> bool {
         }
         RowAction::KernelModuleUnload => table.kernel_module_unload_request(row_id).is_ok(),
         RowAction::ServiceRemoveUnit => table.systemd_unit_removal_request(row_id).is_ok(),
+        RowAction::SupervisorRuntime(inner) => table
+            .supervisor_action_request(row_id, inner, None)
+            .is_ok(),
     }
 }
 
@@ -679,6 +695,7 @@ enum RowPlan {
     ArtifactMutation(ArtifactMutationPlan),
     KernelModuleUnload(KernelModuleUnloadPlan),
     ServiceRemoveUnit(SystemdUnitRemovalPlan),
+    SupervisorRuntime(SupervisorPlan),
 }
 
 impl RowPlan {
@@ -694,6 +711,7 @@ impl RowPlan {
             Self::ArtifactMutation(plan) => plan.definition(),
             Self::KernelModuleUnload(plan) => plan.definition(),
             Self::ServiceRemoveUnit(plan) => plan.definition(),
+            Self::SupervisorRuntime(plan) => plan.definition(),
         }
     }
 }
@@ -926,7 +944,8 @@ impl SystemInfoApi {
                 | RowAction::NetworkDisconnect
                 | RowAction::ArtifactMutation(_)
                 | RowAction::KernelModuleUnload
-                | RowAction::ServiceRemoveUnit => Err(CoreError::Validation {
+                | RowAction::ServiceRemoveUnit
+                | RowAction::SupervisorRuntime(_) => Err(CoreError::Validation {
                     subject: "system-information row action",
                     message: "this action changes the host and must be planned".to_owned(),
                 }),
@@ -960,6 +979,7 @@ impl SystemInfoApi {
         row_id: &str,
         action_key: &str,
         password: Option<SecretValue>,
+        health: Option<(u16, String)>,
     ) -> Result<SystemInfoRowPlanDto, SystemInfoApiError> {
         let action = RowAction::parse(action_key).ok_or(SystemInfoApiError::InvalidAction)?;
         if !action.changes_host() {
@@ -1050,6 +1070,13 @@ impl SystemInfoApi {
                         .plan_systemd_unit_removal(&session, &request)
                         .await
                         .map(RowPlan::ServiceRemoveUnit)
+                }
+                RowAction::SupervisorRuntime(inner) => {
+                    let request = table.supervisor_action_request(row_id, inner, health)?;
+                    service
+                        .plan_supervisor_action(&session, &request)
+                        .await
+                        .map(RowPlan::SupervisorRuntime)
                 }
                 RowAction::ProcessInspect(_)
                 | RowAction::ServiceInspect(_)
@@ -1225,6 +1252,10 @@ impl SystemInfoApi {
                         .map(|outcome| {
                             (outcome.verification, false, None, outcome.undo)
                         }),
+                    RowPlan::SupervisorRuntime(plan) => service
+                        .execute_supervisor_action(&session, plan, confirmation, journal)
+                        .await
+                        .map(|outcome| (outcome.verification, false, None, None)),
                 }
             })
             .await;
@@ -2425,6 +2456,60 @@ mod tests {
                 .iter()
                 .any(|(_, key, _)| key == "service.remove-unit")
         );
+    }
+
+    #[test]
+    fn supervisor_rows_offer_managed_start_stop_restart() {
+        let tab = table(
+            SystemInfoTab::Supervisor,
+            vec![vec![
+                "web:oa",
+                "RUNNING",
+                "1234",
+                "pid 1234, uptime 0:01:00",
+                "-",
+            ]],
+        );
+        let offered: Vec<String> = actions_for(&tab, "row-0")
+            .into_iter()
+            .map(|(_, key, _)| key)
+            .collect();
+        for (action, key) in [
+            (SupervisorAction::Start, "supervisor.start"),
+            (SupervisorAction::Stop, "supervisor.stop"),
+            (SupervisorAction::Restart, "supervisor.restart"),
+        ] {
+            assert!(offered.contains(&key.to_owned()), "{key} not offered");
+            assert_eq!(RowAction::SupervisorRuntime(action).key(), key);
+            assert_eq!(
+                RowAction::parse(key),
+                Some(RowAction::SupervisorRuntime(action))
+            );
+            assert!(RowAction::SupervisorRuntime(action).changes_host());
+        }
+        assert!(RowAction::SupervisorRuntime(SupervisorAction::Stop).dangerous());
+        // A program-name cell that cannot be a program name takes none of them.
+        let broken = table(
+            SystemInfoTab::Supervisor,
+            vec![vec!["not a program", "RUNNING", "-", "-", "-"]],
+        );
+        assert!(!applies(
+            &broken,
+            "row-0",
+            RowAction::SupervisorRuntime(SupervisorAction::Restart)
+        ));
+        let processes = table(
+            SystemInfoTab::Processes,
+            vec![vec!["normal", "1", "0", "root", "S", "0", "0", "1", "init"]],
+        );
+        assert!(
+            !actions_for(&processes, "row-0")
+                .iter()
+                .any(|(_, key, _)| key.starts_with("supervisor."))
+        );
+        for near_miss in ["supervisor", "supervisor.kill", "supervisor.start.now"] {
+            assert_eq!(RowAction::parse(near_miss), None, "{near_miss} parsed");
+        }
     }
 
     #[test]

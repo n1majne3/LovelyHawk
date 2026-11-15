@@ -100,10 +100,11 @@ pub enum SystemInfoTab {
     Docker,
     Kubernetes,
     WebApps,
+    Supervisor,
 }
 
 impl SystemInfoTab {
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 26] = [
         Self::Processes,
         Self::Network,
         Self::Services,
@@ -129,6 +130,7 @@ impl SystemInfoTab {
         Self::Docker,
         Self::Kubernetes,
         Self::WebApps,
+        Self::Supervisor,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -158,6 +160,7 @@ impl SystemInfoTab {
             Self::Docker => "Docker",
             Self::Kubernetes => "Kubernetes",
             Self::WebApps => "Web 应用",
+            Self::Supervisor => "Supervisor 程序",
         }
     }
 
@@ -185,7 +188,9 @@ impl SystemInfoTab {
             | Self::Rootcheck
             | Self::Sensitive
             | Self::RecentFiles => SystemInfoGroup::Security,
-            Self::Docker | Self::Kubernetes | Self::WebApps => SystemInfoGroup::Workload,
+            Self::Docker | Self::Kubernetes | Self::WebApps | Self::Supervisor => {
+                SystemInfoGroup::Workload
+            }
         }
     }
 
@@ -226,6 +231,7 @@ impl SystemInfoTab {
             Self::Docker => &["ID", "名称", "镜像", "状态", "端口", "创建时间"],
             Self::Kubernetes => &["Namespace", "名称", "Ready", "状态", "重启", "Age"],
             Self::WebApps => &["类型", "路径/URL", "状态", "配置文件", "运行用户"],
+            Self::Supervisor => &["程序", "状态", "PID", "说明", "配置文件"],
         }
     }
 
@@ -291,6 +297,7 @@ impl SystemInfoTab {
             Self::Network | Self::Established | Self::OpenPorts => {
                 Some("command -v ss >/dev/null 2>&1 || command -v netstat >/dev/null 2>&1")
             }
+            Self::Supervisor => Some("command -v supervisorctl >/dev/null 2>&1"),
             // Four, because a machine with none of them has an inventory
             // nobody can read — which is a different answer from "nothing is
             // installed", and the one this tab used to give.
@@ -322,6 +329,11 @@ impl SystemInfoTab {
             // questions about its timers, and refusing to look there would hide
             // exactly the machine an operator is most likely investigating.
             Self::Timers => Some("systemctl list-units --type=timer >/dev/null 2>&1"),
+            // Installed is not reachable: a login with no socket access and a
+            // dead supervisord both fail this, which is the "says why" case.
+            Self::Supervisor => Some(
+                "supervisorctl status >/dev/null 2>&1                       || sudo -n supervisorctl status >/dev/null 2>&1",
+            ),
             // Being installed is not enough here either. Without CAP_NET_ADMIN
             // `iptables-save` prints "you must be root" and stops, and the tab
             // then showed an empty firewall — which reads as "no rules" on the
@@ -343,6 +355,7 @@ impl SystemInfoTab {
         match self {
             Self::Firewall => Some("iptables"),
             Self::Timers => Some("systemctl"),
+            Self::Supervisor => Some("supervisorctl"),
             Self::Docker => Some("docker"),
             Self::Kubernetes => Some("kubectl"),
             Self::LoginHistory => Some("last"),
@@ -394,6 +407,7 @@ impl SystemInfoTab {
             Self::Docker => DOCKER_COMMAND,
             Self::Kubernetes => KUBERNETES_COMMAND,
             Self::WebApps => WEB_APPS_COMMAND,
+            Self::Supervisor => SUPERVISOR_COMMAND,
         }
     }
 }
@@ -3127,6 +3141,54 @@ impl SystemInfoTable {
             row_id: row.id.clone(),
             unit,
             action,
+        })
+    }
+
+    /// A Supervisor row resolved to the program `supervisorctl` would act on.
+    /// The name comes from the collected `supervisorctl status` line, not
+    /// from the window, and is held to supervisor's own identifier charset.
+    pub fn supervisor_action_request(
+        &self,
+        row_id: &str,
+        action: crate::supervisor::SupervisorAction,
+        health: Option<(u16, String)>,
+    ) -> CoreResult<crate::supervisor::SupervisorActionRequest> {
+        if self.tab != SystemInfoTab::Supervisor {
+            return Err(CoreError::validation(
+                "supervisor action",
+                "the selected row is not from the Supervisor inventory",
+            ));
+        }
+        let health = health
+            .map(|(port, path)| crate::supervisor::supervisor_health_check(port, &path))
+            .transpose()?;
+        if health.is_some()
+            && !crate::supervisor::SupervisorAction::HEALTH_CHECKABLE.contains(&action)
+        {
+            return Err(CoreError::validation(
+                "supervisor action",
+                "health checks only follow a start or restart",
+            ));
+        }
+        let row = self
+            .rows
+            .iter()
+            .find(|row| row.id == row_id)
+            .ok_or_else(|| CoreError::NotFound {
+                entity: "system information row",
+                id: bounded_text(row_id, 256),
+            })?;
+        let name = row
+            .cells
+            .first()
+            .filter(|name| crate::supervisor::is_valid_program_name(name))
+            .ok_or_else(|| invalid_detail_key("supervisor program name"))?
+            .clone();
+        Ok(crate::supervisor::SupervisorActionRequest {
+            row_id: row.id.clone(),
+            name,
+            action,
+            health,
         })
     }
 
@@ -9203,6 +9265,7 @@ const fn primary_key_columns(tab: SystemInfoTab) -> &'static [usize] {
         SystemInfoTab::Docker => &[0],
         SystemInfoTab::Kubernetes => &[0, 1],
         SystemInfoTab::WebApps => &[0, 1],
+        SystemInfoTab::Supervisor => &[0],
     }
 }
 
@@ -9359,6 +9422,7 @@ const fn tab_id(tab: SystemInfoTab) -> &'static str {
         SystemInfoTab::Docker => "docker",
         SystemInfoTab::Kubernetes => "kubernetes",
         SystemInfoTab::WebApps => "webapps",
+        SystemInfoTab::Supervisor => "supervisor",
     }
 }
 
@@ -9479,6 +9543,8 @@ const NETWORK_COMMAND: &str = concat!(
 /// The fallback walks the init scripts instead, and decides "running" from
 /// what the kernel says is running: a process whose name starts with the
 /// script's (ssh -> sshd, mariadb -> mariadbd), or a live pid file.
+const SUPERVISOR_COMMAND: &str = r#"run=''; if [ "$(id -u)" -eq 0 ]; then run=''; elif sudo -n supervisorctl status >/dev/null 2>&1; then run='sudo -n'; else run=''; fi; $run supervisorctl status 2>/dev/null | head -n 500 | awk '{name=$1; state=$2; pid="-"; note=""; for(i=3;i<=NF;i++){ if($i=="pid" && (i+1)<=NF){gsub(/,/, "", $(i+1)); pid=$(i+1); i++} else note=note (note==""?"":" ") $i } printf "%s\t%s\t%s\t%s\n", name, state, pid, note}' | while IFS="$(printf '\t')" read -r n st p nt; do prog=${n##*:}; conf=$(grep -l "\[program:$prog\]" /etc/supervisor/supervisord.conf /etc/supervisord.conf /etc/supervisor/conf.d/*.conf /etc/supervisor/conf.d/*.ini /etc/supervisord.d/*.conf /etc/supervisord.d/*.ini /usr/local/etc/supervisord.conf 2>/dev/null | head -n 1); printf '%s\t%s\t%s\t%s\t%s\n' "$n" "$st" "$p" "$nt" "${conf:--}"; done"#;
+
 const SERVICES_COMMAND: &str = r#"svc=""; if command -v systemctl >/dev/null 2>&1; then svc=$(systemctl list-units --type=service --all --no-pager --no-legend 2>/dev/null | head -n 500 | awk '{desc=""; for(i=5;i<=NF;i++) desc=desc (i==5?"":" ") $i; gsub(/\t/," ",desc); print $1"\t"$4"\t"$3"\t"desc}'); fi; if [ -n "$svc" ]; then printf '%s\n' "$svc"; elif [ -d /etc/init.d ]; then running=$(cat /proc/[0-9]*/comm 2>/dev/null | sort -u | tr '\n' ' '); for s in /etc/init.d/*; do [ -f "$s" ] && [ -x "$s" ] || continue; n=${s##*/}; case "$n" in README*|skeleton|rc|rcS|functions) continue;; esac; en="未启用"; for l in /etc/rc[2345].d/S*"$n" /etc/runlevels/*/"$n"; do if [ -e "$l" ]; then en="开机启动"; break; fi; done; st="已停止"; case " $running " in *" $n"*) st="运行中";; esac; if [ "$st" = "已停止" ]; then for p in /run/"$n".pid /var/run/"$n".pid /run/"$n"/*.pid /var/run/"$n"/*.pid; do [ -f "$p" ] || continue; pid=$(tr -dc 0-9 < "$p" 2>/dev/null); if [ -n "$pid" ] && [ -d /proc/"$pid" ]; then st="运行中"; break; fi; done; fi; desc=$(sed -n 's/^#[[:space:]]*Short-Description:[[:space:]]*//p' "$s" 2>/dev/null | head -n 1); [ -n "$desc" ] || desc=$(sed -n 's/^#[[:space:]]*Provides:[[:space:]]*//p' "$s" 2>/dev/null | head -n 1); printf '%s\t%s\t%s\t%s\n' "$n" "$st" "$en" "$desc"; done | head -n 500; fi"#;
 /// Outbound connections, whose columns were reading one field too far along.
 ///
@@ -9996,7 +10062,7 @@ mod tests {
 
     #[test]
     fn all_legacy_tabs_have_static_read_only_commands_and_columns() {
-        assert_eq!(SystemInfoTab::ALL.len(), 25);
+        assert_eq!(SystemInfoTab::ALL.len(), 26);
         for tab in SystemInfoTab::ALL {
             assert!(
                 !tab.command(500).trim().is_empty(),

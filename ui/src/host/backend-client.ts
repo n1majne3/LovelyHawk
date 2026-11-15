@@ -178,6 +178,7 @@ import {
   type SystemInfoFirewallResult,
   type SystemInfoRowActions,
   type SystemInfoRowInspection,
+  type SystemInfoHealthCheck,
   type SystemInfoRowPlan,
   type SystemInfoRowReceipt,
   type SystemInfoRowUndo,
@@ -382,6 +383,7 @@ import {
   isSystemInfoFirewallRestorePlan,
   isSystemInfoFirewallResult,
   isSystemInfoOpaqueHandle,
+  isSystemInfoHealthCheck,
   isSystemInfoRowActionKey,
   isSystemInfoRowActions,
   isSystemInfoRowInspection,
@@ -1101,13 +1103,15 @@ export class BackendClient {
     rowId: string,
     action: string,
     password?: string,
+    health?: SystemInfoHealthCheck,
   ): Promise<SystemInfoRowPlan> {
     if (
       !isSystemInfoRowRequest(bindingHandle, snapshotHandle, rowId) ||
       !isSystemInfoRowActionKey(action) ||
       (password !== undefined &&
         (typeof password !== "string" || password.length === 0 ||
-          utf8ByteLength(password) > 1_024))
+          utf8ByteLength(password) > 1_024)) ||
+      (health !== undefined && !isSystemInfoHealthCheck(health))
     ) {
       throw new Error("The system-information row plan request is invalid.");
     }
@@ -1117,6 +1121,9 @@ export class BackendClient {
       rowId,
       action,
       ...(password === undefined ? {} : { password }),
+      ...(health === undefined
+        ? {}
+        : { healthPort: health.port, healthPath: health.path }),
     }, SYSTEM_INFO_ROW_PLAN_TIMEOUT_MS);
     if (!isSystemInfoRowPlan(value) || value.rowId !== rowId || value.action !== action) {
       throw new Error("The backend returned an invalid system-information row plan.");

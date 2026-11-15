@@ -100,6 +100,8 @@ export const BACKEND_ERROR_MESSAGES: Readonly<Record<string, string>> = Object.f
   "system-info-process-restart-tools": "目标机缺少 setsid，无法安全地脱离会话拉起进程，这次没有改动。",
   "system-info-process-restart-cwd": "读取不到原工作目录（可能已删除），按原样拉起会落空，这次没有改动。",
   "system-info-process-restart-changed": "这个进程在计划之后已经退出或被替换，这次没有动它。",
+  "system-info-process-restart-supervised": "这个进程由 Supervisor 管理，请改用 Supervisor 程序页上的重启，避免与托管状态冲突。",
+  "system-info-supervisor-no-tool": "目标机上没有 supervisorctl，或当前账户没有权限访问 Supervisor 管理接口，无法操作它托管的程序。",
   "system-info-module-absent": "这个内核模块没有出现在运行中的模块表里：可能已卸载、是内核内置，或已自我隐藏。隐藏的模块不能按名卸载。",
   "system-info-module-in-use": "这个内核模块仍被引用或被其他模块依赖，现在卸载会失败；先处理依赖（或用‘模块复活点’清理自动加载位置后再重启）。",
   "system-info-module-disabled": "这台主机的内核已禁止模块加载/卸载（modules_disabled=1），重启之前无法卸载，这次没有改动。",

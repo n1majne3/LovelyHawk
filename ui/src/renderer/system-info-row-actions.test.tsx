@@ -324,7 +324,7 @@ describe("system-info row action dialog", () => {
         state={{
           subject: "PID 4242 · /usr/bin/sshd -D",
           rowId: "row-1",
-          needsPassword: false,
+          needsPassword: false, needsHealthCheck: false,
           action: { key: "process.command-line", label: "命令行参数", kind: "inspect", dangerous: false },
           inspection: inspection({ truncated: true }),
           plan: null,
@@ -337,6 +337,7 @@ describe("system-info row action dialog", () => {
         }}
         onConfirm={() => undefined}
         onSubmitPassword={() => undefined}
+        onSubmitHealthCheck={() => undefined}
         onCopyOutput={() => undefined}
         onClose={() => undefined}
       />,
@@ -355,7 +356,7 @@ describe("system-info row action dialog", () => {
     const base = {
       subject: "PID 4242 · /usr/bin/sshd -D",
       rowId: "row-1",
-      needsPassword: false,
+      needsPassword: false, needsHealthCheck: false,
       action: { key: "process.signal.kill", label: "强制终止进程（SIGKILL）", kind: "change" as const, dangerous: true },
       inspection: null,
       busy: false,
@@ -369,6 +370,7 @@ describe("system-info row action dialog", () => {
         state={{ ...base, plan: null, receipt: null, busy: true }}
         onConfirm={() => undefined}
         onSubmitPassword={() => undefined}
+        onSubmitHealthCheck={() => undefined}
         onCopyOutput={() => undefined}
         onClose={() => undefined}
       />,
@@ -381,6 +383,7 @@ describe("system-info row action dialog", () => {
         state={{ ...base, plan: plan(), receipt: null }}
         onConfirm={() => undefined}
         onSubmitPassword={() => undefined}
+        onSubmitHealthCheck={() => undefined}
         onCopyOutput={() => undefined}
         onClose={() => undefined}
       />,
@@ -399,6 +402,7 @@ describe("system-info row action dialog", () => {
         state={{ ...base, plan: plan({ confirmed: true }), receipt: receipt() }}
         onConfirm={() => undefined}
         onSubmitPassword={() => undefined}
+        onSubmitHealthCheck={() => undefined}
         onCopyOutput={() => undefined}
         onClose={() => undefined}
       />,
@@ -412,6 +416,7 @@ describe("system-info row action dialog", () => {
         state={{ ...base, plan: plan({ confirmed: true }), receipt: receipt({ verified: false, restored: true }) }}
         onConfirm={() => undefined}
         onSubmitPassword={() => undefined}
+        onSubmitHealthCheck={() => undefined}
         onCopyOutput={() => undefined}
         onClose={() => undefined}
       />,
@@ -424,7 +429,7 @@ describe("system-info row action dialog", () => {
     const base = {
       subject: "账户 deploy",
       rowId: "row-1",
-      needsPassword: false,
+      needsPassword: false, needsHealthCheck: false,
       action: { key: "user-account.delete", label: "删除账户", kind: "change" as const, dangerous: true },
       inspection: null,
       busy: false,
@@ -446,6 +451,7 @@ describe("system-info row action dialog", () => {
         }}
         onConfirm={() => undefined}
         onSubmitPassword={() => undefined}
+        onSubmitHealthCheck={() => undefined}
         onCopyOutput={() => undefined}
         onClose={() => undefined}
         onOpenWorkbench={() => undefined}
@@ -463,6 +469,7 @@ describe("system-info row action dialog", () => {
         }}
         onConfirm={() => undefined}
         onSubmitPassword={() => undefined}
+        onSubmitHealthCheck={() => undefined}
         onCopyOutput={() => undefined}
         onClose={() => undefined}
         onOpenWorkbench={() => undefined}
@@ -481,7 +488,7 @@ describe("system-info row action dialog", () => {
     const base = {
       subject: "服务 lh-beacon.service",
       rowId: "row-1",
-      needsPassword: false,
+      needsPassword: false, needsHealthCheck: false,
       action: { key: "service.remove-unit", label: "移除服务单元", kind: "change" as const, dangerous: true },
       inspection: null,
       busy: false,
@@ -502,6 +509,7 @@ describe("system-info row action dialog", () => {
         }}
         onConfirm={() => undefined}
         onSubmitPassword={() => undefined}
+        onSubmitHealthCheck={() => undefined}
         onCopyOutput={() => undefined}
         onClose={() => undefined}
         onUndo={() => undefined}
@@ -518,6 +526,7 @@ describe("system-info row action dialog", () => {
         }}
         onConfirm={() => undefined}
         onSubmitPassword={() => undefined}
+        onSubmitHealthCheck={() => undefined}
         onCopyOutput={() => undefined}
         onClose={() => undefined}
         onUndo={() => undefined}
@@ -537,6 +546,7 @@ describe("system-info row action dialog", () => {
         }}
         onConfirm={() => undefined}
         onSubmitPassword={() => undefined}
+        onSubmitHealthCheck={() => undefined}
         onCopyOutput={() => undefined}
         onClose={() => undefined}
       />,
@@ -553,6 +563,7 @@ describe("system-info row action dialog", () => {
         }}
         onConfirm={() => undefined}
         onSubmitPassword={() => undefined}
+        onSubmitHealthCheck={() => undefined}
         onCopyOutput={() => undefined}
         onClose={() => undefined}
         onUndo={() => undefined}
@@ -572,6 +583,7 @@ describe("system-info row action dialog", () => {
         }}
         onConfirm={() => undefined}
         onSubmitPassword={() => undefined}
+        onSubmitHealthCheck={() => undefined}
         onCopyOutput={() => undefined}
         onClose={() => undefined}
         onUndo={() => undefined}

@@ -97,11 +97,13 @@ import {
   isSystemInfoFirewallAddress,
   isSystemInfoFirewallDirection,
   isSystemInfoOpaqueHandle,
+  isSystemInfoHealthCheck,
   isSystemInfoRowActionKey,
   isSystemInfoTabKey,
   isTerminalWindowLaunchResult,
   isWindowThemeInput,
   type BeforeCloseContext,
+  type SystemInfoHealthCheck,
   type LovelyHawkApi,
   type WindowThemeApplied,
 } from "../shared/contract.js";
@@ -509,18 +511,22 @@ export function createMainApi(transport: BackendTransport = hostBackendTransport
       return backend.inspectSystemInfoRow(bindingHandle, snapshotHandle, rowId, action);
     },
     planSystemInfoRowAction: async (...values: unknown[]) => {
-      if (values.length !== 4 && values.length !== 5) {
+      if (values.length < 4 || values.length > 6) {
         refuse("Invalid system-information row plan request.");
       }
-      const [bindingHandle, snapshotHandle, rowId, action, password] = values;
+      const [bindingHandle, snapshotHandle, rowId, action, password, health] = values;
       if (!isSshOpaqueHandle(bindingHandle) || !isSystemInfoOpaqueHandle(snapshotHandle) ||
         !isSystemInfoRowId(rowId) || !isSystemInfoRowActionKey(action) ||
-        (values.length === 5 && !boundedString(password, 1_024, false))) {
+        (values.length >= 5 && password !== undefined && !boundedString(password, 1_024, false)) ||
+        (values.length === 6 && health !== undefined && !isSystemInfoHealthCheck(health))) {
         refuse("Invalid system-information row plan request.");
       }
       return backend.planSystemInfoRowAction(
         bindingHandle, snapshotHandle, rowId, action,
-        values.length === 5 ? password as string : undefined,
+        values.length >= 5 ? password as string | undefined : undefined,
+        values.length === 6 && health !== undefined
+          ? health as SystemInfoHealthCheck
+          : undefined,
       );
     },
     confirmSystemInfoRowAction: async (...values: unknown[]) => {

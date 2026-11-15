@@ -102,6 +102,7 @@ mod structured_sequoia_csv;
 mod structured_xml;
 mod structured_yaml;
 pub mod system_info;
+pub mod supervisor;
 pub mod systemd_unit_removal;
 pub mod target;
 pub mod tomcat_config;

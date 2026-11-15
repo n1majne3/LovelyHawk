@@ -43,6 +43,7 @@ use crate::system_info::{
 pub const RESTART_SESSION_REFUSAL: &str = "process restart session";
 pub const RESTART_INIT_REFUSAL: &str = "process restart init";
 pub const RESTART_MANAGED_REFUSAL: &str = "process restart managed";
+pub const RESTART_SUPERVISED_REFUSAL: &str = "process restart supervised";
 pub const RESTART_PRIVILEGE_REFUSAL: &str = "process restart privilege";
 pub const RESTART_TOOLS_REFUSAL: &str = "process restart tools";
 pub const RESTART_CWD_REFUSAL: &str = "process restart cwd";
@@ -119,6 +120,7 @@ struct RestartProbe {
     /// chain whose death would sever this connection.
     ancestors: Vec<u32>,
     managed: bool,
+    supervised: bool,
     can_signal: bool,
     euid: Option<u32>,
     sudo: bool,
@@ -197,6 +199,10 @@ fn probe_command(pid: u32) -> String {
          uid_n=$(awk '/^Uid:/{{print $2; exit}}' \"/proc/$p/status\" 2>/dev/null); \
          printf 'USER|%s\\n' \"$(getent passwd \"$uid_n\" 2>/dev/null | cut -d: -f1)\"; \
          grep -q '[.]service' \"/proc/$p/cgroup\" 2>/dev/null && echo 'MANAGED|yes' || echo 'MANAGED|no'; \
+         ppid=$(printf '%s\\n' \"$rest\" | awk '{{print $2}}'); \
+         pcomm=$(cat \"/proc/$ppid/comm\" 2>/dev/null); \
+         if [ \"$pcomm\" = 'supervisord' ] || [ \"$(basename \"$(readlink \"/proc/$ppid/exe\" 2>/dev/null)\" 2>/dev/null)\" = 'supervisord' ]; then \
+           echo 'SUPERVISED|yes'; else echo 'SUPERVISED|no'; fi; \
          kill -0 \"$p\" 2>/dev/null && echo 'SIGNAL|yes' || echo 'SIGNAL|no'; \
          printf 'EUID|%s\\n' \"$(id -u)\"; \
          sudo -n true >/dev/null 2>&1 && echo 'SUDO|yes' || echo 'SUDO|no'; \
@@ -234,6 +240,7 @@ fn parse_probe(output: &str) -> RestartProbe {
             "UID" => probe.uid = value.parse().ok(),
             "USER" => probe.user = value.to_owned(),
             "MANAGED" => probe.managed = value == "yes",
+            "SUPERVISED" => probe.supervised = value == "yes",
             "SIGNAL" => probe.can_signal = value == "yes",
             "EUID" => probe.euid = value.parse().ok(),
             "SUDO" => probe.sudo = value == "yes",
@@ -376,6 +383,12 @@ impl SystemInfoService {
             return Err(CoreError::validation(
                 RESTART_MANAGED_REFUSAL,
                 "这个进程由 systemd 管理，请改用服务行上的启动/停止操作，避免与托管状态脱节",
+            ));
+        }
+        if probe.supervised {
+            return Err(CoreError::validation(
+                RESTART_SUPERVISED_REFUSAL,
+                "这个进程由 Supervisor 管理，请改用 Supervisor 程序页上的启动/停止/重启，避免与托管状态冲突",
             ));
         }
         if probe.cwd_hex.is_empty() {

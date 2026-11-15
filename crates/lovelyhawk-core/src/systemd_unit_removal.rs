@@ -468,11 +468,11 @@ impl SystemInfoService {
         let mut operation = OperationPlan::new(
             session.target().clone(),
             format!(
-                "移除 systemd 单元 {}：把单元文件 {}（属主 {}，权限 {}，{}）移入备份目录（不是注释或禁用，文件整体移出单元搜索路径），随后让 systemd 重读单元表。{}{}{}{}{}文件备份在 {}/<计划编号>/ 下，10 分钟内可从回执撤销。",
+                "移除 systemd 单元 {}：把单元文件 {}（属主 {}，权限 {:0>4}，{}）移入备份目录（不是注释或禁用，文件整体移出单元搜索路径），随后让 systemd 重读单元表。{}{}{}{}{}文件备份在 {}/<计划编号>/ 下，10 分钟内可从回执撤销。",
                 snapshot.unit,
                 snapshot.fragment_path,
                 snapshot.owner,
-                format!("{:0>4}", snapshot.mode),
+                snapshot.mode,
                 snapshot.unit_file_state,
                 running_note,
                 dropins_note,

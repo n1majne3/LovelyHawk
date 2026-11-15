@@ -1,5 +1,6 @@
 import { useState } from "react";
 
+import type { SystemInfoHealthCheck } from "../shared/system-info-contract";
 import type { SystemInfoRowActionState } from "./system-info-row-actions";
 import { useModalScrim } from "./modal-scrim";
 import { planExpiryLabel } from "./plan-expiry";
@@ -8,6 +9,8 @@ export interface SystemInfoRowActionDialogProps {
   state: SystemInfoRowActionState;
   onConfirm: () => void;
   onSubmitPassword: (password: string) => void;
+  /** `null` plans the start/restart without a loopback probe. */
+  onSubmitHealthCheck: (health: SystemInfoHealthCheck | null) => void;
   onCopyOutput: (text: string) => void;
   onClose: () => void;
   /** Puts back what a verified removal moved out; the offer is spent once. */
@@ -32,19 +35,29 @@ export function SystemInfoRowActionDialog({
   state,
   onConfirm,
   onSubmitPassword,
+  onSubmitHealthCheck,
   onCopyOutput,
   onClose,
   onUndo,
   onOpenWorkbench,
 }: SystemInfoRowActionDialogProps) {
   useModalScrim();
-  const { action, subject, inspection, plan, receipt, busy, error, needsPassword } = state;
+  const { action, subject, inspection, plan, receipt, busy, error, needsPassword, needsHealthCheck } = state;
   const toolSuspect = receipt !== null && receipt.nextStep === VERIFY_ACCOUNT_TOOL;
   const [password, setPassword] = useState("");
   const [passwordAgain, setPasswordAgain] = useState("");
+  const [healthPort, setHealthPort] = useState("");
+  const [healthPath, setHealthPath] = useState("/");
   const isChange = action.kind === "change";
   const passwordMismatch = passwordAgain.length > 0 && password !== passwordAgain;
   const passwordReady = password.length >= 12 && password === passwordAgain;
+  const healthPortTrimmed = healthPort.trim();
+  const healthPortValue = healthPortTrimmed === "" ? null : Number(healthPortTrimmed);
+  const healthPortValid = healthPortValue === null
+    || (Number.isInteger(healthPortValue) && healthPortValue >= 1 && healthPortValue <= 65_535);
+  const healthPathValid = healthPortValue === null
+    || (healthPath.startsWith("/") && healthPath.length <= 256 && !/\s/u.test(healthPath));
+  const healthReady = healthPortValid && healthPathValid;
   return (
     <div className="system-info-detail-backdrop" role="presentation">
       <section
@@ -133,7 +146,53 @@ export function SystemInfoRowActionDialog({
                 ) : null}
               </div>
             ) : null}
-            {plan === null && error === null && !needsPassword ? (
+            {needsHealthCheck && plan === null ? (
+              <div className="system-info-action-panel">
+                <p className="system-info-action-summary">
+                  可选：操作完成后向目标机的本机回环地址探测一次，确认程序是否开始应答。留空端口则不做探测。
+                </p>
+                <dl>
+                  <div>
+                    <dt><label htmlFor="row-health-port">健康检查端口</label></dt>
+                    <dd>
+                      <input
+                        id="row-health-port"
+                        type="text"
+                        inputMode="numeric"
+                        placeholder="例如 18080，留空不探测"
+                        value={healthPort}
+                        disabled={busy}
+                        onChange={(event) => setHealthPort(event.target.value)}
+                        data-testid="system-info-row-health-port"
+                      />
+                    </dd>
+                  </div>
+                  <div>
+                    <dt><label htmlFor="row-health-path">检查路径</label></dt>
+                    <dd>
+                      <input
+                        id="row-health-path"
+                        type="text"
+                        value={healthPath}
+                        disabled={busy || healthPortValue === null}
+                        onChange={(event) => setHealthPath(event.target.value)}
+                        data-testid="system-info-row-health-path"
+                      />
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>说明</dt>
+                    <dd>将向 http://127.0.0.1:端口路径 请求一次。HTTP 200 只说明该地址有响应，不代表业务已经恢复。</dd>
+                  </div>
+                </dl>
+                {!healthPortValid ? (
+                  <p className="system-info-detail-state error" role="alert">端口需要是 1–65535 的整数，或留空不做探测。</p>
+                ) : !healthPathValid ? (
+                  <p className="system-info-detail-state error" role="alert">路径需要以 / 开头，不超过 256 字节，不含空白字符。</p>
+                ) : null}
+              </div>
+            ) : null}
+            {plan === null && error === null && !needsPassword && !needsHealthCheck ? (
               <div className="system-info-detail-state" role="status">正在读取目标机上的当前状态并准备计划…</div>
             ) : null}
             {plan !== null ? (
@@ -162,6 +221,22 @@ export function SystemInfoRowActionDialog({
                     setPassword("");
                     setPasswordAgain("");
                     onSubmitPassword(value);
+                  }}
+                >
+                  {busy ? "正在计划…" : "生成计划"}
+                </button>
+              ) : needsHealthCheck && plan === null ? (
+                <button
+                  type="button"
+                  className="is-primary"
+                  disabled={busy || !healthReady}
+                  data-testid="system-info-row-health-submit"
+                  onClick={() => {
+                    onSubmitHealthCheck(
+                      healthPortValue === null
+                        ? null
+                        : { port: healthPortValue, path: healthPath },
+                    );
                   }}
                 >
                   {busy ? "正在计划…" : "生成计划"}

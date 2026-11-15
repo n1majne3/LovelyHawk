@@ -1099,6 +1099,15 @@ impl BackendState {
                             params
                                 .password
                                 .map(lovelyhawk_core::crypto::SecretValue::new),
+                            params.health_port.map(|port| {
+                                (
+                                    port,
+                                    params
+                                        .health_path
+                                        .clone()
+                                        .unwrap_or_else(|| "/".to_owned()),
+                                )
+                            }),
                         )
                         .await
                         .map(to_value)
@@ -3968,6 +3977,11 @@ struct SystemInfoRowActionParams {
     /// Only `account.password` may carry one; the api layer refuses it
     /// anywhere else. It becomes a SecretValue before it moves anywhere.
     password: Option<String>,
+    /// Optional loopback health check for `supervisor.start|restart`: the
+    /// port the managed program should answer on once it is running.
+    health_port: Option<u16>,
+    /// URL path for that check; must start with `/`. Core validates both.
+    health_path: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -6009,6 +6023,24 @@ fn system_info_failure(error: SystemInfoApiError) -> RpcFailure {
                     (
                         "system-info-process-restart-managed",
                         "The process is managed by an init system; use its service action.",
+                    )
+                }
+                CoreError::Validation { subject, .. }
+                    if *subject
+                        == lovelyhawk_core::process_restart::RESTART_SUPERVISED_REFUSAL =>
+                {
+                    (
+                        "system-info-process-restart-supervised",
+                        "The process is managed by Supervisor; use the Supervisor program action.",
+                    )
+                }
+                CoreError::Validation { subject, .. }
+                    if *subject
+                        == lovelyhawk_core::supervisor::SUPERVISOR_TOOL_REFUSAL =>
+                {
+                    (
+                        "system-info-supervisor-no-tool",
+                        "supervisorctl is missing or its socket is not accessible.",
                     )
                 }
                 CoreError::Validation { subject, .. }
@@ -10863,11 +10895,18 @@ mod tests {
                 },
             ))
         };
+        use lovelyhawk_core::process_restart::RESTART_SUPERVISED_REFUSAL;
+        use lovelyhawk_core::supervisor::SUPERVISOR_TOOL_REFUSAL;
         for (subject, code) in [
             (USER_ACCOUNT_SESSION_REFUSAL, "system-info-account-session"),
             (USER_ACCOUNT_ROOT_REFUSAL, "system-info-account-root"),
             (USER_ACCOUNT_STATE_REFUSAL, "system-info-account-state"),
             (SSH_KEY_LAST_ROOT_REFUSAL, "system-info-ssh-key-last-root"),
+            (
+                RESTART_SUPERVISED_REFUSAL,
+                "system-info-process-restart-supervised",
+            ),
+            (SUPERVISOR_TOOL_REFUSAL, "system-info-supervisor-no-tool"),
             ("process identity", "system-info-action-unavailable"),
         ] {
             let failure = refused(subject);
@@ -13421,13 +13460,13 @@ mod tests {
         assert!(catalog.ok);
         let catalog = catalog.result.unwrap();
         let tabs = catalog.as_array().unwrap();
-        assert_eq!(tabs.len(), 25);
+        assert_eq!(tabs.len(), 26);
         assert_eq!(
             tabs.iter()
                 .filter_map(|tab| tab["key"].as_str())
                 .collect::<std::collections::HashSet<_>>()
                 .len(),
-            25
+            26
         );
         assert!(tabs.iter().all(|tab| {
             tab["columns"]

@@ -68,7 +68,7 @@ function tableFixture(): Record<string, unknown> {
 }
 
 describe("system-info process-boundary validators", () => {
-  it("accepts only the fixed 25-tab, four-group catalog", () => {
+  it("accepts only the fixed 26-tab, four-group catalog", () => {
     const catalog = catalogFixture();
     expect(isSystemInfoCatalog(catalog)).toBe(true);
     expect(new Set(SYSTEM_INFO_CATALOG.map((entry) => entry.group))).toEqual(

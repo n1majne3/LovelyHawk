@@ -71,7 +71,7 @@ describe("system-info pure helpers", () => {
     expect(grouped.map((group) => group.key)).toEqual([
       "realtime", "persistence", "security", "workload",
     ]);
-    expect(grouped.reduce((total, group) => total + group.tabs.length, 0)).toBe(25);
+    expect(grouped.reduce((total, group) => total + group.tabs.length, 0)).toBe(26);
   });
 
   it("copies bounded plain text without opaque row or snapshot handles", () => {

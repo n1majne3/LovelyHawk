@@ -11,6 +11,7 @@ import {
   type SystemInfoRowActionEntry,
   type SystemInfoRowActions,
   type SystemInfoRowInspection,
+  type SystemInfoHealthCheck,
   type SystemInfoRowPlan,
   type SystemInfoRowReceipt,
 } from "../shared/system-info-contract";
@@ -37,6 +38,8 @@ export interface SystemInfoRowActionState {
   error: string | null;
   /** `account.password` collects the new password before a plan exists. */
   needsPassword: boolean;
+  /** `supervisor.start|restart` may carry a loopback health check into the plan. */
+  needsHealthCheck: boolean;
   /** One-shot undo on a verified removal: busy, what the target said, or why it refused. */
   undoBusy: boolean;
   undoResult: string | null;
@@ -91,6 +94,10 @@ export function rowActionFailureText(error: unknown): string {
       return "1 号进程和内核线程不能走这个通道，请用系统自带方式处理。";
     case "system-info-process-restart-managed":
       return "这个进程由 init 系统托管，请改用对应服务的启动/停止操作，避免与托管状态脱节。";
+    case "system-info-process-restart-supervised":
+      return "这个进程由 Supervisor 管理，请改用 Supervisor 程序页上的重启，避免与托管状态冲突。";
+    case "system-info-supervisor-no-tool":
+      return "目标机上没有 supervisorctl，或当前账户没有权限访问 Supervisor 管理接口，无法操作它托管的程序。";
     case "system-info-process-restart-privilege":
       return "需要进程属主、root 或免密 sudo 才能停止并按原用户重新拉起，这次没有改动。";
     case "system-info-process-restart-tools":
@@ -220,13 +227,23 @@ export function useSystemInfoRowActions(
     if (action.key === "account.password") {
       setState({
         subject, rowId, action, inspection: null, plan: null, receipt: null,
-        busy: false, error: null, needsPassword: true,
+        busy: false, error: null, needsPassword: true, needsHealthCheck: false,
+        undoBusy: false, undoResult: null, undoError: null,
+      });
+      return;
+    }
+    // A start/restart may carry a health check into the plan, so the dialog
+    // asks for it before the plan exists — like the password step.
+    if (action.key === "supervisor.start" || action.key === "supervisor.restart") {
+      setState({
+        subject, rowId, action, inspection: null, plan: null, receipt: null,
+        busy: false, error: null, needsPassword: false, needsHealthCheck: true,
         undoBusy: false, undoResult: null, undoError: null,
       });
       return;
     }
     inFlight.current = true;
-    setState({ subject, rowId, action, inspection: null, plan: null, receipt: null, busy: true, error: null, needsPassword: false, undoBusy: false, undoResult: null, undoError: null });
+    setState({ subject, rowId, action, inspection: null, plan: null, receipt: null, busy: true, error: null, needsPassword: false, needsHealthCheck: false, undoBusy: false, undoResult: null, undoError: null });
     try {
       if (action.kind === "inspect") {
         const inspection = await api.inspectSystemInfoRow(
@@ -295,6 +312,40 @@ export function useSystemInfoRowActions(
     }
   }, [api, bindingHandle, snapshotHandle, state]);
 
+  const submitHealthCheck = useCallback(async (health: SystemInfoHealthCheck | null) => {
+    const current = state;
+    if (
+      current === null ||
+      !current.needsHealthCheck ||
+      bindingHandle === null ||
+      snapshotHandle === null ||
+      inFlight.current
+    ) return;
+    inFlight.current = true;
+    setState({ ...current, busy: true, error: null });
+    try {
+      const plan = await api.planSystemInfoRowAction(
+        bindingHandle,
+        snapshotHandle,
+        current.rowId,
+        current.action.key,
+        undefined,
+        health ?? undefined,
+      );
+      if (!isSystemInfoRowPlan(plan) || plan.action !== current.action.key) {
+        throw new Error("目标机返回的操作计划无法识别。");
+      }
+      planHandleRef.current = plan.planHandle;
+      setState((previous) => previous === null ? null
+        : { ...previous, plan, needsHealthCheck: false, busy: false, error: null });
+    } catch (error) {
+      setState((previous) => previous === null ? null
+        : { ...previous, busy: false, error: rowActionFailureText(error) });
+    } finally {
+      inFlight.current = false;
+    }
+  }, [api, bindingHandle, snapshotHandle, state]);
+
   const confirm = useCallback(async () => {
     const planHandle = planHandleRef.current;
     if (bindingHandle === null || planHandle === null || inFlight.current) return;
@@ -343,5 +394,5 @@ export function useSystemInfoRowActions(
     }
   }, [api, bindingHandle, state]);
 
-  return { menu, state, openMenu, dismissMenu, choose, submitPassword, confirm, undo, close };
+  return { menu, state, openMenu, dismissMenu, choose, submitPassword, submitHealthCheck, confirm, undo, close };
 }

@@ -26,10 +26,30 @@ export const SYSTEM_INFO_TAB_KEYS = [
   "docker",
   "kubernetes",
   "web-apps",
+  "supervisor",
 ] as const;
 
 export type SystemInfoTabKey = (typeof SYSTEM_INFO_TAB_KEYS)[number];
 export type SystemInfoRisk = "normal" | "warning" | "high";
+
+/** The loopback probe a supervisor start/restart may follow with. */
+export interface SystemInfoHealthCheck {
+  port: number;
+  path: string;
+}
+
+export function isSystemInfoHealthCheck(value: unknown): value is SystemInfoHealthCheck {
+  return (
+    isRecord(value) &&
+    exact(value, ["port", "path"]) &&
+    Number.isInteger(value.port) &&
+    (value.port as number) >= 1 &&
+    (value.port as number) <= 65_535 &&
+    typeof value.path === "string" &&
+    value.path.startsWith("/") &&
+    utf8(value.path, 256)
+  );
+}
 
 export interface SystemInfoTabCatalogEntry {
   key: SystemInfoTabKey;
@@ -273,6 +293,7 @@ export interface SystemInfoApi {
     rowId: string,
     action: string,
     password?: string,
+    health?: SystemInfoHealthCheck,
   ): Promise<unknown>;
   confirmSystemInfoRowAction(bindingHandle: string, planHandle: string): Promise<unknown>;
   executeSystemInfoRowAction(bindingHandle: string, planHandle: string): Promise<unknown>;
@@ -318,6 +339,7 @@ export const SYSTEM_INFO_CATALOG: readonly CatalogDefinition[] = [
   { key: "docker", label: "Docker", group: "workload", groupLabel: "工作负载", columns: ["ID", "名称", "镜像", "状态", "端口", "创建时间"] },
   { key: "kubernetes", label: "Kubernetes", group: "workload", groupLabel: "工作负载", columns: ["Namespace", "名称", "Ready", "状态", "重启", "Age"] },
   { key: "web-apps", label: "Web 应用", group: "workload", groupLabel: "工作负载", columns: ["类型", "路径/URL", "状态", "配置文件", "运行用户"] },
+  { key: "supervisor", label: "Supervisor 程序", group: "workload", groupLabel: "工作负载", columns: ["程序", "状态", "PID", "说明", "配置文件"] },
 ];
 
 type JsonRecord = Record<string, unknown>;
