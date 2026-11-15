@@ -539,6 +539,17 @@ impl SystemInfoService {
     }
 }
 
+/// Runs the whole script as one privileged unit: plainly under a root
+/// login, or through `sudo -n sh -c` so redirects, builtins and sequencing
+/// run at the same privilege instead of only the first word.
+fn privileged_script(prefix: &str, script: String) -> String {
+    if prefix.is_empty() {
+        script
+    } else {
+        format!("sudo -n sh -c {}", shq(&script))
+    }
+}
+
 impl SystemdUnitRemovalUndo {
     /// Put the removed pieces back. Refuses when anything the removal left
     /// has since been recreated or the backup no longer matches, so an undo
@@ -561,15 +572,14 @@ impl SystemdUnitRemovalUndo {
         guards.push_str(&format!("cd {}", shq(&self.backup_dir)));
         for (backup, sha) in self.backup_files() {
             guards.push_str(&format!(
-                "; echo '{}  {}' | {}sha256sum -c --status - || exit 42",
+                "; echo '{}  {}' | sha256sum -c --status - || exit 42",
                 sha,
                 shq(&backup),
-                self.prefix
             ));
         }
         let output = service
             .ssh
-            .execute_bound(session, format!("{}{}", self.prefix, guards), EXECUTE_TIMEOUT)
+            .execute_bound(session, privileged_script(self.prefix, guards), EXECUTE_TIMEOUT)
             .await?;
         if output.timed_out || output.exit_code != Some(0) {
             return Err(refusal(
@@ -581,7 +591,7 @@ impl SystemdUnitRemovalUndo {
             ));
         }
         // Move back, preserving what the removal preserved.
-        let mut restore = format!("{}set -e; ", self.prefix);
+        let mut restore = String::from("set -e; ");
         restore.push_str(&format!(
             "mv -- {}/fragment/{} {}; ",
             shq(&self.backup_dir),
@@ -623,10 +633,10 @@ impl SystemdUnitRemovalUndo {
                 shq(&link.path)
             ));
         }
-        restore.push_str(&format!("{}systemctl daemon-reload", self.prefix));
+        restore.push_str("systemctl daemon-reload");
         let output = service
             .ssh
-            .execute_bound(session, restore, EXECUTE_TIMEOUT)
+            .execute_bound(session, privileged_script(self.prefix, restore), EXECUTE_TIMEOUT)
             .await?;
         if output.timed_out || output.exit_code != Some(0) {
             return Err(refusal(
@@ -778,12 +788,12 @@ impl OperationExecutor for UnitRemovalExecutor<'_> {
         let prefix = self.plan.prefix;
         let mut script = String::from("set -e; ");
         if self.plan.snapshot.active_state == "active" {
-            script.push_str(&format!("{prefix}systemctl stop -- {unit}; "));
+            script.push_str(&format!("systemctl stop -- {unit}; "));
         }
-        script.push_str(&format!("{prefix}install -d -m 700 {backup_dir}/fragment {backup_dir}/links; ", backup_dir = shq(&backup)));
+        script.push_str(&format!("install -d -m 700 {backup_dir}/fragment {backup_dir}/links; ", backup_dir = shq(&backup)));
         if !self.plan.snapshot.dropins.is_empty() {
             script.push_str(&format!(
-                "{prefix}mv -- {dropin_dir} {backup_dir}/dropins; ",
+                "mv -- {dropin_dir} {backup_dir}/dropins; ",
                 dropin_dir = shq(&format!("/etc/systemd/system/{}.d", self.plan.snapshot.unit)),
                 backup_dir = shq(&backup)
             ));
@@ -796,7 +806,7 @@ impl OperationExecutor for UnitRemovalExecutor<'_> {
             .next()
             .unwrap_or_default();
         script.push_str(&format!(
-            "{prefix}mv -- {} {}/fragment/{}; ",
+            "mv -- {} {}/fragment/{}; ",
             shq(&self.plan.snapshot.fragment_path),
             shq(&backup),
             shq(fragment_name)
@@ -804,7 +814,7 @@ impl OperationExecutor for UnitRemovalExecutor<'_> {
         for link in &self.plan.snapshot.links {
             let group = link.path.rsplit('/').nth(1).unwrap_or_default();
             script.push_str(&format!(
-                "{prefix}install -d -m 700 {}/links/{}; {prefix}mv -- {} {}/links/{}/; ",
+                "install -d -m 700 {}/links/{}; mv -- {} {}/links/{}/; ",
                 shq(&backup),
                 shq(group),
                 shq(&link.path),
@@ -827,11 +837,11 @@ impl OperationExecutor for UnitRemovalExecutor<'_> {
             script.push_str(&format!("printf 'dropin %s %s\\n' {} {}; ", shq(&dropin.path), shq(&dropin.sha256)));
         }
         script.push_str(&format!("}} > {}/manifest.txt; ", shq(&backup)));
-        script.push_str(&format!("{prefix}systemctl daemon-reload; {prefix}systemctl reset-failed -- {unit} 2>/dev/null || true"));
+        script.push_str(&format!("systemctl daemon-reload; systemctl reset-failed -- {unit} 2>/dev/null || true"));
         let output: SshCommandOutput = self
             .service
             .ssh
-            .execute_bound(self.session, script, EXECUTE_TIMEOUT)
+            .execute_bound(self.session, privileged_script(prefix, script), EXECUTE_TIMEOUT)
             .await?;
         if output.timed_out || output.exit_code != Some(0) {
             return Err(refusal(
