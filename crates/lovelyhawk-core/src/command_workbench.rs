@@ -1020,56 +1020,67 @@ if [ -z "$lh_conf" ]; then echo '# 未发现 lighttpd 进程或默认配置，�
 if ! command -v lighttpd >/dev/null 2>&1; then printf '# lighttpd 命令不可用，仅按配置文件 %s 原文检查\n' "$lh_conf"; lh_eff=$(cat "$lh_conf" 2>/dev/null); else
   echo "=== lighttpd -tt -f $lh_conf（语法自检） ==="; lighttpd -tt -f "$lh_conf" 2>&1 | head -n 40
   lh_eff=$(lighttpd -p -f "$lh_conf" 2>/dev/null | head -n 4000)
-  echo "=== lighttpd -p -f $lh_conf（生效配置，前 300 行，检查按前 4000 行） ==="; printf '%s
-' "$lh_eff" | head -n 300
+  echo "=== lighttpd -p -f $lh_conf（生效配置，前 300 行，检查按前 4000 行；mimetype.assign 表已省略） ==="; printf '%s
+' "$lh_eff" | awk -v h='#' '{ if (!lh_skip && $0 ~ /mimetype\.assign/) { print h " （mimetype.assign 表已省略）"; lh_skip=1; next } if (lh_skip) { if ($0 ~ /^[[:space:]]*\)/) { lh_skip=0; next } if ($0 ~ /^[a-zA-Z0-9._-]+[[:space:]]*=[[:space:]]/) { lh_skip=0; print; next } next } print }' | head -n 300
 fi
+lh_step
 lh_has() { printf '%s
 ' "$lh_eff" | grep -qi "$1"; }
 if lh_has 'mod_cgi'; then
   lh_cgi=$(printf '%s
 ' "$lh_eff" | grep -i 'cgi.assign' -A4 | head -n 20)
-  if [ -z "$lh_cgi" ]; then echo '关注：加载了 mod_cgi 但未见 cgi.assign，需人工确认 CGI 是否实际启用'; else
-    printf '%s
-' "$lh_cgi" | grep -Eq '""[[:space:]]*(=>|,)|\.(sh|py|pl|cgi)("|/|[[:space:]]*=>)' && echo '关注：cgi.assign 为 .sh/.py/.pl/.cgi 映射了解释器或空串处理器（CGI 可直接执行脚本）：'"$(printf '%s' "$lh_cgi" | tr '\n' ';' | head -c 400)"
+  if [ -z "$lh_cgi" ]; then lh_hit '加载了 mod_cgi 但未见 cgi.assign，需人工确认 CGI 是否实际启用'; else
+    lh_cgi_maps=$(printf '%s
+' "$lh_cgi" | grep -iE '""[[:space:]]*(=>|,)|\.(sh|py|pl|cgi)("|/|[[:space:]]*=>)' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | head -n 10)
+    [ -n "$lh_cgi_maps" ] && lh_hit "cgi.assign 为 .sh/.py/.pl/.cgi 映射了解释器或空串处理器（CGI 可直接执行脚本）：$(printf '%s' "$lh_cgi_maps" | tr '\n' ';' | head -c 400)"
   fi
 fi
 lh_has 'dir-listing' && printf '%s
-' "$lh_eff" | grep -Eiq '(dir-listing.activate|server.dir-listing)[[:space:]]*=[[:space:]]*"?(enable|on|true)' && echo '关注：目录列表已开启（dir-listing），任何无索引文件的目录都会暴露文件清单'
+' "$lh_eff" | grep -Eiq '(dir-listing.activate|server.dir-listing)[[:space:]]*=[[:space:]]*"?(enable|on|true)' && lh_hit '目录列表已开启（dir-listing），任何无索引文件的目录都会暴露文件清单'
 printf '%s
-' "$lh_eff" | grep -q 'server.username' || echo '关注：配置中没有 server.username，lighttpd 可能以启动用户（常为 root）运行 worker'
+' "$lh_eff" | grep -q 'server.username' || lh_hit '配置中没有 server.username，lighttpd 可能以启动用户（常为 root）运行 worker'
 printf '%s
-' "$lh_eff" | grep -i 'server.username' | grep -Eq '"?(root|"0")' && echo '关注：server.username 配置为 root，worker 以最高权限运行'
+' "$lh_eff" | grep -i 'server.username' | grep -Eq '"?(root|"0")' && lh_hit 'server.username 配置为 root，worker 以最高权限运行'
 lh_root=$(printf '%s
 ' "$lh_eff" | grep -i 'server.document-root' | head -n 1 | sed 's/.*=[> ]*//; s/^"//; s/"[[:space:]]*,*[[:space:]]*$//')
-printf '%s
-' "$lh_eff" | grep -i 'alias.url' -A4 | grep -i '=>' | while read -r lh_line; do
+lh_alias_lines=$(printf '%s
+' "$lh_eff" | grep -i 'alias.url' -A4 | grep -i '=>' | head -n 20)
+[ -n "$lh_alias_lines" ] && while IFS= read -r lh_line; do
   lh_t=$(echo "$lh_line" | sed 's/.*=>[[:space:]]*//; s/^"//; s/"[[:space:]]*,*[[:space:]]*$//')
   case "$lh_t" in
-    /*) if [ -z "$lh_root" ]; then echo "关注：alias.url 存在别名 $lh_t，缺少 server.document-root 无法判断是否越界"; else case "$lh_t" in "$lh_root"|"$lh_root"/*) ;; *) echo "关注：alias.url 指向站点根目录之外：$lh_t（根 $lh_root）";; esac; fi ;;
+    /*) if [ -z "$lh_root" ]; then lh_hit "alias.url 存在别名 $lh_t，缺少 server.document-root 无法判断是否越界"; else case "$lh_t" in "$lh_root"|"$lh_root"/*) ;; *) lh_hit "alias.url 指向站点根目录之外：$lh_t（根 $lh_root）";; esac; fi ;;
     *) ;;
   esac
-done | head -n 20
-lh_has 'mod_proxy' && echo '关注：加载了 mod_proxy，后端转发目标需人工核对（可能被改成后门回连）：'"$(printf '%s
+done <<LH_ALIAS_EOF
+$lh_alias_lines
+LH_ALIAS_EOF
+lh_has 'mod_proxy' && lh_hit "加载了 mod_proxy，后端转发目标需人工核对（可能被改成后门回连）：$(printf '%s
 ' "$lh_eff" | grep -i 'proxy.server' | head -n 5 | tr '\n' ';' | head -c 300)"
 printf '%s
-' "$lh_eff" | grep -q 'url.access-deny' || echo '关注：配置中没有 url.access-deny，敏感后缀（.conf/.bak/.sql 等）可被直接下载'
+' "$lh_eff" | grep -q 'url.access-deny' || lh_hit '配置中没有 url.access-deny，敏感后缀（.conf/.bak/.sql 等）可被直接下载'
 if ! lh_has 'mod_auth' && ! printf '%s
 ' "$lh_eff" | grep -q 'auth.require'; then
-  echo '关注：未发现认证配置，是否需要认证取决于业务（管理或诊断端点通常需要）'
+  lh_hit '未发现认证配置，是否需要认证取决于业务（管理或诊断端点通常需要）'
 fi
 lh_dirs=$(printf '%s
 ' "$lh_eff" | grep -i 'cgi.assign' -A3 | grep -oE '/[A-Za-z0-9._/-]+' | sort -u; [ -n "$lh_root" ] && echo "$lh_root")
-lh_seen=0
-for lh_d in /usr/lib/cgi-bin /var/www/cgi-bin $lh_dirs; do
+lh_scripts=$(for lh_d in /usr/lib/cgi-bin /var/www/cgi-bin $lh_dirs; do
   [ -d "$lh_d" ] 2>/dev/null || continue
   find "$lh_d" -maxdepth 3 -type f \( -name '*.sh' -o -name '*.py' -o -name '*.pl' -o -name '*.cgi' -o -name '*.lua' \) 2>/dev/null
-done | sort -u | head -n 200 | while read -r lh_s; do
+done | sort -u | head -n 200)
+[ -n "$lh_scripts" ] && while IFS= read -r lh_s; do
+  [ -n "$lh_s" ] || continue
+  lh_step
   echo "CGI：$lh_s"
-  grep -nE 'system[[:space:]]*\(|popen[[:space:]]*\(|os\.system|subprocess.*shell=True|eval[[:space:]]*[( ]|`[^`]+`|\$(QUERY_STRING|1)([^A-Za-z0-9_]|$)' "$lh_s" 2>/dev/null | head -n 10 | while IFS=: read -r lh_ln lh_txt; do
-    echo "关注：$lh_s:$lh_ln 可能存在命令拼接，需人工核对：$(echo "$lh_txt" | head -c 200)"
-  done
-done
-lh_finish
+  lh_susp=$(grep -nE 'system[[:space:]]*\(|popen[[:space:]]*\(|os\.system|subprocess.*shell=True|eval[[:space:]]*[( ]|`[^`]+`|\$(QUERY_STRING|1)([^A-Za-z0-9_]|$)' "$lh_s" 2>/dev/null | head -n 10)
+  [ -n "$lh_susp" ] && while IFS=: read -r lh_ln lh_txt; do
+    [ -n "$lh_ln" ] && lh_hit "$lh_s:$lh_ln 可能存在命令拼接，需人工核对：$(echo "$lh_txt" | head -c 200)"
+  done <<LH_SUSP_EOF
+$lh_susp
+LH_SUSP_EOF
+done <<LH_SCRIPTS_EOF
+$lh_scripts
+LH_SCRIPTS_EOF
 "#);
 
 const CMD_NETWORK_OUTBOUND_PERIODIC: &str = bounded_observation!(
