@@ -1,11 +1,12 @@
 import { TransientNotice } from "./NotificationCenter";
 import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState, useSyncExternalStore } from "react";
-import type { MySqlInstanceReview, MySqlPasswordChange, MySqlProfileInput, MySqlProfileSummary, MySqlReviewLevel, MySqlRuntimeApi } from "../shared/mysql-runtime-contract";
+import type { MySqlAccountInput, MySqlInstanceReview, MySqlPasswordChange, MySqlProfileInput, MySqlProfileSummary, MySqlReviewLevel, MySqlRuntimeApi } from "../shared/mysql-runtime-contract";
 import { MysqlRuntimeController } from "./mysql-runtime-controller";
 import { DialogHost } from "./DialogHost";
 import { useConfirmDialog } from "./use-confirm-dialog";
 import { useModalScrim } from "./modal-scrim";
 import { MysqlPasswordDialog, type PasswordDirty } from "./MysqlPasswordDialog";
+import { MysqlPrivilegePanel } from "./MysqlPrivilegePanel";
 import "./database-page.css";
 
 export interface MysqlPageHandle { beforeDeactivate(): Promise<boolean> }
@@ -56,7 +57,7 @@ function MysqlProfileEditor({ editor, saving, error, onChange, onSubmit, onCance
 const reviewLevelText: Record<MySqlReviewLevel, string> = { info: "参考", review: "需人工核对", high: "高风险" };
 const reviewLevelClass: Record<MySqlReviewLevel, string> = { info: "is-info", review: "is-review", high: "is-high" };
 const reviewVariables = ["general_log", "general_log_file", "log_output", "local_infile", "secure_file_priv"] as const;
-export function MysqlReviewPanel({ profile, review, onClose }: { profile: MySqlProfileSummary; review: MySqlInstanceReview; onClose(): void }): React.JSX.Element {
+export function MysqlReviewPanel({ profile, review, onClose, onPrivileges }: { profile: MySqlProfileSummary; review: MySqlInstanceReview; onClose(): void; onPrivileges?(account: MySqlAccountInput): void }): React.JSX.Element {
   return <section className="database-result" aria-label={`实例检查：${profile.name}`}>
     <h3>实例检查：{profile.name}</h3>
     <p>{review.product} {review.serverVersion} · 连接账号 {review.connecting} · 账号 {review.accounts.length}/{review.accountTotal} 个 · 自定义函数 {review.udfTotal} 个</p>
@@ -67,11 +68,12 @@ export function MysqlReviewPanel({ profile, review, onClose }: { profile: MySqlP
     </li>)}</ul> : <p>未返回线索条目。</p>}
     <h4>数据库账号（{review.accounts.length}/{review.accountTotal}）</h4>
     {review.accounts.length ? <div className="database-table" tabIndex={0} role="region" aria-label="数据库账号，可横向滚动"><table>
-      <thead><tr><th>账号</th><th>认证插件</th><th>高危权限</th><th>状态</th></tr></thead>
+      <thead><tr><th>账号</th><th>认证插件</th><th>高危权限</th><th>状态</th><th>操作</th></tr></thead>
       <tbody>{review.accounts.map((account, index) => <tr key={`${account.user}@${account.host}-${index}`}>
         <th scope="row">{account.user}@{account.host}</th><td>{account.plugin}</td>
         <td>{[account.superuser ? "SUPER" : null, account.filePriv ? "FILE" : null, account.grantPriv ? "GRANT" : null].filter(Boolean).join("、") || "—"}</td>
         <td>{account.emptySecret ? <span className="database-badge is-high">空口令</span> : null}{account.locked === true ? <> <span className="database-badge">已锁定</span></> : account.locked === null ? <> <span className="database-badge">锁定状态未知</span></> : null}{!account.emptySecret && account.locked === false ? "—" : null}</td>
+        <td>{onPrivileges ? <button type="button" data-testid={`mysql-privileges-${account.user}-${account.host}`} onClick={() => onPrivileges({ user: account.user, host: account.host })}>账号权限…</button> : null}</td>
       </tr>)}</tbody></table></div> : <p>未取得账号列表。</p>}
     {review.udfs.length || review.udfTotal ? <>
       <h4>自定义函数 UDF（{review.udfs.length}/{review.udfTotal}）</h4>
@@ -100,6 +102,7 @@ export const MysqlPage = forwardRef<MysqlPageHandle, MysqlPageProps>(function My
   const [saving, setSaving] = useState(false);
   const [dialogBusy, setDialogBusy] = useState(false);
   const [passwordProfile, setPasswordProfile] = useState<MySqlProfileSummary | null>(null);
+  const [privilegeTarget, setPrivilegeTarget] = useState<{ profile: MySqlProfileSummary; account: MySqlAccountInput } | null>(null);
   const passwordDirty = useRef<PasswordDirty>("none");
   const passwordOpener = useRef<HTMLElement | null>(null);
   const dialog = useConfirmDialog();
@@ -108,7 +111,7 @@ export const MysqlPage = forwardRef<MysqlPageHandle, MysqlPageProps>(function My
   const heading = useRef<HTMLHeadingElement>(null);
   const blocked = state.busy || saving || dialogBusy;
   useEffect(() => {
-    setEditor(null); editorRef.current = null; setSaving(false); setDialogBusy(false); setPasswordProfile(null); passwordDirty.current = "none";
+    setEditor(null); editorRef.current = null; setSaving(false); setDialogBusy(false); setPasswordProfile(null); setPrivilegeTarget(null); passwordDirty.current = "none";
     if (dialog.dialog) dialog.resolve({ kind: "cancelled", dialogId: dialog.dialog.id });
     if (bindingHandle) void controller.list();
     return controller.dispose;
@@ -217,7 +220,8 @@ export const MysqlPage = forwardRef<MysqlPageHandle, MysqlPageProps>(function My
           </tr>)}</tbody></table></div> : null}
         {state.profiles.map(item => {
           const review = state.reviews[item.profileHandle];
-          return review ? <MysqlReviewPanel key={item.profileHandle} profile={item} review={review} onClose={() => controller.clearReview(item.profileHandle)} /> : null;
+          return review ? <MysqlReviewPanel key={item.profileHandle} profile={item} review={review} onClose={() => controller.clearReview(item.profileHandle)}
+            onPrivileges={account => setPrivilegeTarget({ profile: item, account })} /> : null;
         })}
         {state.profiles.some(profile => profile.unassigned) ? <p>标记“待关联”的旧连接需要先编辑并保存，明确关联当前 SSH 主机后才能修改口令。</p> : null}
       </>}
@@ -233,6 +237,9 @@ export const MysqlPage = forwardRef<MysqlPageHandle, MysqlPageProps>(function My
       onProfile={profile => { setPasswordProfile(profile); controller.clearReview(profile.profileHandle); void controller.list(); }}
       onInvalidate={() => { if (passwordProfile) controller.clearReview(passwordProfile.profileHandle); void controller.list(); }}
       ask={dialog.ask} /> : null}
+    {privilegeTarget && bindingHandle ? <MysqlPrivilegePanel profile={privilegeTarget.profile} account={privilegeTarget.account}
+      binding={bindingHandle} request={controller.request} busy={state.busy}
+      onClose={() => setPrivilegeTarget(null)} /> : null}
     {dialog.dialog ? <DialogHost dialog={dialog.dialog} onResolve={dialog.resolve} /> : null}
   </section>;
 });

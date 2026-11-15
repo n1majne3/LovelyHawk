@@ -21,6 +21,7 @@ use lovelyhawk_core::{
     },
     database_password::SavedPasswordUpdate,
     mysql_native::{MySqlTlsMode, MySqlTlsSettings},
+    mysql_privilege::{self, GrantScope, MySqlPrivilegePlan},
     mysql_password::{
         MySqlAccount, MySqlPasswordPlan, MySqlPasswordRestorePlan, MySqlPasswordRestoreToken,
         MySqlPasswordVerification,
@@ -85,6 +86,42 @@ pub(crate) enum MySqlRuntimeRequest {
         binding_handle: String,
         plan_handle: String,
     },
+    Privileges {
+        binding_handle: String,
+        profile_handle: String,
+        account: AccountInput,
+    },
+    PlanPrivileges {
+        binding_handle: String,
+        profile_handle: String,
+        account: AccountInput,
+        revokes: Vec<RevokeInput>,
+        grants: Vec<PrivilegeAddInput>,
+    },
+    ExecutePrivileges {
+        binding_handle: String,
+        plan_handle: String,
+    },
+    UndoPrivileges {
+        binding_handle: String,
+        plan_handle: String,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct RevokeInput {
+    pub row: usize,
+    pub privileges: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PrivilegeAddInput {
+    pub database: String,
+    #[serde(default)]
+    pub table: Option<String>,
+    pub privileges: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -167,6 +204,21 @@ struct RestoreSlot {
     token: MySqlPasswordRestoreToken,
 }
 
+struct PrivilegePlanSlot {
+    handle: String,
+    profile_handle: String,
+    plan: MySqlPrivilegePlan,
+}
+
+struct PrivilegeUndoSlot {
+    handle: String,
+    profile_handle: String,
+    plan: MySqlPrivilegePlan,
+    applied_lines: Vec<String>,
+    applied: usize,
+    at: Instant,
+}
+
 struct Entry {
     scope: Scope,
     touched: Instant,
@@ -177,7 +229,13 @@ struct Entry {
     restore_plan: Option<RestorePlan>,
     restore: Option<RestoreSlot>,
     password_busy: bool,
+    privilege_plan: Option<PrivilegePlanSlot>,
+    privilege_undo: Option<PrivilegeUndoSlot>,
+    privilege_busy: bool,
 }
+
+/// Ten minutes, like the other guarded-undo windows.
+const UNDO_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 
 #[derive(Clone)]
 pub(crate) struct MySqlRuntimeApi {
@@ -229,6 +287,10 @@ fn action_name(request: &MySqlRuntimeRequest) -> &'static str {
         MySqlRuntimeRequest::ExecutePassword { .. } => "execute-password",
         MySqlRuntimeRequest::PlanPasswordRestore { .. } => "plan-password-restore",
         MySqlRuntimeRequest::ExecutePasswordRestore { .. } => "execute-password-restore",
+        MySqlRuntimeRequest::Privileges { .. } => "privileges",
+        MySqlRuntimeRequest::PlanPrivileges { .. } => "plan-privileges",
+        MySqlRuntimeRequest::ExecutePrivileges { .. } => "execute-privileges",
+        MySqlRuntimeRequest::UndoPrivileges { .. } => "undo-privileges",
     }
 }
 
@@ -333,7 +395,7 @@ impl MySqlRuntimeApi {
     }
 
     fn idle(entry: &Entry) -> Result<()> {
-        if entry.password_busy || entry.deleting {
+        if entry.password_busy || entry.deleting || entry.privilege_busy {
             return Err(MySqlRuntimeError::Busy);
         }
         Ok(())
@@ -400,7 +462,11 @@ impl MySqlRuntimeApi {
             | PlanPassword { binding_handle, .. }
             | ExecutePassword { binding_handle, .. }
             | PlanPasswordRestore { binding_handle, .. }
-            | ExecutePasswordRestore { binding_handle, .. } => binding_handle,
+            | ExecutePasswordRestore { binding_handle, .. }
+            | Privileges { binding_handle, .. }
+            | PlanPrivileges { binding_handle, .. }
+            | ExecutePrivileges { binding_handle, .. }
+            | UndoPrivileges { binding_handle, .. } => binding_handle,
         };
         let (scope, session) = self.capture(binding)?;
         let response = match request {
@@ -436,6 +502,9 @@ impl MySqlRuntimeApi {
                         restore_plan: None,
                         restore: None,
                         password_busy: false,
+                        privilege_plan: None,
+                        privilege_undo: None,
+                        privilege_busy: false,
                     });
                 Self::idle(entry)?;
                 let mut refreshed = HashMap::new();
@@ -830,6 +899,218 @@ impl MySqlRuntimeApi {
                     "profile":profile,
                 }})
             }
+            Privileges {
+                profile_handle,
+                account,
+                ..
+            } => {
+                let account = MySqlAccount::new(&account.user, &account.host)
+                    .map_err(|_| MySqlRuntimeError::Invalid)?;
+                let snapshot = self.with_entry(&scope, |entry| {
+                    Self::idle(entry)?;
+                    self.profile(entry, &profile_handle)
+                })?;
+                let (read, _profile_id) = self
+                    .services
+                    .database()
+                    .mysql_privilege_review(&session, &snapshot, account)
+                    .await
+                    .map_err(core_error)?;
+                let rows = mysql_privilege::parse_show_grants(&read.grant_lines);
+                let dto_rows: Vec<Value> = rows
+                    .iter()
+                    .enumerate()
+                    .map(|(index, row)| {
+                        let (kind, db, table) = match &row.scope {
+                            GrantScope::Global => ("global", None, None),
+                            GrantScope::Database(db) => ("database", Some(db.clone()), None),
+                            GrantScope::Table(db, table) => {
+                                ("table", Some(db.clone()), Some(table.clone()))
+                            }
+                            GrantScope::Other => ("other", None, None),
+                        };
+                        json!({"row":index,"raw":row.raw,"parseable":row.parseable,
+                            "scope":{"kind":kind,"database":db,"table":table},
+                            "privileges":row.privileges,
+                            "members":row.members(),
+                            "allPrivileges":row.all_privileges,
+                            "grantOption":row.grant_option})
+                    })
+                    .collect();
+                self.with_entry(&scope, |entry| {
+                    Self::idle(entry)?;
+                    entry.touched = Instant::now();
+                    Ok(())
+                })?;
+                json!({"kind":"privileges","review":{
+                    "product":match read.product {
+                        lovelyhawk_core::mysql_password::MySqlProduct::MySql => "MySQL",
+                        lovelyhawk_core::mysql_password::MySqlProduct::MariaDb => "MariaDB",
+                    },
+                    "serverVersion":read.server_version,
+                    "connecting":{"user":read.connecting.user,"host":read.connecting.host},
+                    "rows":dto_rows,
+                    "schemas":read.schemas,
+                    "tables":read.tables.iter()
+                        .map(|(db, table)| json!({"database":db,"table":table}))
+                        .collect::<Vec<Value>>(),
+                }})
+            }
+            PlanPrivileges {
+                profile_handle,
+                account,
+                revokes,
+                grants,
+                ..
+            } => {
+                let account = MySqlAccount::new(&account.user, &account.host)
+                    .map_err(|_| MySqlRuntimeError::Invalid)?;
+                if revokes.len() > 200
+                    || grants.len() > 200
+                    || revokes.iter().any(|row| row.privileges.len() > 64)
+                    || grants.iter().any(|row| row.privileges.len() > 64)
+                {
+                    return Err(MySqlRuntimeError::Invalid);
+                }
+                let snapshot = self.with_entry(&scope, |entry| {
+                    Self::idle(entry)?;
+                    self.profile(entry, &profile_handle)
+                })?;
+                let revoke_choices: Vec<mysql_privilege::RevokeChoice> = revokes
+                    .iter()
+                    .map(|row| mysql_privilege::RevokeChoice {
+                        row: row.row,
+                        privileges: row.privileges.clone(),
+                    })
+                    .collect();
+                let add_choices: Vec<mysql_privilege::AddChoice> = grants
+                    .iter()
+                    .map(|row| mysql_privilege::AddChoice {
+                        scope: match &row.table {
+                            Some(table) => GrantScope::Table(
+                                row.database.clone(),
+                                table.clone(),
+                            ),
+                            None => GrantScope::Database(row.database.clone()),
+                        },
+                        privileges: row.privileges.clone(),
+                    })
+                    .collect();
+                let plan = self
+                    .services
+                    .database()
+                    .plan_mysql_privileges(&session, &snapshot, account, revoke_choices, add_choices)
+                    .await
+                    .map_err(core_error)?;
+                let view =
+                    serde_json::to_value(&plan.view).map_err(|_| MySqlRuntimeError::Store)?;
+                self.with_entry(&scope, |entry| {
+                    Self::idle(entry)?;
+                    let id = new_handle();
+                    entry.privilege_plan = Some(PrivilegePlanSlot {
+                        handle: id.clone(),
+                        profile_handle: profile_handle.clone(),
+                        plan,
+                    });
+                    Ok(json!({"kind":"privilege-plan","planHandle":id,"expiresInMs":120000,"plan":view}))
+                })?
+            }
+            ExecutePrivileges { plan_handle, .. } => {
+                handle(&plan_handle)?;
+                let slot = self.with_entry(&scope, |entry| {
+                    Self::idle(entry)?;
+                    if entry
+                        .privilege_plan
+                        .as_ref()
+                        .is_none_or(|plan| plan.handle != plan_handle)
+                    {
+                        return Err(MySqlRuntimeError::Stale);
+                    }
+                    entry.privilege_busy = true;
+                    Ok(entry.privilege_plan.take().expect("checked plan"))
+                })?;
+                let _lease = PasswordLease {
+                    entries: self.entries.clone(),
+                    scope: scope.clone(),
+                };
+                let snapshot = self.with_entry(&scope, |entry| {
+                    self.profile(entry, &slot.profile_handle)
+                })?;
+                let (receipt, outcome) = match self
+                    .services
+                    .database()
+                    .execute_mysql_privileges(&session, &snapshot, &slot.plan)
+                    .await
+                {
+                    Ok(pair) => pair,
+                    Err(error) => {
+                        let (code, detail) =
+                            lovelyhawk_core::database_password::public_reason(&error);
+                        return Ok(json!({"kind":"rejected","action":"execute-privileges","code":code,"detail":detail}));
+                    }
+                };
+                let undo_handle = new_handle();
+                self.with_entry(&scope, |entry| {
+                    entry.privilege_undo = Some(PrivilegeUndoSlot {
+                        handle: undo_handle.clone(),
+                        profile_handle: slot.profile_handle.clone(),
+                        plan: slot.plan,
+                        applied_lines: outcome.after_lines.clone(),
+                        applied: outcome.applied,
+                        at: Instant::now(),
+                    });
+                    Ok(())
+                })?;
+                let receipt = serde_json::to_value(&receipt)
+                    .map_err(|_| MySqlRuntimeError::Store)?;
+                json!({"kind":"privilege-result","receipt":receipt,"undoHandle":undo_handle})
+            }
+            UndoPrivileges { plan_handle, .. } => {
+                handle(&plan_handle)?;
+                let slot = self.with_entry(&scope, |entry| {
+                    Self::idle(entry)?;
+                    match &entry.privilege_undo {
+                        Some(undo) if undo.handle == plan_handle => {
+                            if undo.at.elapsed() > UNDO_TTL {
+                                entry.privilege_undo = None;
+                                return Err(MySqlRuntimeError::Stale);
+                            }
+                        }
+                        _ => return Err(MySqlRuntimeError::Stale),
+                    }
+                    entry.privilege_busy = true;
+                    Ok(entry.privilege_undo.take().expect("checked undo"))
+                })?;
+                let _lease = PasswordLease {
+                    entries: self.entries.clone(),
+                    scope: scope.clone(),
+                };
+                let snapshot = self.with_entry(&scope, |entry| {
+                    self.profile(entry, &slot.profile_handle)
+                })?;
+                let receipt = match self
+                    .services
+                    .database()
+                    .undo_mysql_privileges(
+                        &session,
+                        &snapshot,
+                        &slot.plan,
+                        &slot.applied_lines,
+                        slot.applied,
+                    )
+                    .await
+                {
+                    Ok(receipt) => receipt,
+                    Err(error) => {
+                        let (code, detail) =
+                            lovelyhawk_core::database_password::public_reason(&error);
+                        return Ok(json!({"kind":"rejected","action":"undo-privileges","code":code,"detail":detail}));
+                    }
+                };
+                let receipt = serde_json::to_value(&receipt)
+                    .map_err(|_| MySqlRuntimeError::Store)?;
+                json!({"kind":"privilege-result","receipt":receipt,"undoHandle":Value::Null})
+            }
         };
         Ok(response)
     }
@@ -862,6 +1143,7 @@ impl Drop for PasswordLease {
     fn drop(&mut self) {
         if let Some(entry) = self.entries.lock().get_mut(&self.scope.binding) {
             entry.password_busy = false;
+            entry.privilege_busy = false;
         }
     }
 }

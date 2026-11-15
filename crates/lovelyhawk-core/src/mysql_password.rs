@@ -147,6 +147,18 @@ pub(crate) enum MySqlPasswordStep {
     },
     /// Read-only live-instance review (accounts, UDFs, global variables).
     Review { request: MySqlRuntimeRequest },
+    /// Read one account's `SHOW GRANTS`, identity and schema/table lists.
+    PrivilegeRead {
+        request: MySqlRuntimeRequest,
+        account: MySqlAccount,
+    },
+    /// Re-read grants, refuse on drift, run each statement, read grants back.
+    PrivilegeApply {
+        request: MySqlRuntimeRequest,
+        account: MySqlAccount,
+        expected_before: Vec<String>,
+        statements: Vec<String>,
+    },
 }
 
 impl fmt::Debug for MySqlPasswordStep {
@@ -158,6 +170,8 @@ impl fmt::Debug for MySqlPasswordStep {
             Self::Capture { .. } => "Capture",
             Self::Restore { .. } => "Restore",
             Self::Review { .. } => "Review",
+            Self::PrivilegeRead { .. } => "PrivilegeRead",
+            Self::PrivilegeApply { .. } => "PrivilegeApply",
         };
         f.debug_tuple("MySqlPasswordStep")
             .field(&name)
@@ -173,7 +187,9 @@ impl MySqlPasswordStep {
             | Self::VerifyLogin { request, .. }
             | Self::Capture { request, .. }
             | Self::Restore { request, .. }
-            | Self::Review { request } => request,
+            | Self::Review { request }
+            | Self::PrivilegeRead { request, .. }
+            | Self::PrivilegeApply { request, .. } => request,
         };
         (request.host().to_owned(), request.port())
     }
@@ -190,6 +206,8 @@ pub(crate) enum MySqlPasswordResult {
     },
     Restored,
     Reviewed(Box<crate::mysql_instance::MySqlInstanceReview>),
+    PrivilegeRead(Box<crate::mysql_privilege::MySqlPrivilegeRead>),
+    PrivilegeApplied(Box<crate::mysql_privilege::PrivilegeApplyOutcome>),
 }
 
 impl fmt::Debug for MySqlPasswordResult {
@@ -201,6 +219,8 @@ impl fmt::Debug for MySqlPasswordResult {
             Self::Captured { .. } => "Captured",
             Self::Restored => "Restored",
             Self::Reviewed(_) => "Reviewed",
+            Self::PrivilegeRead(_) => "PrivilegeRead",
+            Self::PrivilegeApplied(_) => "PrivilegeApplied",
         };
         f.debug_tuple("MySqlPasswordResult").field(&name).finish()
     }
@@ -417,6 +437,29 @@ where
             let result = crate::mysql_instance::run_review(&mut session).await;
             session.quit().await;
             Ok(MySqlPasswordResult::Reviewed(Box::new(result?)))
+        }
+        MySqlPasswordStep::PrivilegeRead { request, account } => {
+            let mut session = connect(stream, request).await?;
+            let result = crate::mysql_privilege::run_privilege_read(&mut session, &account).await;
+            session.quit().await;
+            Ok(MySqlPasswordResult::PrivilegeRead(Box::new(result?)))
+        }
+        MySqlPasswordStep::PrivilegeApply {
+            request,
+            account,
+            expected_before,
+            statements,
+        } => {
+            let mut session = connect(stream, request).await?;
+            let result = crate::mysql_privilege::run_privilege_apply(
+                &mut session,
+                &account,
+                &expected_before,
+                &statements,
+            )
+            .await;
+            session.quit().await;
+            Ok(MySqlPasswordResult::PrivilegeApplied(Box::new(result?)))
         }
     }
 }
@@ -1470,7 +1513,7 @@ impl DatabaseService {
 
     /// Write steps run to completion once dispatched; a transport failure
     /// after dispatch means the remote state is unknown.
-    async fn mysql_password_step_write(
+    pub(crate) async fn mysql_password_step_write(
         &self,
         session: &BoundSshSession,
         profile_id: &str,

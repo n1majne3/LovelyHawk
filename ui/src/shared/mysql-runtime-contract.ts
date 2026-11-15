@@ -14,7 +14,29 @@ export type MySqlRuntimeRequest =
   | { action: "execute-password"; bindingHandle: string; planHandle: string }
   | { action: "plan-password-restore"; bindingHandle: string; restoreHandle: string; profileHandle: string }
   | { action: "execute-password-restore"; bindingHandle: string; planHandle: string }
-  | { action: "inspect"; bindingHandle: string; profileHandle: string };
+  | { action: "inspect"; bindingHandle: string; profileHandle: string }
+  | { action: "privileges"; bindingHandle: string; profileHandle: string; account: MySqlAccountInput }
+  | { action: "plan-privileges"; bindingHandle: string; profileHandle: string; account: MySqlAccountInput; revokes: MySqlRevokeInput[]; grants: MySqlPrivilegeAddInput[] }
+  | { action: "execute-privileges"; bindingHandle: string; planHandle: string }
+  | { action: "undo-privileges"; bindingHandle: string; planHandle: string };
+export interface MySqlRevokeInput { row: number; privileges: string[]; }
+export interface MySqlPrivilegeAddInput { database: string; table: string | null; privileges: string[]; }
+export interface MySqlPrivilegeScope { kind: "global" | "database" | "table" | "other"; database: string | null; table: string | null; }
+export interface MySqlPrivilegeRow {
+  row: number; raw: string; parseable: boolean; scope: MySqlPrivilegeScope;
+  privileges: string[]; members: string[]; allPrivileges: boolean; grantOption: boolean;
+}
+export interface MySqlPrivilegeReview {
+  product: "MySQL" | "MariaDB"; serverVersion: string;
+  connecting: MySqlAccountInput;
+  rows: MySqlPrivilegeRow[]; schemas: string[]; tables: { database: string; table: string }[];
+}
+export interface MySqlPrivilegePlanView {
+  account: string; summary: string; statements: string[]; notes: string[]; dangerous: boolean;
+}
+export interface MySqlPrivilegeReceipt {
+  applied: number; failed: string | null; verified: boolean; detail: string; finalLines: string[];
+}
 export interface MySqlPasswordPlanView {
   account: string; plugin: string; product: string; isConnectionAccount: boolean;
   restorable: boolean; updateSavedPassword: boolean; warnings: string[];
@@ -63,7 +85,10 @@ export type MySqlRuntimeResponse =
   | { kind: "password-result"; result: MySqlPasswordResult }
   | { kind: "password-restore-plan"; planHandle: string; expiresInMs: number; plan: MySqlPasswordRestorePlanView }
   | { kind: "password-restore-result"; result: MySqlPasswordRestoreResult }
-  | { kind: "review"; review: MySqlInstanceReview };
+  | { kind: "review"; review: MySqlInstanceReview }
+  | { kind: "privileges"; review: MySqlPrivilegeReview }
+  | { kind: "privilege-plan"; planHandle: string; expiresInMs: number; plan: MySqlPrivilegePlanView }
+  | { kind: "privilege-result"; receipt: MySqlPrivilegeReceipt; undoHandle: string | null };
 export interface MySqlRuntimeApi {
   mysqlRuntime(request: MySqlRuntimeRequest): Promise<MySqlRuntimeResponse>;
 }
@@ -103,6 +128,19 @@ function passwordChange(value: unknown): value is MySqlPasswordChange {
   return value.action === "replace" && keys(value, ["action", "value"]) && typeof value.value === "string" &&
     value.value.length > 0 && encoder.encode(value.value).length <= 16384 && !value.value.includes("\0") && !/[\uD800-\uDFFF]/u.test(value.value);
 }
+function nameList(value: unknown, maximum: number): value is string[] {
+  return Array.isArray(value) && value.length <= maximum && value.every(item => string(item, 128));
+}
+function revokeInputs(value: unknown): value is MySqlRevokeInput[] {
+  return Array.isArray(value) && value.length <= 200 && value.every(item =>
+    record(item) && keys(item, ["row", "privileges"]) &&
+    typeof item.row === "number" && Number.isInteger(item.row) && item.row >= 0 && nameList(item.privileges, 64));
+}
+function addInputs(value: unknown): value is MySqlPrivilegeAddInput[] {
+  return Array.isArray(value) && value.length <= 200 && value.every(item =>
+    record(item) && keys(item, ["database", "table", "privileges"]) &&
+    string(item.database, 128) && (item.table === null || string(item.table, 128)) && nameList(item.privileges, 64));
+}
 function passwordText(value: unknown): boolean {
   return typeof value === "string" && encoder.encode(value).length <= 1024 && !value.includes("\0") && !/[\uD800-\uDFFF]/u.test(value);
 }
@@ -121,6 +159,12 @@ export function isMySqlRuntimeRequest(value: unknown): value is MySqlRuntimeRequ
     case "plan-password-restore": return keys(value, [...basic, "restoreHandle", "profileHandle"]) && string(value.restoreHandle, 128) && string(value.profileHandle, 128);
     case "execute-password-restore": return keys(value, [...basic, "planHandle"]) && string(value.planHandle, 128);
     case "inspect": return keys(value, [...basic, "profileHandle"]) && string(value.profileHandle, 128);
+    case "privileges": return keys(value, [...basic, "profileHandle", "account"]) &&
+      string(value.profileHandle, 128) && accountInput(value.account);
+    case "plan-privileges": return keys(value, [...basic, "profileHandle", "account", "revokes", "grants"]) &&
+      string(value.profileHandle, 128) && accountInput(value.account) && revokeInputs(value.revokes) && addInputs(value.grants);
+    case "execute-privileges": return keys(value, [...basic, "planHandle"]) && string(value.planHandle, 128);
+    case "undo-privileges": return keys(value, [...basic, "planHandle"]) && string(value.planHandle, 128);
     default: return false;
   }
 }
@@ -185,10 +229,44 @@ function profileSummary(value: unknown): value is MySqlProfileSummary {
     string(value.username, 128) && string(value.database, 128, true) && mode(value.tlsMode) && typeof value.hasPassword === "boolean" &&
     typeof value.hasCa === "boolean" && typeof value.unassigned === "boolean" && (value.tlsMode !== "ssh-loopback" || value.hasCa === false);
 }
+function privilegeScope(value: unknown): value is MySqlPrivilegeScope {
+  return record(value) && keys(value, ["kind", "database", "table"]) &&
+    oneOf(value.kind, ["global", "database", "table", "other"]) &&
+    (value.database === null || string(value.database, 128)) &&
+    (value.table === null || string(value.table, 128));
+}
+function privilegeRow(value: unknown): value is MySqlPrivilegeRow {
+  return record(value) && keys(value, ["row", "raw", "parseable", "scope", "privileges", "members", "allPrivileges", "grantOption"]) &&
+    typeof value.row === "number" && Number.isInteger(value.row) && value.row >= 0 &&
+    string(value.raw, 4096) && typeof value.parseable === "boolean" && privilegeScope(value.scope) &&
+    nameList(value.privileges, 64) && nameList(value.members, 64) &&
+    typeof value.allPrivileges === "boolean" && typeof value.grantOption === "boolean";
+}
+function privilegeReview(value: unknown): value is MySqlPrivilegeReview {
+  return record(value) && keys(value, ["product", "serverVersion", "connecting", "rows", "schemas", "tables"]) &&
+    oneOf(value.product, ["MySQL", "MariaDB"]) && string(value.serverVersion, 128) && accountInput(value.connecting) &&
+    Array.isArray(value.rows) && value.rows.length <= 500 && value.rows.every(privilegeRow) &&
+    nameList(value.schemas, 2000) &&
+    Array.isArray(value.tables) && value.tables.length <= 8000 && value.tables.every(item =>
+      record(item) && keys(item, ["database", "table"]) && string(item.database, 128) && string(item.table, 128));
+}
+function privilegePlanView(value: unknown): value is MySqlPrivilegePlanView {
+  return record(value) && keys(value, ["account", "summary", "statements", "notes", "dangerous"]) &&
+    string(value.account, 300) && string(value.summary, 2048) &&
+    Array.isArray(value.statements) && value.statements.length <= 400 && value.statements.every(item => string(item, 2048)) &&
+    Array.isArray(value.notes) && value.notes.length <= 32 && value.notes.every(item => string(item, 1024)) &&
+    typeof value.dangerous === "boolean";
+}
+function privilegeReceipt(value: unknown): value is MySqlPrivilegeReceipt {
+  return record(value) && keys(value, ["applied", "failed", "verified", "detail", "finalLines"]) &&
+    typeof value.applied === "number" && Number.isInteger(value.applied) && value.applied >= 0 &&
+    (value.failed === null || string(value.failed, 1024)) && typeof value.verified === "boolean" &&
+    string(value.detail, 2048) && nameList(value.finalLines, 500);
+}
 export function isMySqlRuntimeResponse(value: unknown): value is MySqlRuntimeResponse {
   if (!record(value)) return false;
   switch (value.kind) {
-    case "rejected": return keys(value, ["kind", "action", "code", "detail"]) && oneOf(value.action, ["list", "save", "plan-delete", "delete", "plan-password", "execute-password", "plan-password-restore", "execute-password-restore", "inspect"]) && oneOf(value.code, ["invalid-params", "invalid", "stale", "busy", "capacity", "store", "unknown-state", "rejected"]) && string(value.detail, 2048);
+    case "rejected": return keys(value, ["kind", "action", "code", "detail"]) && oneOf(value.action, ["list", "save", "plan-delete", "delete", "plan-password", "execute-password", "plan-password-restore", "execute-password-restore", "inspect", "privileges", "plan-privileges", "execute-privileges", "undo-privileges"]) && oneOf(value.code, ["invalid-params", "invalid", "stale", "busy", "capacity", "store", "unknown-state", "rejected"]) && string(value.detail, 2048);
     case "profiles": return keys(value, ["kind", "profiles"]) && Array.isArray(value.profiles) && value.profiles.length <= 256 &&
       value.profiles.every(profileSummary) && new Set(value.profiles.map(item => item.profileHandle)).size === value.profiles.length;
     case "saved": return keys(value, ["kind", "profile"]) && profileSummary(value.profile) && !value.profile.unassigned;
@@ -203,6 +281,11 @@ export function isMySqlRuntimeResponse(value: unknown): value is MySqlRuntimeRes
       typeof value.result.verified === "boolean" && typeof value.result.savedPasswordRestored === "boolean" && typeof value.result.journalRecorded === "boolean" &&
       (value.result.profile === null || profileSummary(value.result.profile));
     case "review": return keys(value, ["kind", "review"]) && instanceReview(value.review);
+    case "privileges": return keys(value, ["kind", "review"]) && privilegeReview(value.review);
+    case "privilege-plan": return keys(value, ["kind", "planHandle", "expiresInMs", "plan"]) &&
+      string(value.planHandle, 128) && integer(value.expiresInMs, 120000, 1) && privilegePlanView(value.plan);
+    case "privilege-result": return keys(value, ["kind", "receipt", "undoHandle"]) &&
+      privilegeReceipt(value.receipt) && (value.undoHandle === null || string(value.undoHandle, 128));
     default: return false;
   }
 }
@@ -222,5 +305,9 @@ export function matchesMySqlRuntimeResponse(request: MySqlRuntimeRequest, respon
     case "plan-password-restore": return response.kind === "password-restore-plan";
     case "execute-password-restore": return response.kind === "password-restore-result";
     case "inspect": return response.kind === "review";
+    case "privileges": return response.kind === "privileges";
+    case "plan-privileges": return response.kind === "privilege-plan";
+    case "execute-privileges": return response.kind === "privilege-result" && response.undoHandle !== null;
+    case "undo-privileges": return response.kind === "privilege-result" && response.undoHandle === null;
   }
 }
