@@ -32,6 +32,18 @@
 ### 实施进度（2026-11-15 起）
 
 - 本日范围：P0 与 P1 全部、两项体验改进；P2、P3 与离线分析项保留在本表待后续批次。
+- 体验改进：命令工作台结果顶部固定显示“实际运行的命令”（可展开、复制，原第四个标签移除，组合运行同样显示）（3430404、7f9827c）。实时抓包同时把原始包写入目标 `/tmp/lovelyres-pcap-<uuid>.pcap`（写包 tcpdump 经 fifo、`tee` 落盘、读包 tcpdump 显示行，兼容无 `--print` 的旧版 tcpdump），结束后“导出为 pcap…”复用留证读回链路（目标摘要、两次 SFTP 读取、本机回读、manifest、登记案件），导出、丢弃、开始新抓包或离开页面时删除目标文件（9f94f4d、5d61453、6406500）。停止时先让 tee 与读包进程读到文件尾再删 fifo（原先挂断信号会让二者丢失末尾数据，单次运行曾出现 20/23）。验证：修正后 RPC 探针连续 10 次均 23/23（`target/1116-pcap-export-run{1..10}.log`），桌面 CDP 25/25，root 与仅免密 sudo 账号各一轮（`target/lab-pcap-export-desktop/27cc72c0-…`）；修正既有 `test -f --` 在 dash/bash 中恒判“缺失”的缺陷。
+- P0-1 删除单条 authorized_keys 公钥（c8029b2、86c7af4）：按密钥类型与内容匹配（选项字段含引号空格），恰好一条才删，重复或缺失拒绝，root 文件最后一条可用公钥拒绝；计划显示 OpenSSH 指纹与剩余数量，并说明无法判断当前会话所用公钥；整文件备份、原子写入、可撤销。Debian 容器桌面 24/24：属主与 600 权限保留、剩余公钥仍可登录、被删公钥不能登录、撤销复原、最后一把 root 公钥被拒（`target/lab-ssh-key-delete/1c908b17-…`）。
+- P0-2 `/etc/modprobe.d/*.conf` 进入行级删除放行（bef6099）；可见模块卸载（d899fef、5d61453）：探测 `/proc/modules` 身份、引用计数、`[permanent]`、holders、`modules_disabled`、工具与权限，执行前逐项复核，`rmmod` 后 `/proc/modules` 与 `/sys/module` 双重复核，不提供恢复。容器内只能驱动拒绝分支（10/10，`target/lab-kernel-module-unload/69e98d12-…`）；真实卸载 NOT_RUN（需 VM）。
+- P0-3 移除恶意 systemd 单元（e2a8159、5d61453、ff0405c）：只处理 `/etc/systemd/system` 与 `/usr/local/lib/systemd/system` 下非软件包的普通文件，单元文件、drop-in 与 wants/requires 链接移入 `/var/lib/lovelyres-unit-backups/<计划编号>/` 并写 manifest，`daemon-reload` 后分别复核 not-found、文件与链接、主进程；撤销放回并恢复启用状态但不启动。Podman systemd 容器桌面 25/25，含软件包单元拒绝（`target/lab-systemd-unit-removal/ef0d19bd-…`，root 登录）。ff0405c 修正仅 sudo 账号时 manifest 写入与撤销不在特权下运行的缺陷，单测通过；sudo 账号实验与 5d61453 之后的复跑 NOT_RUN。
+- P0-4 外连周期采样（c517796、7f9827c）：opt-in 工作台条目，约 30 秒每 0.5 秒读内核 TCP 表（ESTABLISHED/SYN_SENT），按远端汇总新连接数、间隔中位数与进程，规律间隔记为线索；`ss` 可用时双来源比对。debian/alpine/rocky 均标出约 3.1 秒的周期外连、持续连接不误报（`target/1115-batch3-outbound-lab.log`）。一次采样间隔内建立并关闭或被拒绝的连接看不到，说明中引导改用抓包。NOT_RUN：`ss` 双来源、tcp6。
+- P1-7 Supervisor 程序页（f24464e）：列表、启动/停止/重启，重启后核对新 PID 稳定运行、可选回环 HTTP 观察与新进程监听端口；按原命令行重启对 supervisord 子进程拒绝并引导。桌面 36/36（`target/lab-supervisor/a469d55f-…`）。
+- P1-8 Java 整包替换（8a0e5b3）：源为目标上的 JAR，计划绑定两份摘要，同目录临时文件套用原属主权限后原子改名，复核摘要与属主权限，可恢复；回执说明需重启。`probe-java-hot-update.mjs` 39/39（`target/lab-java-hot-update/8b498c46-…`）。
+- P1-9 Lighttpd 工作台条目（26648ce、a7e910e）：有效配置（省略 mimetype 表）、CGI 映射、目录列表、alias 越出站点根、缺少认证与 CGI 脚本命令拼接线索；三个发行版容器均命中。仍不是完整中间件产品接入（无实例图、编辑与回滚）。
+- P1-5 SQLite 只读查看与有界删行（1b7e0ae、81cee04、eb372eb）：python3 优先、sqlite3 3.33+ 只读次之，`mode=ro` 失败时以 immutable 读取并标注；删行仅 python3、rowid 表、≤50 行，绑定文件摘要与行值，在线备份后单事务删除并复核，撤销按原 rowid 回插。桌面 30/30（`target/lab-sqlite-view/8091b757-…`）；仅 sqlite3 与两者皆无的目标 21/21（`target/lab-sqlite-view-engines/9014d388-…`）。
+- P1-6 MySQL 账号权限（e2ee56a）：`SHOW GRANTS` 按作用域解析，勾选收回与表单授予生成有序 REVOKE/GRANT 计划，逐条执行后以 `SHOW GRANTS` 复核期望集合，撤销按逆序回放。mysql:8.0 RPC 探针 20/20、桌面 35/35（含焦点保持修正 e1996f7，`target/lab-mysql-privilege-desktop/4d8cfcdd-…`），收敛结果与题目权限矩阵逐条一致（`target/lab-mysql-privilege/84e8838b-…`）。NOT_RUN：MariaDB 实机（仅解析夹具）；`NO_BACKSLASH_ESCAPES` 下含反斜杠的账号名未覆盖。
+- 未完成（下一批）：新增桌面探针补齐控制台错误采集并复跑（改动在 stash `wip-1115-rework`，未验证）；systemd/内核模块/Supervisor 的 sudo 账号实验；内核模块与 systemd 在 5d61453 之后复跑；命令工作台“实际运行的命令”的桌面截图；P2、P3 与离线分析项。
+- 全量门禁：core/backend/desktop 测试、三包 clippy、`pnpm ui:check`、source/ledger 门禁通过；core 5 项 ai/net_guard 回环用例失败，在今日改动前的 4f91dec 工作树上同样失败（`target/1116-wt-4f91dec-ai-tests.log`），属本机 TUN 代理环境。便携包 `artifacts/20261116/LovelyHawk-0.0.4-windows-x64.zip`（SHA-256 5314868414a6d42997a9053545a27f97b296bd53b6a4bdadef6524a31330b2bf）通过 `release:package` 校验与 `release:smoke`。
 
 ## 2026-11-13 day5 运维 writeup 对照与进程活动监视规划
 
