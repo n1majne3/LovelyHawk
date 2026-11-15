@@ -113,6 +113,14 @@ const CASES: &[Case] = &[
         quiet_skip: &[],
     },
     Case {
+        id: "network-outbound-periodic",
+        fixture: "lh_b() { if command -v bash >/dev/null 2>&1; then timeout 4 bash -c 'exec 3<>/dev/tcp/10.89.99.5/18888; sleep 2' 2>/dev/null; elif command -v nc >/dev/null 2>&1; then sleep 2 | nc -w 4 10.89.99.5 18888 >/dev/null 2>&1; fi; }; ( while :; do lh_b; sleep 1; done </dev/null >/dev/null 2>&1 & ); if command -v bash >/dev/null 2>&1; then ( bash -c 'exec 3<>/dev/tcp/10.89.99.5/17777; exec sleep 90' </dev/null >/dev/null 2>&1 & ); elif command -v nc >/dev/null 2>&1; then ( sleep 90 | nc 10.89.99.5 17777 >/dev/null 2>&1 & ); fi; sleep 2",
+        expect: &["10.89.99.5:18888", "间隔中位约"],
+        expect_pkg: &[],
+        quiet: &["10.89.99.5:17777"],
+        quiet_skip: &[],
+    },
+    Case {
         id: "system-lkm",
         fixture: "mkdir -p /usr/local/lib; touch /usr/local/lib/lhlab.ko",
         expect: &["lhlab.ko"],

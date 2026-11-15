@@ -997,6 +997,105 @@ lh_finish
 "#
 );
 
+const CMD_NETWORK_OUTBOUND_PERIODIC: &str = bounded_observation!(
+    r#"printf '# 每 0.5 秒读取一次内核 TCP表（ESTABLISHED 与 SYN_SENT、非回环远端），约 30 秒；一条连接按 本地端口+远端+inode 计数。
+'
+lh_iv=0.5
+sleep 0.5 2>/dev/null || { lh_iv=1; printf '# sleep 0.5 不可用，已降为 1 秒间隔。\n'; }
+lh_procs=''
+for lh_f in /proc/net/tcp6 /proc/net/tcp; do
+  if [ -r "$lh_f" ]; then lh_procs="$lh_procs $lh_f"; else lh_gap "$lh_f 不可读，采样来源不完整。"; fi
+done
+[ -n "$lh_procs" ] || { lh_gap '内核 TCP表不可读，本项未执行。'; lh_finish; exit 1; }
+lh_ss=0
+command -v ss >/dev/null 2>&1 && lh_ss=1
+lh_cap=''
+lh_t0=$(date +%s)
+lh_i=0
+while [ "$lh_i" -lt 60 ] && [ $(( $(date +%s) - lh_t0 )) -lt 48 ]; do
+  lh_cap="$lh_cap$(
+    ls -l /proc/[0-9]*/fd 2>/dev/null | awk -v s="$lh_i" '
+      /^\/proc\/[0-9]+\/fd:?$/ { gsub(/[^0-9]/,""); p=$0+0; next }
+      $NF ~ /^socket:\[[0-9]+\]$/ && p>0 { i=$NF; sub(/.*\[/,"",i); sub(/\].*/,"",i); printf "F\t%s\t%s\t%s\n", s, p, i }'
+    awk -v s="$lh_i" '{ gsub(/\/comm$/,"",FILENAME); sub(/.*\//,"",FILENAME); printf "C\t%s\t%s\t%s\n", s, FILENAME, $0; nextfile }' /proc/[0-9]*/comm 2>/dev/null
+    awk -v s="$lh_i" '
+      function hx(h,  n,i) { n=0; for(i=1;i<=length(h);i++) n=n*16+index("0123456789ABCDEF",toupper(substr(h,i,1)))-1; return n }
+      function v4(h) { return hx(substr(h,7,2)) "." hx(substr(h,5,2)) "." hx(substr(h,3,2)) "." hx(substr(h,1,2)) }
+      function v6(h,  w,b,g,seg,rip) {
+        for(w=0;w<4;w++){ seg=""; for(b=4;b>=1;b--) seg=seg substr(h,w*8+b*2-1,2); for(g=1;g<=4;g++) rip=rip ":" substr(seg,g*2-1,2) }
+        sub(/^:/,"",rip); return rip
+      }
+      $2 ~ /^[0-9A-Fa-f]+:[0-9A-Fa-f]+$/ && ($4=="01" || $4=="02") {
+        split($3,a,":"); rip=""
+        if (length(a[1])==8) rip=v4(a[1]); else if (length(a[1])==32) rip=v6(a[1]); else next
+        z=rip; gsub(/[:.]/,"",z)
+        if (z ~ /^0+$/) next
+        if (length(a[1])==8) { if (rip ~ /^127\./) next } else if (z ~ /^0*1$/) next
+        split($2,l,":")
+        printf "P\t%s\t%s\t%d\t%s:%d\t%s\n", s, $10, hx(l[2]), rip, hx(a[2]), ($4=="01"?"ESTABLISHED":"SYN_SENT")
+      }' $lh_procs
+    if [ "$lh_ss" = 1 ]; then ss -tanH state established state syn-sent 2>/dev/null | awk -v s="$lh_i" '$5 ~ /[0-9]$/ { printf "S\t%s\t%s\t%s\n", s, $5, $1 }'; fi
+  )
+"
+  lh_i=$((lh_i + 1))
+  { [ "$lh_i" -lt 60 ] && [ $(( $(date +%s) - lh_t0 )) -lt 48 ]; } && sleep "$lh_iv"
+done
+lh_t1=$(date +%s)
+lh_tick=$(awk -v t0="$lh_t0" -v t1="$lh_t1" -v n="$lh_i" -v iv="$lh_iv" 'BEGIN{d=n-1; if(d<1)d=1; t=(t1-t0)/d; if(t<=0)t=iv; printf "%.2f",t}')
+if [ "$lh_ss" = 1 ]; then
+  printf '# 采样 %s 次、实际约 %s 秒一次（目标 %s 秒）；内核表与 ss 双来源比对。规则间隔只是线索，不是 C2 结论。\n' "$lh_i" "$lh_tick" "$lh_iv"
+else
+  printf '# 采样 %s 次、实际约 %s 秒一次（目标 %s 秒）；ss 不可用，仅内核表单一来源。规则间隔只是线索，不是 C2 结论。\n' "$lh_i" "$lh_tick" "$lh_iv"
+fi
+printf '远端 | 新连接数 | 首见-末见(采样点) | 状态 | 来源 | 进程\n'
+lh_agg=$(printf '%s\n' "$lh_cap" | awk -F'\t' -v tick="$lh_tick" -v ss="$lh_ss" '
+  $1=="F"{ fd[$2,$4]=$3; next }
+  $1=="C"{ c=""; for(j=4;j<=NF;j++) c=c (j>4?" ":"") $j; comm[$2,$3]=c; next }
+  $1=="S"{ ssseen[$3]=1; states[$3,$4]=1; if(!($3 in fo)||$2<fo[$3]) fo[$3]=$2; if($2>lo[$3]) lo[$3]=$2; next }
+  $1=="P"{
+    s=$2; ino=$3; lp=$4; r=$5; st=$6
+    ck=ino SUBSEP lp SUBSEP r
+    if(!(ck in seen)){
+      seen[ck]=1; nk[r]++
+      seq[r]=(seq[r]==""?s:seq[r] " " s)
+      pid=fd[s,ino]
+      if(pid==""){ w="进程未知（权限不足）" } else { cm=comm[s,pid]; w=pid (cm==""?"":"(" cm ")") }
+      if(!((r,w) in wset)){ wset[r,w]=1; wl[r]=(wl[r]==""?w:wl[r] "," w) }
+    }
+    pr[r]=1; states[r,st]=1
+    if(!(r in fo)||s<fo[r]) fo[r]=s
+    if(s>lo[r]) lo[r]=s
+    next
+  }
+  END{
+    nrem=0
+    for(r in pr) rows[++nrem]=r
+    for(r in ssseen) if(!(r in pr)) rows[++nrem]=r
+    for(i=1;i<=nrem;i++){
+      r=rows[i]; n=nk[r]+0; sst=""
+      for(k in states){ split(k,p,SUBSEP); if(p[1]==r) sst=sst (sst==""?"":"/") p[2] }
+      src=((r in pr)?"内核表":"") ((r in ssseen)?((r in pr)?"+ss":"ss"):"")
+      printf "T\t%s\t%d\t%d\t%d\t%s\t%s\t%s\n", r, n, fo[r]+0, lo[r]+0, sst, src, wl[r]
+      if(n>=4){
+        m=split(seq[r],a," "); nd=0; delete d
+        for(k=2;k<=m;k++) d[++nd]=a[k]-a[k-1]
+        for(x=2;x<=nd;x++){ v=d[x]; y=x-1; while(y>=1&&d[y]>v){ d[y+1]=d[y]; y-- } d[y+1]=v }
+        med=(nd%2?d[(nd+1)/2]:(d[nd/2]+d[nd/2+1])/2)
+        ok=(nd>0&&med>0)?1:0
+        if(ok) for(k=1;k<=nd;k++){ dev=d[k]-med; if(dev<0)dev=-dev; if(dev>med*0.3) ok=0 }
+        if(ok) printf "H\t远端 %s：采样内新连接 %d 次，间隔中位约 %.1f 秒且各间隔与中位偏差不超过 30%%（规律外连线索，不是 C2 结论）\n", r, n, med*tick
+      }
+      if((r in pr)&&!(r in ssseen)&&ss>0) printf "H\t远端 %s 出现在内核表但 ss 未列出（可能隐藏或采样时点差异）\n", r
+      if(!(r in pr)&&(r in ssseen)) printf "N\t仅 ss 可见（采样时点差异）：%s\n", r
+    }
+  }')
+printf '%s\n' "$lh_agg" | awk -F'\t' '$1=="T"{printf "%d\t%s | %s | %s-%s | %s | %s | %s\n",$3,$2,$3,$4,$5,$6,$7,$8}' | sort -k1,1nr | head -n 200 | cut -f2-
+printf '%s\n' "$lh_agg" | awk -F'\t' '$1=="H"{print $2}' | while IFS= read -r lh_line; do lh_hit "$lh_line"; done
+printf '%s\n' "$lh_agg" | awk -F'\t' -v h='#' '$1=="N"{printf "%s %s\n",h,$2}'
+lh_finish
+"#
+);
+
 const CMD_SYSTEM_LKM: &str = bounded_observation!(concat!(
     r#"printf '# 已知 LKM rootkit 符号、当前内核模块目录外 .ko 与模块加载痕迹；已加载模块的残留通常在重启后才消失。
 '
@@ -3083,6 +3182,17 @@ static CATALOG: &[CommandDefinition] = &[
     .with_timeout(60)
     .flagging(command_findings::collection_finding),
     portable!(
+        "network-outbound-periodic",
+        Network,
+        "外连周期采样",
+        "对内核 TCP表中外连（ESTABLISHED 与 SYN_SENT、非回环远端）每 0.5 秒采样一次、约 30 秒（sleep 0.5 不支持时降为 1 秒，机器过慢时提前结束），按远端汇总新连接数、首末见偏移、间隔中位数与进程，ss 可用时与内核表双来源比对；新连接不少于 4 次且各间隔与中位数偏差不超过 30% 记为关注。规则间隔只是线索，不等于 C2 证据。不加入整组执行。",
+        CMD_NETWORK_OUTBOUND_PERIODIC
+    )
+    .opt_in()
+    .self_checked()
+    .with_timeout(60)
+    .flagging(command_findings::collection_finding),
+    portable!(
         "system-lkm",
         System,
         "LKM rootkit 痕迹",
@@ -4142,6 +4252,7 @@ Permission denied"
             "file-rootkit-signatures",
             "network-hidden-ports",
             "network-bind-probe",
+            "network-outbound-periodic",
             "system-lkm",
             "perm-dt-needed",
             "file-command-evidence",
@@ -4154,9 +4265,17 @@ Permission denied"
             assert!(definition.abnormal.is_some(), "{id}");
         }
         assert!(lookup("network-bind-probe").unwrap().entry.opt_in);
+        assert!(lookup("network-outbound-periodic").unwrap().entry.opt_in);
         for definition in CATALOG {
             if definition.entry.opt_in {
-                assert_eq!(definition.entry.id, "network-bind-probe");
+                assert!(
+                    matches!(
+                        definition.entry.id,
+                        "network-bind-probe" | "network-outbound-periodic"
+                    ),
+                    "unexpected opt-in entry {}",
+                    definition.entry.id
+                );
             }
         }
         assert!(CMD_FILE_ROOTKIT_SIGS.contains("/dev/tux/.proc"));
@@ -4166,6 +4285,30 @@ Permission denied"
         assert!(CMD_SYSTEM_LKM.contains("hacked_getdents"));
         assert!(CMD_PERM_SUID_OWNERSHIP.contains("find -exec /bin/sh -p"));
         assert!(CMD_PERSISTENCE_CHAIN.contains("64"));
+    }
+
+    /// The outbound sampler flags only 关注： leads; table rows, scope notes
+    /// and single-source hints stay neutral context.
+    #[test]
+    fn outbound_periodic_flags_only_attention_leads() {
+        let sampler = lookup("network-outbound-periodic").unwrap();
+        assert_eq!(sampler.entry.category, CommandCategory::Network);
+        assert_eq!(sampler.entry.timeout_seconds, 60);
+        assert!(sampler.entry.opt_in);
+        for marker in [
+            "/proc/net/tcp",
+            "SYN_SENT",
+            "进程未知（权限不足）",
+            "不是 C2 结论",
+            "各间隔与中位偏差不超过",
+        ] {
+            assert!(sampler.default_command.contains(marker), "{marker}");
+        }
+        let output = "# 采样 60 次、间隔 0.5 秒；内核表与 ss 双来源比对。规则间隔只是线索，不是 C2 结论。\n远端 | 新连接数 | 首见-末见(采样点) | 状态 | 来源 | 进程\n203.0.113.10:4444 | 6 | 4-54 | SYN_SENT | 内核表 | 412(beacon)\n10.0.2.2:22 | 1 | 2-59 | ESTABLISHED | 内核表 | 388(bash)\n关注：远端 203.0.113.10:4444：采样内新连接 6 次，间隔中位约 5.0 秒且各间隔与中位偏差不超过 30%（规律外连线索，不是 C2 结论）\n关注：远端 198.51.100.9:443 出现在内核表但 ss 未列出（可能隐藏或采样时点差异）\n# 仅 ss 可见（采样时点差异）：192.0.2.8:80\n# 已检查对象 0；关注线索 2；读取缺口 0。线索不等于入侵结论。";
+        assert_eq!(
+            command_findings::finding_lines(output, sampler.abnormal),
+            vec![4, 5]
+        );
     }
 
     /// A highlight the operator cannot explain is noise, so every rule the
