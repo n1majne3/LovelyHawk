@@ -188,14 +188,14 @@ try {
   await waitFor(session,
     `[...document.querySelectorAll('.system-info-table-scroll tbody tr')].some(row => row.textContent.includes('probe-middle'))`,
     "the middle key row", 240);
-  await session.shot("ssh-keys-table");
+  await session.shot("ssh-keys-table.png");
 
   check("the middle row can be right-clicked", await contextMenuOnRow(session, "probe-middle"));
   await waitFor(session, "document.querySelector('.system-info-row-menu-parent') !== null", "the menu actions");
   const menuText = await session.evaluate(
     `document.querySelector('.system-info-row-menu')?.textContent ?? ""`);
   check("the menu offers 删除此公钥", menuText.includes("删除此公钥"));
-  await session.shot("ssh-key-menu");
+  await session.shot("ssh-key-menu.png");
   check("the delete item clicks", await clickMenuItem(session, "删除此公钥"));
 
   await waitFor(session,
@@ -205,14 +205,14 @@ try {
   check("the plan names the fingerprint", planText.includes("SHA256:"));
   check("the plan names the line and the count that stays", planText.includes("第 2 行") && planText.includes("还剩 2 条"));
   check("the plan warns the session key cannot be told apart", planText.includes("指纹"));
-  await session.shot("ssh-key-delete-plan");
+  await session.shot("ssh-key-delete-plan.png");
 
   await session.evaluate("document.querySelector('[data-testid=\"system-info-row-action-execute\"]').click(), true");
   await waitFor(session,
     "document.querySelector('[data-testid=\"system-info-row-action-dialog\"]')?.textContent.includes('目标机反馈') === true",
     "the receipt", 120);
   const receiptText = await dialogText(session);
-  await session.shot("ssh-key-delete-receipt");
+  await session.shot("ssh-key-delete-receipt.png");
   check("the delete verified on target", receiptText.includes("已完成，并在目标机上核对过"));
 
   // ---- independent read-back -------------------------------------------
@@ -262,10 +262,10 @@ try {
       "the refusal", 120);
   } catch (error) {
     console.log(`      dialog at timeout: ${JSON.stringify((await dialogText(session)).slice(0, 400))}`);
-    await session.shot("ssh-key-last-timeout");
+    await session.shot("ssh-key-last-timeout.png");
     throw error;
   }
-  await session.shot("ssh-key-last-refusal");
+  await session.shot("ssh-key-last-refusal.png");
   check("the single-key file was left untouched", remoteSha(KEYS_FILE) === sha256hex(`${pub1} probe-only\n`));
 } catch (error) {
   failure = String(error?.stack ?? error);

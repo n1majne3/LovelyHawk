@@ -997,7 +997,7 @@ export function EmergencyCommandOutput({ output, findingLines = [], paths = [], 
  * The 复制 button needs the clipboard bridge and is refused once the text is
  * longer than the bridge accepts.
  */
-export function EmergencyCommandVerbatim({ text, note, truncated = false, truncatedNote, writeClipboard, collapsible = false, defaultExpanded = false }: {
+export function EmergencyCommandVerbatim({ text, note, truncated = false, truncatedNote, writeClipboard, collapsible = false }: {
   text: string;
   note: string;
   truncated?: boolean;
@@ -1005,10 +1005,9 @@ export function EmergencyCommandVerbatim({ text, note, truncated = false, trunca
   writeClipboard?: ((text: string) => Promise<void>) | undefined;
   /** Fold the console to a few lines until the operator expands it. */
   collapsible?: boolean;
-  defaultExpanded?: boolean;
 }) {
   const [copied, setCopied] = useState<null | "ok" | "error">(null);
-  const [expanded, setExpanded] = useState(defaultExpanded);
+  const [expanded, setExpanded] = useState(false);
   const tooLong = new TextEncoder().encode(text).byteLength > CLIPBOARD_LIMIT_BYTES;
   return (
     <div className="emergency-command-verbatim">

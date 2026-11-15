@@ -670,8 +670,6 @@
 
 .emergency-command-result-tools > .view-tabs { flex: 0 1 auto; border-bottom: 0; }
 
-/* The exact command the run sent sits above the result tabs instead of
-   behind one, folded to a few lines until the operator expands it. */
 .emergency-command-actual {
   padding: 9px 12px;
   border-bottom: 1px solid var(--border);
@@ -955,7 +953,6 @@
   flex: none;
 }
 
-/* About four lines tall; 展开 lifts the clamp and the box scrolls as usual. */
 .emergency-command-verbatim-scroll.is-collapsed {
   min-height: 0;
   max-height: calc(4lh + 28px);

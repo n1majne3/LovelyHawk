@@ -699,14 +699,12 @@ describe("EmergencyCommandsPage", () => {
     expect(html).toContain('aria-expanded="false"');
     expect(html).toContain(">展开</button>");
     expect(html).toContain("is-collapsed");
-    const expanded = renderToStaticMarkup(<EmergencyCommandVerbatim
-      text={verbatim.command} collapsible defaultExpanded
-      writeClipboard={async () => undefined}
-      note="这是在目标上实际执行的完整命令（含容器包装和工具检查前置）"
-      truncatedNote="命令超过 128 KiB，只显示前 128 KiB" />);
-    expect(expanded).toContain('aria-expanded="true"');
-    expect(expanded).toContain(">收起</button>");
-    expect(expanded).not.toContain("is-collapsed");
+    // The collapsed default is the only static state; the press path is the
+    // toggle flipping expanded, driving the same attribute and clamp off.
+    const source = readFileSync(new URL("./EmergencyCommandsPage.tsx", import.meta.url), "utf8");
+    expect(source).toContain("aria-expanded={expanded}");
+    expect(source).toContain('expanded ? "收起" : "展开"');
+    expect(source).toContain('collapsible && !expanded ? " is-collapsed" : ""');
     // The always-visible copy keeps the clipboard ceiling.
     const hugeCommand = renderToStaticMarkup(<EmergencyCommandResultView
       result={{ ...verbatim, command: "x".repeat(128 * 1_024 + 1) }}
@@ -744,7 +742,6 @@ describe("EmergencyCommandsPage", () => {
       text="x" note="n" truncated truncatedNote="原始输出超过 1 MiB，只显示前 1 MiB" />);
     expect(truncated).toContain("原始输出超过 1 MiB，只显示前 1 MiB");
     // The button hands the exact field to the bridge, nothing else.
-    const source = readFileSync(new URL("./EmergencyCommandsPage.tsx", import.meta.url), "utf8");
     expect(source).toContain("void writeClipboard(text)");
   });
 
