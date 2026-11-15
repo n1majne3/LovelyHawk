@@ -5743,6 +5743,69 @@ fn system_info_failure(error: SystemInfoApiError) -> RpcFailure {
                 }
                 CoreError::Validation { subject, .. }
                     if *subject
+                        == lovelyhawk_core::kernel_module_unload::KERNEL_MODULE_ABSENT_REFUSAL =>
+                {
+                    (
+                        "system-info-module-absent",
+                        "The module is not in /proc/modules (unloaded, built-in, or hiding itself).",
+                    )
+                }
+                CoreError::Validation { subject, .. }
+                    if *subject
+                        == lovelyhawk_core::kernel_module_unload::KERNEL_MODULE_IN_USE_REFUSAL =>
+                {
+                    (
+                        "system-info-module-in-use",
+                        "The module is still referenced or depended on and cannot be unloaded.",
+                    )
+                }
+                CoreError::Validation { subject, .. }
+                    if *subject
+                        == lovelyhawk_core::kernel_module_unload::KERNEL_MODULE_DISABLED_REFUSAL =>
+                {
+                    (
+                        "system-info-module-disabled",
+                        "The kernel has modules_disabled=1; unloading is blocked until reboot.",
+                    )
+                }
+                CoreError::Validation { subject, .. }
+                    if *subject
+                        == lovelyhawk_core::kernel_module_unload::KERNEL_MODULE_TOOLS_REFUSAL =>
+                {
+                    (
+                        "system-info-module-tools",
+                        "No usable rmmod (or busybox rmmod) is on the host.",
+                    )
+                }
+                CoreError::Validation { subject, .. }
+                    if *subject
+                        == lovelyhawk_core::kernel_module_unload::KERNEL_MODULE_PRIVILEGE_REFUSAL =>
+                {
+                    (
+                        "system-info-module-privilege",
+                        "Unloading a kernel module needs root or passwordless sudo.",
+                    )
+                }
+                CoreError::Validation { subject, .. }
+                    if *subject
+                        == lovelyhawk_core::kernel_module_unload::KERNEL_MODULE_CHANGED_REFUSAL =>
+                {
+                    (
+                        "system-info-module-changed",
+                        "The module's identity changed after the plan was made; nothing was unloaded.",
+                    )
+                }
+                CoreError::Validation { subject, .. }
+                    if *subject
+                        == lovelyhawk_core::kernel_module_unload::KERNEL_MODULE_PROBE_REFUSAL =>
+                {
+                    (
+                        "system-info-module-probe",
+                        "The kernel-module state read back incomplete or ambiguous; nothing was done.",
+                    )
+                }
+                CoreError::Validation { subject, .. }
+                    if *subject
                         == lovelyhawk_core::account_password::ACCOUNT_PASSWORD_PRIVILEGE_REFUSAL =>
                 {
                     (

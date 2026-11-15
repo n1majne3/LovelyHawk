@@ -3482,6 +3482,38 @@ impl SystemInfoTable {
         Ok(ArtifactMutationRequest { identity, action })
     }
 
+    /// The kernel-module row resolved to the module an unload would target.
+    /// Only the name travels: everything else the plan needs is re-read from
+    /// the host because the table may be minutes old.
+    pub fn kernel_module_unload_request(
+        &self,
+        row_id: &str,
+    ) -> CoreResult<crate::kernel_module_unload::KernelModuleUnloadRequest> {
+        if self.tab != SystemInfoTab::KernelModules {
+            return Err(CoreError::validation(
+                "kernel module unload",
+                "the selected row is not from the kernel module inventory",
+            ));
+        }
+        let row = self
+            .rows
+            .iter()
+            .find(|row| row.id == row_id)
+            .ok_or_else(|| invalid_detail_key("kernel module row"))?;
+        let module = row
+            .cells
+            .first()
+            .map(String::as_str)
+            .unwrap_or_default();
+        if !is_valid_module_name(module) {
+            return Err(invalid_detail_key("kernel module name"));
+        }
+        Ok(crate::kernel_module_unload::KernelModuleUnloadRequest {
+            row_id: row.id.clone(),
+            module: module.to_owned(),
+        })
+    }
+
     pub fn user_account_request(
         &self,
         row_id: &str,
@@ -8601,7 +8633,7 @@ fn is_valid_package_name(value: &str) -> bool {
         })
 }
 
-fn is_valid_module_name(value: &str) -> bool {
+pub(crate) fn is_valid_module_name(value: &str) -> bool {
     value
         .bytes()
         .next()

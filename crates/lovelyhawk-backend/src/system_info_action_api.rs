@@ -22,6 +22,7 @@ use std::{
 use lovelyhawk_core::{
     CoreError, CoreResult,
     account_password::AccountPasswordPlan,
+    kernel_module_unload::KernelModuleUnloadPlan,
     crypto::SecretValue,
     firewall_block::{
         FirewallBlockOutcome, FirewallBlockPlan, FirewallBlockRequest, FirewallBlockRestorePlan,
@@ -84,6 +85,9 @@ pub(crate) enum RowAction {
     NetworkDisconnect,
     ArtifactInspect(ArtifactInvestigationAction),
     ArtifactMutation(ArtifactMutationAction),
+    /// `kernel-module.unload` — rmmod a Live, refcount-0 module the kernel
+    /// module inventory listed.
+    KernelModuleUnload,
 }
 
 impl RowAction {
@@ -118,6 +122,7 @@ impl RowAction {
                 ArtifactInvestigationAction::SuidFile(inner) => format!("suid.{}", kebab(inner)),
                 ArtifactInvestigationAction::SshKey(inner) => format!("ssh-key.{}", kebab(inner)),
             },
+            Self::KernelModuleUnload => return "kernel-module.unload".to_owned(),
             Self::ArtifactMutation(action) => match action {
                 ArtifactMutationAction::DeleteCronFile => "cron.delete-file",
                 ArtifactMutationAction::CommentShellLine => "shell.comment-line",
@@ -172,6 +177,10 @@ impl RowAction {
                 _ => from_kebab(rest)
                     .map(ArtifactInvestigationAction::KernelModule)
                     .map(Self::ArtifactInspect),
+            },
+            "kernel-module" => match rest {
+                "unload" => Some(Self::KernelModuleUnload),
+                _ => None,
             },
             "env" => from_kebab(rest)
                 .map(ArtifactInvestigationAction::Environment)
@@ -242,6 +251,7 @@ impl RowAction {
             Self::NetworkDisconnect => "断开此连接",
             Self::ArtifactInspect(action) => action.label(),
             Self::ArtifactMutation(action) => action.label(),
+            Self::KernelModuleUnload => "卸载模块",
         }
     }
 
@@ -256,6 +266,7 @@ impl RowAction {
                 | Self::UserPassword
                 | Self::NetworkDisconnect
                 | Self::ArtifactMutation(_)
+                | Self::KernelModuleUnload
         )
     }
 
@@ -267,7 +278,8 @@ impl RowAction {
             Self::ProcessSignal(_)
             | Self::ProcessRestart
             | Self::NetworkDisconnect
-            | Self::ArtifactMutation(_) => true,
+            | Self::ArtifactMutation(_)
+            | Self::KernelModuleUnload => true,
             Self::ServiceRuntime(action) => matches!(
                 action,
                 ServiceRuntimeAction::Stop
@@ -297,7 +309,8 @@ impl RowAction {
             | Self::UserAccount(_)
             | Self::UserPassword
             | Self::NetworkDisconnect
-            | Self::ArtifactMutation(_) => ("change".to_owned(), "处置"),
+            | Self::ArtifactMutation(_)
+            | Self::KernelModuleUnload => ("change".to_owned(), "处置"),
         }
     }
 
@@ -375,6 +388,7 @@ impl RowAction {
                     ]
                     .map(Self::ArtifactMutation),
                 );
+                actions.push(Self::KernelModuleUnload);
             }
             SystemInfoTab::EnvVars => actions.extend(
                 EnvVarInvestigationAction::ALL
@@ -474,6 +488,7 @@ fn applies(table: &SystemInfoTable, row_id: &str, action: RowAction) -> bool {
         RowAction::ArtifactMutation(inner) => {
             table.artifact_mutation_request(row_id, inner).is_ok()
         }
+        RowAction::KernelModuleUnload => table.kernel_module_unload_request(row_id).is_ok(),
     }
 }
 
@@ -626,6 +641,7 @@ enum RowPlan {
     UserPassword(AccountPasswordPlan),
     NetworkDisconnect(NetworkDisconnectPlan),
     ArtifactMutation(ArtifactMutationPlan),
+    KernelModuleUnload(KernelModuleUnloadPlan),
 }
 
 impl RowPlan {
@@ -639,6 +655,7 @@ impl RowPlan {
             Self::UserPassword(plan) => plan.definition(),
             Self::NetworkDisconnect(plan) => plan.definition(),
             Self::ArtifactMutation(plan) => plan.definition(),
+            Self::KernelModuleUnload(plan) => plan.definition(),
         }
     }
 }
@@ -833,7 +850,8 @@ impl SystemInfoApi {
                 | RowAction::UserAccount(_)
                 | RowAction::UserPassword
                 | RowAction::NetworkDisconnect
-                | RowAction::ArtifactMutation(_) => Err(CoreError::Validation {
+                | RowAction::ArtifactMutation(_)
+                | RowAction::KernelModuleUnload => Err(CoreError::Validation {
                     subject: "system-information row action",
                     message: "this action changes the host and must be planned".to_owned(),
                 }),
@@ -943,6 +961,13 @@ impl SystemInfoApi {
                         .plan_artifact_mutation(&session, &request)
                         .await
                         .map(RowPlan::ArtifactMutation)
+                }
+                RowAction::KernelModuleUnload => {
+                    let request = table.kernel_module_unload_request(row_id)?;
+                    service
+                        .plan_kernel_module_unload(&session, &request)
+                        .await
+                        .map(RowPlan::KernelModuleUnload)
                 }
                 RowAction::ProcessInspect(_)
                 | RowAction::ServiceInspect(_)
@@ -1092,6 +1117,10 @@ impl SystemInfoApi {
                                 None,
                             )
                         }),
+                    RowPlan::KernelModuleUnload(plan) => service
+                        .execute_kernel_module_unload(&session, plan, confirmation, journal)
+                        .await
+                        .map(|outcome| (outcome.verification, false, None)),
                 }
             })
             .await;
@@ -2141,6 +2170,54 @@ mod tests {
             "expiresInMs",
         ] {
             assert!(restore.get(key).is_some(), "{key}");
+        }
+    }
+
+    #[test]
+    fn kernel_module_rows_offer_unload_as_a_dangerous_change() {
+        let modules = table(
+            SystemInfoTab::KernelModules,
+            vec![vec!["nf_conntrack", "172032", "1", "normal"]],
+        );
+        let actions = actions_for(&modules, "row-0");
+        let unload = actions
+            .iter()
+            .find(|(_, key, _)| key == "kernel-module.unload")
+            .expect("kernel module rows offer unload");
+        assert_eq!(unload.0, "change");
+        assert!(unload.2, "unload is marked dangerous");
+        assert_eq!(RowAction::KernelModuleUnload.label(), "卸载模块");
+        assert!(RowAction::KernelModuleUnload.changes_host());
+        // A row whose first cell is not a module name still cannot take it.
+        let broken = table(
+            SystemInfoTab::KernelModules,
+            vec![vec!["", "0", "0", "normal"]],
+        );
+        assert!(!applies(&broken, "row-0", RowAction::KernelModuleUnload));
+        assert!(
+            !actions_for(&broken, "row-0")
+                .iter()
+                .any(|(_, key, _)| key == "kernel-module.unload")
+        );
+    }
+
+    #[test]
+    fn kernel_module_unload_key_parses_to_exactly_one_action() {
+        assert_eq!(
+            RowAction::parse("kernel-module.unload"),
+            Some(RowAction::KernelModuleUnload)
+        );
+        assert_eq!(
+            RowAction::KernelModuleUnload.key(),
+            "kernel-module.unload"
+        );
+        for near_miss in [
+            "kernel-module.unload-now",
+            "kernel-module",
+            "module.unload",
+            "kernel-module.remove",
+        ] {
+            assert_eq!(RowAction::parse(near_miss), None, "{near_miss} parsed");
         }
     }
 }

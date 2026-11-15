@@ -44,6 +44,7 @@ pub mod integrity;
 pub mod investigation;
 pub mod ioc_extract;
 pub mod java;
+pub mod kernel_module_unload;
 pub mod kubernetes;
 pub mod line_config_visual;
 pub mod line_delete;
