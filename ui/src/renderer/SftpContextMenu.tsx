@@ -31,6 +31,7 @@ export type SftpMenuAction =
   | "chmod"
   | "archive"
   | "relay"
+  | "sqlite"
   | "remove"
   | "create-directory"
   | "properties";
@@ -159,6 +160,9 @@ export function menuItems(entry: SftpBrowserEntry | null, localScan = false): Me
   if (entry.kind === "file") {
     items.push({ action: "download", label: "下载", icon: <DownloadIcon /> });
     items.push({ action: "relay", label: "发送到其他主机…", icon: <UploadIcon /> });
+    // Offered for any regular file; the engine on the target decides whether
+    // it can be read as a SQLite database.
+    items.push({ action: "sqlite", label: "以 SQLite 只读打开…", icon: <PreviewIcon /> });
   }
   if (entry.kind === "directory") {
     items.push({ action: "download-directory", label: "下载目录…", icon: <DownloadIcon /> });

@@ -26,6 +26,13 @@ import {
   isSftpTextPreview,
 } from "../shared/sftp-browser-contract.js";
 import {
+  isSqliteDeletePlanResponse,
+  isSqliteDeleteReceipt,
+  isSqliteInspectResponse,
+  isSqliteRowsResponse,
+  SQLITE_DELETE_MAX_ROWS,
+} from "../shared/sqlite-contract.js";
+import {
   isFileEditorTarget,
   isTerminalClosed,
   isTerminalInputAcknowledgement,
@@ -367,6 +374,56 @@ export function createTerminalApi(): TerminalApi {
       return checked("sftp_undo", { planHandle }, SFTP_OPERATION_TIMEOUT_MS,
         (value) => isSftpOperationUndoResult(value) && value.planHandle === planHandle,
         "The SFTP undo result is invalid.");
+    },
+    sqliteInspectSftp: async (...values: unknown[]) => {
+      requireArity(values, 2, "Invalid SQLite view request.");
+      const [browserHandle, entryHandle] = values;
+      if (!isSftpBrowserOpaqueHandle(browserHandle) || !isSftpBrowserOpaqueHandle(entryHandle)) {
+        refuse("Invalid SQLite view request.");
+      }
+      return checked("sqlite_sftp_inspect", { browserHandle, entryHandle }, SFTP_BROWSER_TIMEOUT_MS,
+        isSqliteInspectResponse, "The SQLite inspect result is invalid.");
+    },
+    sqliteRowsSftp: async (...values: unknown[]) => {
+      requireArity(values, 4, "Invalid SQLite rows request.");
+      const [browserHandle, entryHandle, table, offset] = values;
+      if (!isSftpBrowserOpaqueHandle(browserHandle) || !isSftpBrowserOpaqueHandle(entryHandle) ||
+        typeof table !== "string" || table.trim().length === 0 ||
+        new TextEncoder().encode(table).byteLength > 512 ||
+        ![...table].every((char) => char.charCodeAt(0) >= 0x20) ||
+        typeof offset !== "number" || !Number.isSafeInteger(offset) || offset < 0 || offset > 1_000_000) {
+        refuse("Invalid SQLite rows request.");
+      }
+      return checked("sqlite_sftp_rows", { browserHandle, entryHandle, table, offset }, SFTP_BROWSER_TIMEOUT_MS,
+        isSqliteRowsResponse, "The SQLite rows result is invalid.");
+    },
+    sqliteDeletePlanSftp: async (...values: unknown[]) => {
+      requireArity(values, 4, "Invalid SQLite delete request.");
+      const [browserHandle, entryHandle, table, rowids] = values;
+      if (!isSftpBrowserOpaqueHandle(browserHandle) || !isSftpBrowserOpaqueHandle(entryHandle) ||
+        typeof table !== "string" || table.trim().length === 0 ||
+        new TextEncoder().encode(table).byteLength > 512 ||
+        ![...table].every((char) => char.charCodeAt(0) >= 0x20) ||
+        !Array.isArray(rowids) || rowids.length === 0 || rowids.length > SQLITE_DELETE_MAX_ROWS ||
+        !rowids.every((rowid) => typeof rowid === "number" && Number.isSafeInteger(rowid) && rowid >= 0)) {
+        refuse("Invalid SQLite delete request.");
+      }
+      return checked("sqlite_sftp_delete_plan", { browserHandle, entryHandle, table, rowids },
+        SFTP_BROWSER_TIMEOUT_MS, isSqliteDeletePlanResponse, "The SQLite delete plan is invalid.");
+    },
+    sqliteDeleteExecuteSftp: async (...values: unknown[]) => {
+      requireArity(values, 1, "Invalid SQLite delete request.");
+      const planHandle = values[0];
+      if (!isSftpBrowserOpaqueHandle(planHandle)) refuse("Invalid SQLite delete request.");
+      return checked("sqlite_sftp_delete_execute", { planHandle }, SFTP_OPERATION_TIMEOUT_MS,
+        isSqliteDeleteReceipt, "The SQLite delete result is invalid.");
+    },
+    sqliteDeleteUndoSftp: async (...values: unknown[]) => {
+      requireArity(values, 1, "Invalid SQLite undo request.");
+      const planHandle = values[0];
+      if (!isSftpBrowserOpaqueHandle(planHandle)) refuse("Invalid SQLite undo request.");
+      return checked("sqlite_sftp_delete_undo", { planHandle }, SFTP_OPERATION_TIMEOUT_MS,
+        isSqliteDeleteReceipt, "The SQLite undo result is invalid.");
     },
     stageSftpUpload: async (...values: unknown[]) => {
       if (values.length > 1) refuse("Invalid SFTP staging request.");

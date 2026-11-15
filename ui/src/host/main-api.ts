@@ -18,6 +18,12 @@ import { isJavaClassStageResult, isJavaHandle, isJavaHotUpdateRequest } from "..
 import { isWindowsFileId, isWindowsFileSaveResult, isWindowsIncidentRequest } from "../shared/windows-incident-contract.js";
 import { isPostgresqlRuntimeRequest } from "../shared/postgresql-runtime-contract.js";
 import { isMySqlRuntimeRequest } from "../shared/mysql-runtime-contract.js";
+import {
+  isSqliteDeletePlanRequest,
+  isSqliteDeleteRefRequest,
+  isSqliteInspectRequest,
+  isSqliteRowsRequest,
+} from "../shared/sqlite-contract.js";
 import { isThemeId } from "../shared/theme-contract.js";
 import {
   isAiHistoryExportFormat,
@@ -229,6 +235,31 @@ export function createMainApi(transport: BackendTransport = hostBackendTransport
       requireArity(values, 1, "数据库请求无效。");
       if (!isMySqlRuntimeRequest(values[0])) refuse("数据库请求无效。");
       return backend.mysqlRuntime(values[0]);
+    },
+    sqliteInspect: async (...values: unknown[]) => {
+      requireArity(values, 1, "SQLite 查看请求无效。");
+      if (!isSqliteInspectRequest(values[0])) refuse("SQLite 查看请求无效。");
+      return backend.sqliteInspect(values[0]);
+    },
+    sqliteRows: async (...values: unknown[]) => {
+      requireArity(values, 1, "SQLite 查看请求无效。");
+      if (!isSqliteRowsRequest(values[0])) refuse("SQLite 查看请求无效。");
+      return backend.sqliteRows(values[0]);
+    },
+    sqliteDeletePlan: async (...values: unknown[]) => {
+      requireArity(values, 1, "SQLite 删除请求无效。");
+      if (!isSqliteDeletePlanRequest(values[0])) refuse("SQLite 删除请求无效。");
+      return backend.sqliteDeletePlan(values[0]);
+    },
+    sqliteDeleteExecute: async (...values: unknown[]) => {
+      requireArity(values, 1, "SQLite 删除请求无效。");
+      if (!isSqliteDeleteRefRequest(values[0])) refuse("SQLite 删除请求无效。");
+      return backend.sqliteDeleteExecute(values[0]);
+    },
+    sqliteDeleteUndo: async (...values: unknown[]) => {
+      requireArity(values, 1, "SQLite 恢复请求无效。");
+      if (!isSqliteDeleteRefRequest(values[0])) refuse("SQLite 恢复请求无效。");
+      return backend.sqliteDeleteUndo(values[0]);
     },
     fileEvidence: async (...values: unknown[]) => {
       requireArity(values, 1, "留证请求无效。");

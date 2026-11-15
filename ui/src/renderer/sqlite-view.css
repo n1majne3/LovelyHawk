@@ -1,0 +1,287 @@
+/* SQLite 只读查看. Layout follows the path dialogs: fixed scrim, surface
+   card, theme tokens only. */
+
+.sqlite-view-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: var(--backdrop);
+}
+
+.sqlite-view-dialog {
+  display: flex;
+  width: min(960px, 100%);
+  max-height: 100%;
+  flex-direction: column;
+  gap: 10px;
+  overflow: hidden;
+  padding: 18px;
+  border: 1px solid var(--border-strong);
+  border-radius: 12px;
+  background: var(--surface);
+  box-shadow: var(--shadow-lg);
+}
+
+.sqlite-view-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.sqlite-view-header h2 {
+  margin: 0;
+  font-size: var(--font-subtitle);
+}
+
+.sqlite-view-subject {
+  margin: 4px 0 0;
+  color: var(--text-secondary);
+  font-size: var(--font-small);
+  overflow-wrap: anywhere;
+}
+
+.sqlite-view-close {
+  border: 0;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: var(--font-subtitle);
+  cursor: pointer;
+}
+
+.sqlite-view-note {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: var(--font-small);
+}
+
+.sqlite-view-note.is-warning {
+  color: var(--warning, #b45309);
+}
+
+.sqlite-view-error {
+  margin: 0;
+  color: var(--danger, #b91c1c);
+}
+
+.sqlite-view-busy {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: var(--font-small);
+}
+
+.sqlite-view-body {
+  display: grid;
+  grid-template-columns: minmax(180px, 240px) 1fr;
+  gap: 12px;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.sqlite-view-tables {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+  overflow: auto;
+  border-inline-end: 1px solid var(--border);
+  padding-inline-end: 10px;
+}
+
+.sqlite-view-file {
+  margin: 0;
+  font-size: var(--font-small);
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+}
+
+.sqlite-view-table-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.sqlite-view-table-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.sqlite-view-table-row > button:first-child {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  padding: 4px 6px;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  text-align: start;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+
+.sqlite-view-table-row > button:first-child:hover,
+.sqlite-view-table-row > button:first-child.is-active {
+  background: var(--surface-hover, rgba(127, 127, 127, 0.16));
+}
+
+.sqlite-view-schema-button {
+  flex: none;
+  border: 1px solid var(--border);
+  padding: 2px 6px;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: var(--font-small);
+  cursor: pointer;
+}
+
+.sqlite-view-content {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.sqlite-view-schema {
+  max-height: 160px;
+  overflow: auto;
+  margin: 0;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-raised, rgba(127, 127, 127, 0.08));
+  font-size: var(--font-small);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.sqlite-view-grid-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: var(--font-small);
+  color: var(--text-secondary);
+}
+
+.sqlite-view-grid-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.sqlite-view-grid-actions button,
+.sqlite-view-mutation-actions button,
+.sqlite-view-rowcopy button {
+  border: 1px solid var(--border-strong);
+  padding: 4px 10px;
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.sqlite-view-grid-actions button:disabled,
+.sqlite-view-mutation-actions button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.sqlite-view-grid-actions .is-dangerous,
+.sqlite-view-mutation-actions .is-dangerous {
+  border-color: var(--danger, #b91c1c);
+  color: var(--danger, #b91c1c);
+}
+
+.sqlite-view-grid-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.sqlite-view-grid {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--font-small);
+}
+
+.sqlite-view-grid th,
+.sqlite-view-grid td {
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border);
+  text-align: start;
+  white-space: nowrap;
+  max-width: 280px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sqlite-view-grid th {
+  position: sticky;
+  top: 0;
+  background: var(--surface-raised, var(--surface));
+  color: var(--text-secondary);
+}
+
+.sqlite-view-grid td.is-blob {
+  color: var(--text-secondary);
+  font-family: var(--font-mono, monospace);
+}
+
+.sqlite-view-check {
+  width: 28px;
+  text-align: center;
+}
+
+.sqlite-view-rowcopy {
+  width: 64px;
+}
+
+.sqlite-view-empty {
+  color: var(--text-secondary);
+  font-size: var(--font-small);
+}
+
+.sqlite-view-mutation {
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  padding: 12px;
+  background: var(--surface-raised, rgba(127, 127, 127, 0.06));
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  overflow: auto;
+  max-height: 240px;
+}
+
+.sqlite-view-mutation h3 {
+  margin: 0;
+  font-size: var(--font-subtitle);
+}
+
+.sqlite-view-mutation p {
+  margin: 0;
+}
+
+.sqlite-view-plan-rows {
+  margin: 0;
+  padding-inline-start: 18px;
+  font-size: var(--font-small);
+  overflow-wrap: anywhere;
+}
+
+.sqlite-view-mutation-actions {
+  display: flex;
+  gap: 8px;
+}

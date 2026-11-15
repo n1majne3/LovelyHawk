@@ -65,6 +65,11 @@ const MAIN_WINDOW_METHODS: &[&str] = &[
     "windows.incident",
     "postgresql.runtime",
     "mysql.runtime",
+    "sqlite.inspect",
+    "sqlite.rows",
+    "sqlite.delete.plan",
+    "sqlite.delete.execute",
+    "sqlite.delete.undo",
     "emergency.file-evidence",
     "case.workspace",
     "case.library",
@@ -258,6 +263,7 @@ fn lane_for(method: &str) -> Lane {
         Lane::Control
     } else if method.starts_with("sftp-browser.")
         || method.starts_with("emergency-command.path.")
+        || method.starts_with("sqlite.")
         || method == "emergency.file-evidence"
     {
         // An investigation can still be collecting later results when the
@@ -514,6 +520,11 @@ mod tests {
             "emergency-command.path.cancel",
             "emergency-command.path.undo",
             "emergency.file-evidence",
+            "sqlite.inspect",
+            "sqlite.rows",
+            "sqlite.delete.plan",
+            "sqlite.delete.execute",
+            "sqlite.delete.undo",
         ] {
             assert_eq!(lane_for(method), Lane::Files, "{method}");
         }

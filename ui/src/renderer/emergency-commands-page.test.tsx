@@ -27,9 +27,14 @@ import { EmergencyPathDialog, EmergencyPathOutcome, EmergencyPathProperties, sym
 import { EmergencyPathLinesDialog } from "./EmergencyPathLinesDialog";
 import { EmergencyPathMenu } from "./EmergencyPathMenu";
 
-const api: EmergencyCommandApi & import("../shared/file-evidence-contract").FileEvidenceApi & import("../shared/local-scan-contract").LocalScanApi & import("../shared/process-watch-contract").ProcessWatchApi = {
+const api: EmergencyCommandApi & import("../shared/file-evidence-contract").FileEvidenceApi & import("../shared/local-scan-contract").LocalScanApi & import("../shared/process-watch-contract").ProcessWatchApi & import("../shared/sqlite-contract").SqliteHostApi = {
   fileEvidence: async () => { throw new Error(); },
   localScan: async () => { throw new Error(); },
+  sqliteInspect: async () => { throw new Error(); },
+  sqliteRows: async () => { throw new Error(); },
+  sqliteDeletePlan: async () => { throw new Error(); },
+  sqliteDeleteExecute: async () => { throw new Error(); },
+  sqliteDeleteUndo: async () => { throw new Error(); },
   loadEmergencyCommandCatalog: async () => { throw new Error(); },
   runEmergencyCommand: async () => { throw new Error(); },
   inspectEmergencyPath: async () => { throw new Error(); },

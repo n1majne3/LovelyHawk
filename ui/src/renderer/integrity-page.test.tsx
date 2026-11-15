@@ -12,7 +12,14 @@ import {
 import { IntegrityPage } from "./IntegrityPage";
 import { createIntegrityState, type IntegrityState } from "./integrity-state";
 
-const api: IntegrityApi & EmergencyCommandApi & FileEvidenceApi = {
+const api: IntegrityApi & EmergencyCommandApi & FileEvidenceApi &
+  import("../shared/sqlite-contract").SqliteHostApi & { writeClipboard(text: string): Promise<void> } = {
+  sqliteInspect: async () => { throw new Error(); },
+  sqliteRows: async () => { throw new Error(); },
+  sqliteDeletePlan: async () => { throw new Error(); },
+  sqliteDeleteExecute: async () => { throw new Error(); },
+  sqliteDeleteUndo: async () => { throw new Error(); },
+  writeClipboard: async () => {},
   getIntegrityPresets: async () => ({}),
   listIntegrityBaselines: async () => ({}),
   startIntegrityComparison: async () => ({}),

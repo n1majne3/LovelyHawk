@@ -42,6 +42,7 @@ mod postgresql_runtime_api;
 mod process_watch_api;
 mod settings_api;
 mod sftp_browser_api;
+mod sqlite_api;
 mod ssh_api;
 mod system_info_action_api;
 mod system_info_api;
@@ -128,6 +129,10 @@ use crate::{
         SettingsAiApiKeyReplacementInput, SettingsApi, SettingsApiError, SettingsSaveInput,
     },
     sftp_browser_api::{SftpBrowserApi, SftpBrowserApiError, SftpOperationRequest},
+    sqlite_api::{
+        SqliteApi, SqliteApiError, SqliteDeletePlanRequest, SqliteDeleteRefRequest,
+        SqliteInspectRequest, SqliteRowsRequest,
+    },
     ssh_api::{SecretResponses, SshApi},
     system_info_api::{SystemInfoApi, SystemInfoApiError},
     terminal_api::{TerminalApi, TerminalApiError},
@@ -233,6 +238,7 @@ pub struct BackendState {
     case_workspace: CaseWorkspaceApi,
     case_library: CaseLibraryApi,
     sftp_browser: SftpBrowserApi,
+    sqlite: SqliteApi,
     integrity: Arc<IntegrityApi>,
     integrity_write: Arc<IntegrityWriteApi>,
     // Shared: the mutation side resolves its row handles through this exact
@@ -375,6 +381,12 @@ impl BackendState {
         let nginx_repair = NginxRepairApi::new(services.clone(), Arc::clone(&ssh));
         let java_hot_update = JavaHotUpdateApi::new(services.clone(), Arc::clone(&ssh));
         let windows_incident = WindowsIncidentApi::new(services.clone());
+        let sqlite = SqliteApi::new(
+            services.clone(),
+            Arc::clone(&ssh),
+            emergency_command.paths().clone(),
+            sftp_browser.clone(),
+        );
         Ok(Self {
             services,
             ai_history: AiHistoryApi::default(),
@@ -400,6 +412,7 @@ impl BackendState {
             postgresql_runtime,
             mysql_runtime,
             sftp_browser,
+            sqlite,
             integrity,
             integrity_write,
             kubernetes_read,
@@ -879,6 +892,7 @@ impl BackendState {
                             self.docker_write.close_binding(&params.binding_handle);
                             self.system_info.close_binding(&params.binding_handle);
                             self.sftp_browser.close_binding(&params.binding_handle);
+                            self.sqlite.close_binding(&params.binding_handle);
                             self.port_forward.close_binding(&params.binding_handle);
                             self.packet_capture_evidence
                                 .close_binding(&params.binding_handle);
@@ -1203,6 +1217,59 @@ impl BackendState {
                 Ok(params) => Ok(to_value(self.mysql_runtime.dispatch(params).await)),
                 Err(failure) => Err(failure),
             },
+            RpcMethod::SqliteInspect => {
+                match parse_params::<SqliteInspectRequest>(request.params) {
+                    Ok(params) => self
+                        .sqlite
+                        .inspect(&params)
+                        .await
+                        .map(to_value)
+                        .map_err(sqlite_failure),
+                    Err(failure) => Err(failure),
+                }
+            }
+            RpcMethod::SqliteRows => match parse_params::<SqliteRowsRequest>(request.params) {
+                Ok(params) => self
+                    .sqlite
+                    .rows(&params)
+                    .await
+                    .map(to_value)
+                    .map_err(sqlite_failure),
+                Err(failure) => Err(failure),
+            },
+            RpcMethod::SqliteDeletePlan => {
+                match parse_params::<SqliteDeletePlanRequest>(request.params) {
+                    Ok(params) => self
+                        .sqlite
+                        .delete_plan(&params)
+                        .await
+                        .map(to_value)
+                        .map_err(sqlite_failure),
+                    Err(failure) => Err(failure),
+                }
+            }
+            RpcMethod::SqliteDeleteExecute => {
+                match parse_params::<SqliteDeleteRefRequest>(request.params) {
+                    Ok(params) => self
+                        .sqlite
+                        .delete_execute(&params)
+                        .await
+                        .map(to_value)
+                        .map_err(sqlite_failure),
+                    Err(failure) => Err(failure),
+                }
+            }
+            RpcMethod::SqliteDeleteUndo => {
+                match parse_params::<SqliteDeleteRefRequest>(request.params) {
+                    Ok(params) => self
+                        .sqlite
+                        .delete_undo(&params)
+                        .await
+                        .map(to_value)
+                        .map_err(sqlite_failure),
+                    Err(failure) => Err(failure),
+                }
+            }
             RpcMethod::FileEvidence => match parse_params::<FileEvidenceRequest>(request.params) {
                 Ok(params) => self
                     .file_evidence
@@ -3481,6 +3548,16 @@ enum RpcMethod {
     PostgresqlRuntime,
     #[serde(rename = "mysql.runtime")]
     MySqlRuntime,
+    #[serde(rename = "sqlite.inspect")]
+    SqliteInspect,
+    #[serde(rename = "sqlite.rows")]
+    SqliteRows,
+    #[serde(rename = "sqlite.delete.plan")]
+    SqliteDeletePlan,
+    #[serde(rename = "sqlite.delete.execute")]
+    SqliteDeleteExecute,
+    #[serde(rename = "sqlite.delete.undo")]
+    SqliteDeleteUndo,
     #[serde(rename = "emergency.file-evidence")]
     FileEvidence,
     #[serde(rename = "local.scan")]
@@ -6676,6 +6753,38 @@ fn config_visual_failure(error: ConfigVisualError) -> RpcFailure {
     };
     RpcFailure {
         operation: "visual configuration",
+        code,
+        public_message: message,
+        source: None,
+    }
+}
+
+fn sqlite_failure(error: SqliteApiError) -> RpcFailure {
+    let (code, message) = match error {
+        SqliteApiError::Invalid => ("invalid-params", "SQLite 查看请求无效。"),
+        SqliteApiError::BindingUnavailable => (
+            "sqlite-binding-unavailable",
+            "连接已失效或目标已切换，请重新连接后再查看。",
+        ),
+        SqliteApiError::PathStale => (
+            "sqlite-path-stale",
+            "文件列表已失效或目标已变化，请刷新后再打开。",
+        ),
+        SqliteApiError::PlanStale => (
+            "sqlite-delete-plan-stale",
+            "删除计划已过期或已使用，请重新选择行并重新规划。",
+        ),
+        SqliteApiError::Refused { code } => (
+            Box::leak(code.into_boxed_str()) as &'static str,
+            "目标拒绝了这次操作，原因见页面提示。",
+        ),
+        SqliteApiError::Opaque => (
+            "sqlite-opaque",
+            "目标返回了无法解析的结果，请重试或人工检查。",
+        ),
+    };
+    RpcFailure {
+        operation: "sqlite view",
         code,
         public_message: message,
         source: None,

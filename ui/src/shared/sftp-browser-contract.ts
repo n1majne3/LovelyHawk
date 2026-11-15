@@ -209,6 +209,17 @@ export interface SftpBrowserApi {
   /** Puts a verified operation back, once, while its receipt offers it. */
   undoSftpOperation(planHandle: string): Promise<unknown>;
   /**
+   * Read-only SQLite view of one file this browser offered. The host resolves
+   * which target and file the handles are; the page never names a path.
+   */
+  sqliteInspectSftp(browserHandle: string, entryHandle: string): Promise<unknown>;
+  sqliteRowsSftp(browserHandle: string, entryHandle: string, table: string, offset: number): Promise<unknown>;
+  sqliteDeletePlanSftp(browserHandle: string, entryHandle: string, table: string, rowids: number[]): Promise<unknown>;
+  sqliteDeleteExecuteSftp(planHandle: string): Promise<unknown>;
+  sqliteDeleteUndoSftp(planHandle: string): Promise<unknown>;
+  /** Clipboard goes through the host; the page never touches it directly. */
+  copySelection(text: string): Promise<void>;
+  /**
    * Picks a local folder through the host dialog, packs it into a bounded
    * tar (no links, junctions or reparse points) and stages it. Nothing remote
    * changes; the page previews the counts and asks before running.

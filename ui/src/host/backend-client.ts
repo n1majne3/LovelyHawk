@@ -7,6 +7,24 @@ import { isLogRulesRequest, matchesLogRulesResponse, type LogRulesRequest, type 
 import { isAiAssistRequest, matchesAiAssistResponse, type AiAssistRequest, type AiAssistResponse } from "../shared/ai-assist-contract.js";
 import { isPostgresqlRuntimeRequest, matchesPostgresqlRuntimeResponse, type PostgresqlRuntimeRequest, type PostgresqlRuntimeResponse } from "../shared/postgresql-runtime-contract.js";
 import { isMySqlRuntimeRequest, matchesMySqlRuntimeResponse, type MySqlRuntimeRequest, type MySqlRuntimeResponse } from "../shared/mysql-runtime-contract.js";
+import {
+  isSqliteDeletePlanRequest,
+  isSqliteDeletePlanResponse,
+  isSqliteDeleteReceipt,
+  isSqliteDeleteRefRequest,
+  isSqliteInspectRequest,
+  isSqliteInspectResponse,
+  isSqliteRowsRequest,
+  isSqliteRowsResponse,
+  type SqliteDeletePlanRequest,
+  type SqliteDeletePlanResponse,
+  type SqliteDeleteReceipt,
+  type SqliteDeleteRefRequest,
+  type SqliteInspectRequest,
+  type SqliteInspectResponse,
+  type SqliteRowsRequest,
+  type SqliteRowsResponse,
+} from "../shared/sqlite-contract.js";
 import { isFileEvidenceRequest, matchesFileEvidenceResult, type FileEvidenceRequest, type FileEvidenceResult } from "../shared/file-evidence-contract.js";
 import { isPacketCaptureEvidenceRequest, matchesPacketCaptureEvidenceResult, type PacketCaptureEvidenceRequest, type PacketCaptureEvidenceResult } from "../shared/packet-capture-evidence-contract.js";
 import { isPcapOfflineStatus } from "../shared/pcap-offline-contract.js";
@@ -782,6 +800,41 @@ export class BackendClient {
     if (!isMySqlRuntimeRequest(request)) throw new Error("数据库请求无效。");
     const response = await this.#request("mysql.runtime", request, 30_000);
     if (!matchesMySqlRuntimeResponse(request, response)) throw new Error("数据库返回了无法核实的结果，请刷新后重试。");
+    return response;
+  }
+
+  async sqliteInspect(request: SqliteInspectRequest): Promise<SqliteInspectResponse> {
+    if (!isSqliteInspectRequest(request)) throw new Error("SQLite 查看请求无效。");
+    const response = await this.#request("sqlite.inspect", request, 30_000);
+    if (!isSqliteInspectResponse(response)) throw new Error("SQLite 查看返回了无法核实的结果，请重试。");
+    return response;
+  }
+
+  async sqliteRows(request: SqliteRowsRequest): Promise<SqliteRowsResponse> {
+    if (!isSqliteRowsRequest(request)) throw new Error("SQLite 查看请求无效。");
+    const response = await this.#request("sqlite.rows", request, 30_000);
+    if (!isSqliteRowsResponse(response)) throw new Error("SQLite 查看返回了无法核实的结果，请重试。");
+    return response;
+  }
+
+  async sqliteDeletePlan(request: SqliteDeletePlanRequest): Promise<SqliteDeletePlanResponse> {
+    if (!isSqliteDeletePlanRequest(request)) throw new Error("SQLite 删除请求无效。");
+    const response = await this.#request("sqlite.delete.plan", request, 30_000);
+    if (!isSqliteDeletePlanResponse(response)) throw new Error("SQLite 删除计划返回了无法核实的结果，请重试。");
+    return response;
+  }
+
+  async sqliteDeleteExecute(request: SqliteDeleteRefRequest): Promise<SqliteDeleteReceipt> {
+    if (!isSqliteDeleteRefRequest(request)) throw new Error("SQLite 删除请求无效。");
+    const response = await this.#request("sqlite.delete.execute", request, 30_000);
+    if (!isSqliteDeleteReceipt(response)) throw new Error("SQLite 删除结果返回了无法核实的结果，请重试。");
+    return response;
+  }
+
+  async sqliteDeleteUndo(request: SqliteDeleteRefRequest): Promise<SqliteDeleteReceipt> {
+    if (!isSqliteDeleteRefRequest(request)) throw new Error("SQLite 恢复请求无效。");
+    const response = await this.#request("sqlite.delete.undo", request, 30_000);
+    if (!isSqliteDeleteReceipt(response)) throw new Error("SQLite 恢复结果返回了无法核实的结果，请重试。");
     return response;
   }
 

@@ -58,6 +58,9 @@ import type { FileEvidenceApi } from "../shared/file-evidence-contract";
 import { LocalScanDialog } from "./LocalScanDialog";
 import { pathOfferScanTransport } from "./local-scan-controller";
 import type { LocalScanApi } from "../shared/local-scan-contract";
+import { SqliteViewDialog } from "./SqliteViewDialog";
+import { offerSqliteViewer } from "./sqlite-viewer-adapters";
+import type { SqliteHostApi } from "../shared/sqlite-contract";
 import { useListExpiry } from "./use-list-expiry";
 import { useModalScrim } from "./modal-scrim";
 import "./emergency-commands.css";
@@ -65,7 +68,7 @@ import "./emergency-path.css";
 
 export interface EmergencyCommandsPageProps {
   bindingHandle: string | null;
-  api: EmergencyCommandApi & FileEvidenceApi & LocalScanApi & ProcessWatchApi;
+  api: EmergencyCommandApi & FileEvidenceApi & LocalScanApi & ProcessWatchApi & SqliteHostApi;
   /** Clipboard bridge; the result view's 复制 buttons are hidden without it. */
   writeClipboard?: ((text: string) => Promise<void>) | undefined;
   /**
@@ -93,6 +96,7 @@ const RERUN_MISSING: Record<Exclude<EmergencyHistoryLocationStatus, "found">, st
 export function EmergencyCommandsPage({ bindingHandle, api, writeClipboard, rerun = null, runIn = null }: EmergencyCommandsPageProps) {
   const [evidence, setEvidence] = useState<{ offer: EmergencyCommandPathOffer; binding: string; api: FileEvidenceApi; returnFocus: HTMLElement | null } | null>(null);
   const [localScan, setLocalScan] = useState<{ offer: EmergencyCommandPathOffer; binding: string; api: LocalScanApi; returnFocus: HTMLElement | null } | null>(null);
+  const [sqliteView, setSqliteView] = useState<{ offer: EmergencyCommandPathOffer; binding: string; returnFocus: HTMLElement | null } | null>(null);
   // Handles picked for the batch dialog. A target switch or a new bridge
   // must not carry a selection minted for another target.
   const [batchHandles, setBatchHandles] = useState<readonly string[] | null>(null);
@@ -103,7 +107,7 @@ export function EmergencyCommandsPage({ bindingHandle, api, writeClipboard, reru
   const rememberWatch = useCallback((handle: string | null) => {
     setLastWatch(handle !== null && bindingHandle !== null ? { binding: bindingHandle, handle } : null);
   }, [bindingHandle]);
-  useEffect(() => { setEvidence(null); setLocalScan(null); setBatchHandles(null); setProcessWatch(null); setLastWatch(null); }, [api, bindingHandle]);
+  useEffect(() => { setEvidence(null); setLocalScan(null); setSqliteView(null); setBatchHandles(null); setProcessWatch(null); setLastWatch(null); }, [api, bindingHandle]);
   const [state, dispatch] = useReducer(emergencyCommandReducer, undefined, createEmergencyCommandState);
   const [refreshVersion, setRefreshVersion] = useState(0);
   const [runVersion, setRunVersion] = useState(0);
@@ -559,7 +563,11 @@ export function EmergencyCommandsPage({ bindingHandle, api, writeClipboard, reru
               (document.activeElement instanceof HTMLElement ? document.activeElement : null);
             pathActions.dismissMenu();
             setLocalScan({ offer, binding: bindingHandle, api, returnFocus });
-          } else if (offer !== null && action !== "evidence" && action !== "local-scan") {
+          } else if (offer !== null && action === "sqlite" && bindingHandle !== null) {
+            const returnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+            pathActions.dismissMenu();
+            setSqliteView({ offer, binding: bindingHandle, returnFocus });
+          } else if (offer !== null && action !== "evidence" && action !== "local-scan" && action !== "sqlite") {
             void pathActions.start(action, offer);
           }
         }}
@@ -588,6 +596,16 @@ export function EmergencyCommandsPage({ bindingHandle, api, writeClipboard, reru
         subject={{ path: localScan.offer.path, entryKind: "file" }}
         onLocate={(event, offer) => pathActions.openMenu(event, offer)}
         returnFocus={localScan.returnFocus} onClose={() => setLocalScan(null)} /> : null}
+      {sqliteView !== null && sqliteView.binding === bindingHandle ? <SqliteViewDialog
+        key={`${sqliteView.binding}:${sqliteView.offer.pathHandle}`}
+        api={offerSqliteViewer(api, sqliteView.binding)}
+        source={{ kind: "offer", pathHandle: sqliteView.offer.pathHandle }}
+        subject={sqliteView.offer.path}
+        copyText={(text) => { void writeClipboard?.(text); }}
+        onClose={() => {
+          sqliteView.returnFocus?.focus();
+          setSqliteView(null);
+        }} /> : null}
       {acting !== null && (acting.action === null ? <EmergencyPathProperties
         path={acting.offer.path}
         detail={acting.detail}

@@ -1225,6 +1225,141 @@ pub async fn sftp_undo<R: Runtime>(
     sftp_plan_step(&window, &host, "sftp-browser.operation.undo", plan_handle).await
 }
 
+/// Read-only SQLite view of a file this window's browser offered. The page
+/// only names handles; the host resolves which binding and file they are.
+#[tauri::command]
+pub async fn sqlite_sftp_inspect<R: Runtime>(
+    window: WebviewWindow<R>,
+    host: State<'_, Host>,
+    browser_handle: String,
+    entry_handle: String,
+) -> CommandResult<Value> {
+    let scope = scope(&window, &host)?;
+    if !matches!(scope.kind, ChildKind::Terminal) {
+        return Err(REFUSED_METHOD.to_owned());
+    }
+    if !opaque(&browser_handle) || !opaque(&entry_handle) {
+        return Err("Invalid SQLite view request.".to_owned());
+    }
+    host.bridge
+        .call(
+            "sqlite.inspect",
+            json!({
+                "bindingHandle": scope.binding_handle,
+                "source": { "kind": "sftp", "browserHandle": browser_handle, "entryHandle": entry_handle },
+            }),
+        )
+        .await
+}
+
+#[tauri::command]
+pub async fn sqlite_sftp_rows<R: Runtime>(
+    window: WebviewWindow<R>,
+    host: State<'_, Host>,
+    browser_handle: String,
+    entry_handle: String,
+    table: String,
+    offset: u32,
+) -> CommandResult<Value> {
+    let scope = scope(&window, &host)?;
+    if !matches!(scope.kind, ChildKind::Terminal) {
+        return Err(REFUSED_METHOD.to_owned());
+    }
+    if !opaque(&browser_handle) || !opaque(&entry_handle) || !valid_sqlite_table(&table)
+        || offset > 1_000_000
+    {
+        return Err("Invalid SQLite rows request.".to_owned());
+    }
+    host.bridge
+        .call(
+            "sqlite.rows",
+            json!({
+                "bindingHandle": scope.binding_handle,
+                "source": { "kind": "sftp", "browserHandle": browser_handle, "entryHandle": entry_handle },
+                "table": table,
+                "offset": offset,
+            }),
+        )
+        .await
+}
+
+#[tauri::command]
+pub async fn sqlite_sftp_delete_plan<R: Runtime>(
+    window: WebviewWindow<R>,
+    host: State<'_, Host>,
+    browser_handle: String,
+    entry_handle: String,
+    table: String,
+    rowids: Vec<i64>,
+) -> CommandResult<Value> {
+    let scope = scope(&window, &host)?;
+    if !matches!(scope.kind, ChildKind::Terminal) {
+        return Err(REFUSED_METHOD.to_owned());
+    }
+    if !opaque(&browser_handle) || !opaque(&entry_handle) || !valid_sqlite_table(&table)
+        || rowids.is_empty() || rowids.len() > 50
+        || rowids.iter().any(|rowid| *rowid < 0)
+    {
+        return Err("Invalid SQLite delete request.".to_owned());
+    }
+    host.bridge
+        .call(
+            "sqlite.delete.plan",
+            json!({
+                "bindingHandle": scope.binding_handle,
+                "source": { "kind": "sftp", "browserHandle": browser_handle, "entryHandle": entry_handle },
+                "table": table,
+                "rowids": rowids,
+            }),
+        )
+        .await
+}
+
+#[tauri::command]
+pub async fn sqlite_sftp_delete_execute<R: Runtime>(
+    window: WebviewWindow<R>,
+    host: State<'_, Host>,
+    plan_handle: String,
+) -> CommandResult<Value> {
+    sqlite_sftp_plan_step(&window, &host, "sqlite.delete.execute", plan_handle).await
+}
+
+#[tauri::command]
+pub async fn sqlite_sftp_delete_undo<R: Runtime>(
+    window: WebviewWindow<R>,
+    host: State<'_, Host>,
+    plan_handle: String,
+) -> CommandResult<Value> {
+    sqlite_sftp_plan_step(&window, &host, "sqlite.delete.undo", plan_handle).await
+}
+
+async fn sqlite_sftp_plan_step<R: Runtime>(
+    window: &WebviewWindow<R>,
+    host: &Host,
+    method: &'static str,
+    plan_handle: String,
+) -> CommandResult<Value> {
+    let scope = scope(window, host)?;
+    if !matches!(scope.kind, ChildKind::Terminal) {
+        return Err(REFUSED_METHOD.to_owned());
+    }
+    if !opaque(&plan_handle) {
+        return Err("Invalid SQLite request.".to_owned());
+    }
+    host.bridge
+        .call(
+            method,
+            json!({ "bindingHandle": scope.binding_handle, "planHandle": plan_handle }),
+        )
+        .await
+}
+
+fn valid_sqlite_table(table: &str) -> bool {
+    !table.is_empty()
+        && table.len() <= 512
+        && !table.chars().any(char::is_control)
+}
+
 /// Stages a local file for upload: one the local pane listed, or one picked
 /// in the system dialog. Either way the host resolves the path.
 #[tauri::command]

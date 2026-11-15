@@ -6,6 +6,16 @@ import type { LogRulesRequest, LogRulesResponse } from "./log-rules-contract.js"
 import type { AiAssistRequest, AiAssistResponse } from "./ai-assist-contract.js";
 import type { PostgresqlRuntimeRequest, PostgresqlRuntimeResponse } from "./postgresql-runtime-contract.js";
 import type { MySqlRuntimeRequest, MySqlRuntimeResponse } from "./mysql-runtime-contract.js";
+import type {
+  SqliteDeletePlanRequest,
+  SqliteDeletePlanResponse,
+  SqliteDeleteReceipt,
+  SqliteDeleteRefRequest,
+  SqliteInspectRequest,
+  SqliteInspectResponse,
+  SqliteRowsRequest,
+  SqliteRowsResponse,
+} from "./sqlite-contract.js";
 import type { FileEvidenceRequest, FileEvidenceResult } from "./file-evidence-contract.js";
 import type { PacketCaptureEvidenceRequest, PacketCaptureEvidenceResult } from "./packet-capture-evidence-contract.js";
 import type { PcapOfflineRequest, PcapOfflineResult } from "./pcap-offline-contract.js";
@@ -503,6 +513,12 @@ export interface LovelyHawkApi {
   caseWorkspace(request: CaseWorkspaceRequest): Promise<CaseWorkspaceResult>;
   postgresqlRuntime(request: PostgresqlRuntimeRequest): Promise<PostgresqlRuntimeResponse>;
   mysqlRuntime(request: MySqlRuntimeRequest): Promise<MySqlRuntimeResponse>;
+  /** Read-only SQLite view of a file a browser or a path offer already named. */
+  sqliteInspect(request: SqliteInspectRequest): Promise<SqliteInspectResponse>;
+  sqliteRows(request: SqliteRowsRequest): Promise<SqliteRowsResponse>;
+  sqliteDeletePlan(request: SqliteDeletePlanRequest): Promise<SqliteDeletePlanResponse>;
+  sqliteDeleteExecute(request: SqliteDeleteRefRequest): Promise<SqliteDeleteReceipt>;
+  sqliteDeleteUndo(request: SqliteDeleteRefRequest): Promise<SqliteDeleteReceipt>;
   fileEvidence(request: FileEvidenceRequest): Promise<FileEvidenceResult | null>;
   /** Fetch offered target content into the local quarantine area and launch a configured local engine against it. */
   localScan(request: import("./local-scan-contract").LocalScanRequest): Promise<import("./local-scan-contract").LocalScanResult | null>;

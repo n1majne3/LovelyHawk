@@ -23,6 +23,9 @@ import { EmergencyPathMenu } from "./EmergencyPathMenu";
 import { useEmergencyPathActions } from "./emergency-path-actions";
 import { errorText } from "./error-text";
 import { FileEvidenceDialog } from "./FileEvidenceDialog";
+import { SqliteViewDialog } from "./SqliteViewDialog";
+import { offerSqliteViewer } from "./sqlite-viewer-adapters";
+import type { SqliteHostApi } from "../shared/sqlite-contract";
 import { useConfirmDialog } from "./use-confirm-dialog";
 import {
   cancelIntegrityLifecycle,
@@ -42,7 +45,9 @@ import "./integrity.css";
 interface IntegrityPageProps {
   bindingHandle: string | null;
   /** Findings use the command workbench's file actions, so its API comes too. */
-  api: IntegrityApi & EmergencyCommandApi & FileEvidenceApi;
+  api: IntegrityApi & EmergencyCommandApi & FileEvidenceApi & SqliteHostApi & {
+    writeClipboard(text: string): Promise<void>;
+  };
   /** Deterministic standalone/SSR fixture; production leaves this unset. */
   initialState?: IntegrityState;
 }
@@ -94,6 +99,11 @@ export function IntegrityPage({ bindingHandle, api, initialState }: IntegrityPag
     binding: string;
     returnFocus: HTMLElement | null;
   } | null>(null);
+  const [sqliteView, setSqliteView] = useState<{
+    offer: EmergencyCommandPathOffer;
+    binding: string;
+    returnFocus: HTMLElement | null;
+  } | null>(null);
   // Which preset locations a new baseline records; null until the operator
   // changes the catalogue's own defaults.
   const [chosenPresets, setChosenPresets] = useState<readonly IntegrityPresetId[] | null>(null);
@@ -114,6 +124,7 @@ export function IntegrityPage({ bindingHandle, api, initialState }: IntegrityPag
   // A creation belongs to the target it runs on: switching or leaving the page stops it.
   useEffect(() => {
     setEvidence(null);
+    setSqliteView(null);
     return () => {
       const running = creationRef.current;
       if (running?.bindingHandle === bindingHandle) {
@@ -671,7 +682,11 @@ export function IntegrityPage({ bindingHandle, api, initialState }: IntegrityPag
               (document.activeElement instanceof HTMLElement ? document.activeElement : null);
             pathActions.dismissMenu();
             setEvidence({ offer, binding: bindingHandle, returnFocus });
-          } else if (offer !== null && action !== "evidence" && action !== "local-scan") {
+          } else if (offer !== null && action === "sqlite" && bindingHandle !== null) {
+            const returnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+            pathActions.dismissMenu();
+            setSqliteView({ offer, binding: bindingHandle, returnFocus });
+          } else if (offer !== null && action !== "evidence" && action !== "local-scan" && action !== "sqlite") {
             void pathActions.start(action, offer);
           }
         }}
@@ -679,6 +694,16 @@ export function IntegrityPage({ bindingHandle, api, initialState }: IntegrityPag
       {evidence !== null && evidence.binding === bindingHandle ? <FileEvidenceDialog
         key={`${evidence.binding}:${evidence.offer.pathHandle}`} api={api} binding={evidence.binding}
         offer={evidence.offer} returnFocus={evidence.returnFocus} onClose={() => setEvidence(null)} /> : null}
+      {sqliteView !== null && sqliteView.binding === bindingHandle ? <SqliteViewDialog
+        key={`${sqliteView.binding}:${sqliteView.offer.pathHandle}`}
+        api={offerSqliteViewer(api, sqliteView.binding)}
+        source={{ kind: "offer", pathHandle: sqliteView.offer.pathHandle }}
+        subject={sqliteView.offer.path}
+        copyText={(text) => { void api.writeClipboard(text); }}
+        onClose={() => {
+          sqliteView.returnFocus?.focus();
+          setSqliteView(null);
+        }} /> : null}
       {acting !== null && (acting.action === null ? <EmergencyPathProperties
         path={acting.offer.path}
         detail={acting.detail}

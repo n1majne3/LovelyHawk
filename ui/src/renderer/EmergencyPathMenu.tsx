@@ -10,6 +10,7 @@ export type EmergencyPathMenuAction =
   | "properties"
   | "evidence"
   | "local-scan"
+  | "sqlite"
   | "disarm"
   | "remove-capabilities"
   | "restore-residue"
@@ -35,12 +36,21 @@ interface MenuItem {
   dangerous?: boolean;
 }
 
+function isSqliteName(path: string): boolean {
+  return /\.(db|sqlite|sqlite3|db3)$/iu.test(path);
+}
+
 const ITEMS: MenuItem[] = [
   { action: "evidence", label: "下载留证", icon: <InfoIcon /> },
   { action: "local-scan", label: "取回本机扫描", icon: <SearchIcon /> },
   {
     action: "properties",
     label: "查看属性",
+    icon: <InfoIcon />,
+  },
+  {
+    action: "sqlite",
+    label: "以 SQLite 只读打开…",
     icon: <InfoIcon />,
   },
   {
@@ -149,7 +159,10 @@ export function EmergencyPathMenu({
         (item.action !== "delete-lines" || offer.lineEditable) &&
         // Same rule for the xinetd service action: only files xinetd
         // actually loads ever show it.
-        (item.action !== "disable-xinetd-service" || offer.xinetdService),
+        (item.action !== "disable-xinetd-service" || offer.xinetdService) &&
+        // The SQLite viewer only makes sense where the name reads like a
+        // database; the engine on the target decides either way.
+        (item.action !== "sqlite" || isSqliteName(offer.path)),
       ).map((item) => (
         <Fragment key={item.action}>
           {item.action === "disarm" ? <div className="emergency-path-menu-separator" role="separator" /> : null}

@@ -93,6 +93,7 @@ pub mod services;
 pub mod settings;
 pub mod sftp;
 pub mod shell_escape;
+pub mod sqlite_view;
 pub mod ssh;
 pub mod ssh_compat;
 pub mod store;

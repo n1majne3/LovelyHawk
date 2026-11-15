@@ -45,6 +45,8 @@ import { LocalFilePane } from "./LocalFilePane";
 import { SftpContextMenu, type SftpMenuAction } from "./SftpContextMenu";
 import { SftpOperationDialog, type SftpOperationDraft } from "./SftpOperationDialog";
 import { SftpPropertiesDialog } from "./SftpPropertiesDialog";
+import { SqliteViewDialog } from "./SqliteViewDialog";
+import { sftpSqliteViewer } from "./sqlite-viewer-adapters";
 import {
   ArchiveIcon,
   DownloadIcon,
@@ -166,6 +168,12 @@ export function SftpBrowserPage({
   const [windowError, setWindowError] = useState<string | null>(null);
   const [operationBusy, setOperationBusy] = useState(false);
   const [properties, setProperties] = useState<SftpBrowserEntry | null>(null);
+  // The open SQLite viewer: the browser and entry handles it resolves, never a path.
+  const [sqliteView, setSqliteView] = useState<{
+    browserHandle: string;
+    entryHandle: string;
+    name: string;
+  } | null>(null);
   const operationInFlight = useRef(false);
   const requestRef = useRef(0);
   // The backend said this browser is gone (expired or closed): listing again
@@ -924,6 +932,13 @@ export function SftpBrowserPage({
       if (entry !== null) setProperties(entry);
       return;
     }
+    if (action === "sqlite") {
+      const browserHandle = visibleState.directory?.browserHandle ?? null;
+      if (entry !== null && browserHandle !== null) {
+        setSqliteView({ browserHandle, entryHandle: entry.entryHandle, name: entry.name });
+      }
+      return;
+    }
     if (action === "open") return;
     // Relay needs an entry; a blank-area menu has no file to send.
     if (action === "relay") return;
@@ -1366,6 +1381,16 @@ export function SftpBrowserPage({
           entry={properties}
           onChmod={() => startOperation("chmod", properties)}
           onClose={() => setProperties(null)}
+        />
+      )}
+      {sqliteView === null ? null : (
+        <SqliteViewDialog
+          key={`${sqliteView.browserHandle}:${sqliteView.entryHandle}`}
+          api={sftpSqliteViewer(api)}
+          source={{ kind: "sftp", browserHandle: sqliteView.browserHandle, entryHandle: sqliteView.entryHandle }}
+          subject={sqliteView.name}
+          copyText={(text) => void api.copySelection(text)}
+          onClose={() => setSqliteView(null)}
         />
       )}
       {relayPick === null ? null : (

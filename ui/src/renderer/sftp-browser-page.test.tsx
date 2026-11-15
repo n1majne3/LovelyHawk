@@ -52,6 +52,12 @@ const api: SftpBrowserApi & LocalBrowserApi = {
   stageSftpUpload: async () => { throw new Error(); },
   openFileEditor: async () => ({ opened: true, reused: false }),
   openDirectoryTerminal: async () => ({ opened: true, reused: false }),
+  sqliteInspectSftp: async () => { throw new Error(); },
+  sqliteRowsSftp: async () => { throw new Error(); },
+  sqliteDeletePlanSftp: async () => { throw new Error(); },
+  sqliteDeleteExecuteSftp: async () => { throw new Error(); },
+  sqliteDeleteUndoSftp: async () => { throw new Error(); },
+  copySelection: async () => {},
 };
 
 const hostileName = "<script>steal()<img src=x onerror=steal()>";
@@ -239,6 +245,17 @@ describe("取回本机扫描 in the file manager", () => {
     // A window without the scan bridge never shows the item.
     expect(menuItems(file).map((item) => item.action)).not.toContain("local-scan");
     expect(menuItems(null).map((item) => item.action)).not.toContain("local-scan");
+  });
+
+  it("offers the read-only SQLite view on any regular file and nowhere else", () => {
+    const file = entries.find((entry) => entry.action === "preview")!;
+    const directory = entries.find((entry) => entry.action === "browse")!;
+    const link = entries.find((entry) => entry.action === "none")!;
+    expect(menuItems(file).map((item) => item.action)).toContain("sqlite");
+    expect(menuItems(file).find((item) => item.action === "sqlite")?.label).toBe("以 SQLite 只读打开…");
+    expect(menuItems(directory).map((item) => item.action)).not.toContain("sqlite");
+    expect(menuItems(link).map((item) => item.action)).not.toContain("sqlite");
+    expect(menuItems(null).map((item) => item.action)).not.toContain("sqlite");
   });
 
   it("gates the toolbar entry on the child api and the stale list like the download", () => {

@@ -155,7 +155,12 @@ function mockApi() {
     cleanProcessWatchResidue: vi.fn(async () => { throw new Error(); }),
     listProcessWatchSources: vi.fn(async () => { throw new Error(); }),
     readProcessWatchAccounting: vi.fn(async () => { throw new Error(); }),
-  } satisfies EmergencyCommandApi & import("../shared/file-evidence-contract").FileEvidenceApi & import("../shared/local-scan-contract").LocalScanApi & import("../shared/process-watch-contract").ProcessWatchApi;
+    sqliteInspect: vi.fn(async () => { throw new Error(); }),
+    sqliteRows: vi.fn(async () => { throw new Error(); }),
+    sqliteDeletePlan: vi.fn(async () => { throw new Error(); }),
+    sqliteDeleteExecute: vi.fn(async () => { throw new Error(); }),
+    sqliteDeleteUndo: vi.fn(async () => { throw new Error(); }),
+  } satisfies EmergencyCommandApi & import("../shared/file-evidence-contract").FileEvidenceApi & import("../shared/local-scan-contract").LocalScanApi & import("../shared/process-watch-contract").ProcessWatchApi & import("../shared/sqlite-contract").SqliteHostApi;
 }
 
 let api = mockApi();

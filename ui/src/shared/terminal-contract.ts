@@ -101,6 +101,15 @@ export interface TerminalApi {
   cancelSftpOperation(planHandle: string): Promise<unknown>;
   undoSftpOperation(planHandle: string): Promise<unknown>;
   /**
+   * Read-only SQLite view of one file this window's browser offered. The host
+   * fills in the target; the page only names the browser entry and table.
+   */
+  sqliteInspectSftp(browserHandle: string, entryHandle: string): Promise<unknown>;
+  sqliteRowsSftp(browserHandle: string, entryHandle: string, table: string, offset: number): Promise<unknown>;
+  sqliteDeletePlanSftp(browserHandle: string, entryHandle: string, table: string, rowids: number[]): Promise<unknown>;
+  sqliteDeleteExecuteSftp(planHandle: string): Promise<unknown>;
+  sqliteDeleteUndoSftp(planHandle: string): Promise<unknown>;
+  /**
    * Picks a local folder via the host dialog, packs it into a bounded tar and
    * stages it; the preview comes back before anything remote is touched.
    */
