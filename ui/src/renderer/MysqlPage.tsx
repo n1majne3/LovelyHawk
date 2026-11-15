@@ -13,8 +13,8 @@ export interface MysqlPageProps { api: MySqlRuntimeApi; bindingHandle: string | 
 interface Editor { handle: string | null; input: MySqlProfileInput; initial: string; password: string; passwordAction: "keep" | "replace" | "remove"; unassigned: boolean; hasCa: boolean }
 const initial: MySqlProfileInput = { name: "", host: "127.0.0.1", port: 3306, username: "root", database: "", tlsMode: "verify-full", caPem: null };
 
-function MysqlProfileEditor({ editor, saving, onChange, onSubmit, onCancel, nameInput, dialogRef }: {
-  editor: Editor; saving: boolean; nameInput: React.RefObject<HTMLInputElement | null>; dialogRef: React.RefObject<HTMLElement | null>;
+function MysqlProfileEditor({ editor, saving, error, onChange, onSubmit, onCancel, nameInput, dialogRef }: {
+  editor: Editor; saving: boolean; error: string | null; nameInput: React.RefObject<HTMLInputElement | null>; dialogRef: React.RefObject<HTMLElement | null>;
   onChange(next: Editor): void; onSubmit(): void; onCancel(): void;
 }): React.JSX.Element {
   useModalScrim();
@@ -46,6 +46,7 @@ function MysqlProfileEditor({ editor, saving, onChange, onSubmit, onCancel, name
           <label className="database-check"><input type="radio" name="mysql-password-action" checked={editor.passwordAction === "remove"} onChange={() => onChange({ ...editor, passwordAction: "remove", password: "" })} />移除已保存口令</label>
         </fieldset>
         {editor.passwordAction === "replace" ? <label>新口令<input type="password" required maxLength={16384} autoComplete="new-password" value={editor.password} onChange={event => onChange({ ...editor, password: event.target.value })} /></label> : null}
+        {error ? <p role="alert" className="database-error">{error}</p> : null}
         <div className="database-toolbar"><button type="submit">{saving ? "正在保存…" : editor.unassigned ? "保存并关联此主机" : "保存连接"}</button><button type="button" onClick={() => onCancel()}>取消</button></div>
       </fieldset>
     </form>
@@ -220,10 +221,10 @@ export const MysqlPage = forwardRef<MysqlPageHandle, MysqlPageProps>(function My
         })}
         {state.profiles.some(profile => profile.unassigned) ? <p>标记“待关联”的旧连接需要先编辑并保存，明确关联当前 SSH 主机后才能修改口令。</p> : null}
       </>}
-      {state.error ? <TransientNotice source="数据库" message={state.error ?? ""} severity="error"><p role="alert" className="database-error">{state.error}</p></TransientNotice> : null}
+      {state.error && !editor ? <TransientNotice source="数据库" message={state.error ?? ""} severity="error"><p role="alert" className="database-error">{state.error}</p></TransientNotice> : null}
       {state.notice ? <TransientNotice source="数据库" message={state.notice ?? ""} severity="info"><p role="status">{state.notice}</p></TransientNotice> : null}
     </div>
-    {editor ? <MysqlProfileEditor editor={editor} saving={saving} nameInput={nameInput} dialogRef={editorDialog}
+    {editor ? <MysqlProfileEditor editor={editor} saving={saving} error={state.error} nameInput={nameInput} dialogRef={editorDialog}
       onChange={next => { editorRef.current = next; setEditor(next); }}
       onSubmit={() => save()} onCancel={() => void requestEditorClose()} /> : null}
     {passwordProfile && bindingHandle ? <MysqlPasswordDialog api={api} bindingHandle={bindingHandle} profile={passwordProfile} targetLabel={targetLabel}

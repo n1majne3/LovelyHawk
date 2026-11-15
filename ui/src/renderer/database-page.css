@@ -7,7 +7,13 @@
 .database-page label { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
 .database-page .database-mode { flex-direction: row; align-items: center; white-space: nowrap; }
 .database-page :where(input, select, textarea, button) { font: inherit; color: var(--text); background: var(--input-bg); border: 1px solid var(--border-strong); border-radius: 6px; padding: 8px; min-width: 0; }
-.database-page :where(input:not([type="checkbox"]), select, textarea) { width: 100%; }
+.database-page :where(input:not([type="checkbox"]):not([type="radio"]), select, textarea) { width: 100%; }
+.database-page :where(input[type="checkbox"], input[type="radio"]) { width: auto; margin: 0; padding: 0; accent-color: var(--accent); }
+.database-page label.database-check { flex-direction: row; align-items: center; gap: 8px; margin: 6px 0; }
+.database-page .dialog { box-sizing: border-box; width: min(680px, 100%); max-height: calc(100vh - 50px); overflow: auto; padding: 20px 22px; color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: 16px; box-shadow: var(--shadow-lg); }
+.database-page .dialog fieldset { min-width: 0; margin: 12px 0; padding: 8px 12px; border: 1px solid var(--border); border-radius: 8px; }
+.database-page .dialog form > fieldset { margin: 0; padding: 0; border: 0; }
+.database-page .dialog legend { padding: 0 4px; color: var(--text-secondary); font-weight: 600; }
 .database-page textarea { resize: vertical; }
 .database-page button { cursor: pointer; }
 .database-page button:disabled { opacity: .55; cursor: default; }

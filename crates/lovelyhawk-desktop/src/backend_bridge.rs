@@ -63,6 +63,7 @@ const MAIN_WINDOW_METHODS: &[&str] = &[
     "java.hot-update",
     "windows.incident",
     "postgresql.runtime",
+    "mysql.runtime",
     "emergency.file-evidence",
     "case.workspace",
     "case.library",
@@ -630,6 +631,18 @@ mod tests {
         });
         drop(runtime);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn every_method_the_main_page_client_sends_is_allowed() {
+        let client = include_str!("../../../ui/src/host/backend-client.ts");
+        let mut checked = 0;
+        for chunk in client.split("#request(").skip(1) {
+            let Some(method) = chunk.trim_start().strip_prefix('"').and_then(|rest| rest.split('"').next()) else { continue };
+            assert!(MAIN_WINDOW_METHODS.contains(&method), "{method} is sent by the main page but not allowed");
+            checked += 1;
+        }
+        assert!(checked >= 40, "found only {checked} methods in the client");
     }
 
     #[test]
